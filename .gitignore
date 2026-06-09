@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / build output
+node_modules/
+dist/
+build/
+
+# Local agent/runtime artifacts
+.hermes/
+artifacts/
+logs/
+*.log
