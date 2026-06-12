@@ -153,10 +153,10 @@ Check and record:
 
 Start with one small cloud CPU node and no GPU:
 
-1. run the VPS network preflight in [`docs/vps-preflight.md`](vps-preflight.md);
-2. if Queen Glasser's existing Guangzhou server passes HTTPS/WebSocket checks, use it first because it costs nothing extra;
-3. if Guangzhou only passes HTTPS, it may still run the first polling recorder while a non-mainland WebSocket recorder is evaluated;
-4. if Guangzhou fails HTTPS or is unstable, buy a Hong Kong/Singapore/Japan/US/EU VPS before changing trading logic;
+1. use the VPS network preflight in [`docs/vps-preflight.md`](vps-preflight.md);
+2. do not use the tested Guangzhou MCP machine (`ailcloud_esc`) as the primary recorder because it failed Polymarket HTTPS/WebSocket preflight;
+3. test any other existing overseas node before buying new capacity;
+4. if no existing node passes, buy a Hong Kong/Singapore/Japan/US/EU VPS before changing trading logic;
 5. deploy recorder;
 6. collect continuous public data;
 7. run paper engine;

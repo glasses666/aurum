@@ -46,3 +46,4 @@ Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting f
 - Local paper account rules: [`docs/local-paper-account-rules.md`](docs/local-paper-account-rules.md)
 - Deployment architecture: [`docs/deployment-architecture.md`](docs/deployment-architecture.md)
 - VPS preflight runbook: [`docs/vps-preflight.md`](docs/vps-preflight.md)
+- Guangzhou ECS preflight result: [`docs/vps-preflight-ailcloud-esc-20260613.md`](docs/vps-preflight-ailcloud-esc-20260613.md)

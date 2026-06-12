@@ -2,14 +2,21 @@
 
 ## Current buying decision
 
-Do **not** buy a new Hong Kong VPS before testing the existing Guangzhou server.
+The existing Guangzhou MCP machine (`ailcloud_esc`) has now been tested and is **blocked** for Aurum's Polymarket recorder.
 
-Use this gate:
+Recorded result:
 
-1. Test the existing Guangzhou machine first.
-2. If HTTPS public endpoints pass and latency is acceptable, use Guangzhou for the first polling recorder.
-3. If WebSocket also passes, Guangzhou can run the fuller CLOB recorder.
-4. If HTTPS/WebSocket fail or are unstable, buy a Hong Kong/Singapore/Japan/US/EU VPS.
+- report: [`docs/vps-preflight-ailcloud-esc-20260613.md`](vps-preflight-ailcloud-esc-20260613.md)
+- verdict: `fail`
+- Polymarket HTTPS endpoints: failed
+- Polymarket WebSocket: failed
+- root cause: broken default Alibaba internal DNS on that host plus failed direct connectivity to Polymarket endpoint IPs even with DNS override
+
+Buying gate after this test:
+
+1. Do not deploy the primary recorder on Guangzhou.
+2. If another existing overseas node exists, run this preflight there first.
+3. Otherwise, buy a Hong Kong/Singapore/Japan/US/EU VPS and immediately run this preflight before installing Aurum.
 
 The Alibaba Cloud Hong Kong lightweight server shown by Queen Glasser is acceptable if needed:
 
