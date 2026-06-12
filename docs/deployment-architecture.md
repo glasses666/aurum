@@ -154,13 +154,14 @@ Check and record:
 Start with one small cloud CPU node and no GPU:
 
 1. use the VPS network preflight in [`docs/vps-preflight.md`](vps-preflight.md);
-2. do not use the tested Guangzhou MCP machine (`ailcloud_esc`) as the primary recorder because it failed Polymarket HTTPS/WebSocket preflight;
-3. test any other existing overseas node before buying new capacity;
-4. if no existing node passes, buy a Hong Kong/Singapore/Japan/US/EU VPS before changing trading logic;
-5. deploy recorder;
-6. collect continuous public data;
-7. run paper engine;
-8. produce daily reports;
-9. after data quality is stable, schedule model-training experiments on separate hardware.
+2. use the provider shortlist in [`docs/vps-provider-shortlist.md`](vps-provider-shortlist.md) to pick a non-mainland candidate;
+3. do not use the tested Guangzhou MCP machine (`ailcloud_esc`) as the primary recorder because it failed Polymarket HTTPS/WebSocket preflight;
+4. test any other existing overseas node before buying new capacity;
+5. if no existing node passes, buy a Hong Kong/Singapore/Japan/US/EU VPS before changing trading logic;
+6. deploy recorder;
+7. collect continuous public data;
+8. run paper engine;
+9. produce daily reports;
+10. after data quality is stable, schedule model-training experiments on separate hardware.
 
 Conclusion: **cloud for uptime, local for development, ephemeral GPU for training**.
