@@ -38,3 +38,9 @@ It does not require live funds, a real trading wallet, private keys, USDC deposi
 ## Status
 
 Early builder/research prototype.
+
+## Current local-first path
+
+Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting for official access, Aurum should run a local paper account over public market/orderbook data.
+
+- Local paper account rules: [`docs/local-paper-account-rules.md`](docs/local-paper-account-rules.md)
