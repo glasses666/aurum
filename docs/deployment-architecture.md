@@ -153,10 +153,14 @@ Check and record:
 
 Start with one small cloud CPU node and no GPU:
 
-1. deploy recorder;
-2. collect continuous public data;
-3. run paper engine;
-4. produce daily reports;
-5. after data quality is stable, schedule model-training experiments on separate hardware.
+1. run the VPS network preflight in [`docs/vps-preflight.md`](vps-preflight.md);
+2. if Queen Glasser's existing Guangzhou server passes HTTPS/WebSocket checks, use it first because it costs nothing extra;
+3. if Guangzhou only passes HTTPS, it may still run the first polling recorder while a non-mainland WebSocket recorder is evaluated;
+4. if Guangzhou fails HTTPS or is unstable, buy a Hong Kong/Singapore/Japan/US/EU VPS before changing trading logic;
+5. deploy recorder;
+6. collect continuous public data;
+7. run paper engine;
+8. produce daily reports;
+9. after data quality is stable, schedule model-training experiments on separate hardware.
 
 Conclusion: **cloud for uptime, local for development, ephemeral GPU for training**.
