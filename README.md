@@ -44,3 +44,4 @@ Early builder/research prototype.
 Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting for official access, Aurum should run a local paper account over public market/orderbook data.
 
 - Local paper account rules: [`docs/local-paper-account-rules.md`](docs/local-paper-account-rules.md)
+- Deployment architecture: [`docs/deployment-architecture.md`](docs/deployment-architecture.md)
