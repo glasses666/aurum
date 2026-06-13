@@ -48,3 +48,4 @@ Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting f
 - VPS preflight runbook: [`docs/vps-preflight.md`](docs/vps-preflight.md)
 - Guangzhou ECS preflight result: [`docs/vps-preflight-ailcloud-esc-20260613.md`](docs/vps-preflight-ailcloud-esc-20260613.md)
 - VPS provider shortlist: [`docs/vps-provider-shortlist.md`](docs/vps-provider-shortlist.md)
+- DeepSeek/SuperWing paper-wallet duel: [`docs/deepseek-agent-duel.md`](docs/deepseek-agent-duel.md)
