@@ -1,0 +1,21 @@
+[Unit]
+Description=Aurum paper duel unified tick (review-only by default)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=aurum
+Group=aurum
+WorkingDirectory=/opt/aurum/app
+EnvironmentFile=/opt/aurum/.env
+Environment=AURUM_ENV_FILE=/opt/aurum/.env
+Environment=AURUM_DATA_DIR=/opt/aurum/data/paper_duel
+Environment=AURUM_RUN_DIR=/opt/aurum/run
+Environment=AURUM_LOG_DIR=/opt/aurum/logs
+ExecStart=/opt/aurum/app/scripts/run_paper_duel_tick.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/aurum/data /opt/aurum/logs /opt/aurum/run

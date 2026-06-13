@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Aurum paper duel unified tick hourly
+
+[Timer]
+OnCalendar=*-*-* *:07:00
+Persistent=true
+RandomizedDelaySec=90
+Unit=aurum-paper-duel-tick.service
+
+[Install]
+WantedBy=timers.target

@@ -150,6 +150,7 @@ AURUM_DEEPSEEK_MAX_NOTIONAL=45
 AURUM_DEEPSEEK_TEMPERATURE=0.2
 AURUM_DEEPSEEK_THINKING=enabled
 AURUM_DEEPSEEK_REASONING_EFFORT=high
+AURUM_DUEL_MODE=review_only
 ```
 
 To let DeepSeek apply paper fills after reviewing a dry-run, the operator must change both gates locally and upload the env again:
