@@ -136,31 +136,46 @@ def call_review_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
             if effort in {"high", "max"}:
                 payload["reasoning_effort"] = effort
             payload.pop("temperature", None)
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": "Bearer " + api_key,
-                "Content-Type": "application/json",
-                "User-Agent": "aurum-strategy-review/0.1 (+paper-only)",
-            },
-            method="POST",
-        )
-        try:
-            opener = duel.no_proxy_opener(False)
-            with opener.open(req, timeout=90) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            out = duel.extract_json_object(content)
-            out["review_model"] = model
-            return out
-        except urllib.error.HTTPError as exc:
-            detail = exc.read(800).decode("utf-8", "replace") if exc.fp else ""
-            last_error = f"{model} HTTP {exc.code}: {detail[:300]}"
-            continue
-        except Exception as exc:
-            last_error = f"{model}: {exc}"
-            continue
+        payloads = [(payload, False)]
+        if payload.get("thinking", {}).get("type") == "enabled" and os.environ.get("AURUM_REVIEW_STRUCTURED_RETRY", "true").strip().lower() in {"1", "true", "yes", "on"}:
+            retry_payload = dict(payload)
+            retry_payload["thinking"] = {"type": "disabled"}
+            retry_payload["temperature"] = 0.1
+            retry_payload.pop("reasoning_effort", None)
+            retry_payload["messages"] = [
+                {"role": "system", "content": system + " Return the final answer in the content field as exactly one valid JSON object."},
+                {"role": "user", "content": user + "\n\nThe prior response was not parseable JSON. Retry with one strict JSON object only."},
+            ]
+            payloads.append((retry_payload, True))
+        model_error = ""
+        for attempt_payload, retry_used in payloads:
+            req = urllib.request.Request(
+                endpoint,
+                data=json.dumps(attempt_payload).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer " + api_key,
+                    "Content-Type": "application/json",
+                    "User-Agent": "aurum-strategy-review/0.1 (+paper-only)",
+                },
+                method="POST",
+            )
+            try:
+                opener = duel.no_proxy_opener(False)
+                with opener.open(req, timeout=90) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                out = duel.extract_deepseek_decision_from_response(data)
+                out["review_model"] = model
+                out["structured_retry_used"] = retry_used
+                return out
+            except urllib.error.HTTPError as exc:
+                detail = exc.read(800).decode("utf-8", "replace") if exc.fp else ""
+                model_error = f"{model} HTTP {exc.code}: {detail[:300]}"
+                break
+            except Exception as exc:
+                model_error = f"{model}: {exc}"
+                continue
+        last_error = model_error
+        continue
     raise duel.DuelError("strategy review model call failed: " + last_error)
 
 
