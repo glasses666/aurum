@@ -34,7 +34,7 @@ DEFAULT_SUPERWING_RULES: Dict[str, Any] = {
 DEFAULT_DEEPSEEK_RULES = """# DeepSeek paper strategy rules
 
 - Scope: paper-only Polymarket research; never ask for wallets, private keys, USDC deposits, logins, geoblock bypass, or live orders.
-- Side: buy-only paper orders. If the edge is unclear, hold.
+- Side: buy and sell paper orders only. If the edge is unclear, hold.
 - Prefer high-liquidity markets with a clear thesis, near-term resolution, and prices that leave room for mispricing.
 - Avoid forced trades. A no-order decision is valid when the slate is noisy or the available market prices already look efficient.
 - Keep each rationale one concise sentence: what edge you think exists and why the quoted limit is acceptable.
@@ -155,7 +155,7 @@ def validate_deepseek_rules(text: str) -> str:
     required = ["paper", "buy", "hold"]
     missing = [word for word in required if word not in lower]
     if missing:
-        text += "\n\nSafety footer: This is paper-only, buy-only, and holding is required when no clear edge exists.\n"
+        text += "\n\nSafety footer: This is paper-only, buy/sell only, and holding is required when no clear edge exists.\n"
     return text + ("\n" if not text.endswith("\n") else "")
 
 

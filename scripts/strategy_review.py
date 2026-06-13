@@ -18,6 +18,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 import agent_duel as duel
+import bot_scripts
 import generate_dashboard
 import strategy_rules
 
@@ -80,6 +81,7 @@ def review_context(data_dir: pathlib.Path, limit_ticks: int) -> Dict[str, Any]:
         "paper_only": True,
         "scores": scores,
         "current_rules": strategy_rules.summarize_rules(data_dir),
+        "current_bot_scripts": {agent: bot_scripts.load_bot_script(data_dir, agent) for agent in duel.AGENTS},
         "recent_ticks": [compact_tick(t) for t in ticks[-limit_ticks:]],
         "recent_decision_count": len(decisions),
         "required_output_schema": {
@@ -97,8 +99,12 @@ def review_context(data_dir: pathlib.Path, limit_ticks: int) -> Dict[str, Any]:
                 "notes": "string",
             },
             "superwing_rationale": "why this rule change helps",
-            "deepseek_rules_md": "markdown rules for DeepSeek, paper-only/buy-only/hold-if-no-edge",
+            "deepseek_rules_md": "markdown rules for DeepSeek, paper-only/buy/sell/hold-if-no-edge",
             "deepseek_rationale": "why this prompt change helps",
+            "bot_scripts": {
+                "superwing": "optional mechanical JSON script with buy_when/sell_when/hold_when",
+                "deepseek": "optional mechanical JSON script with buy_when/sell_when/hold_when",
+            },
             "risk_notes": ["safety note"],
             "public_dashboard_note": "one sentence for human transparency",
         },
@@ -195,6 +201,7 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     duel.ensure_data_dir(data_dir)
     duel.load_env_file(env_file)
     strategy_rules.ensure_default_rules(data_dir)
+    bot_scripts.ensure_default_bot_scripts(data_dir)
     ctx = review_context(data_dir, args.limit_ticks)
     try:
         review = call_review_model(ctx)
@@ -230,10 +237,32 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     ds_proposal = strategy_rules.write_proposal(data_dir, review_id, "deepseek", "_rules.md", ds_rules_text)
     proposed["deepseek_rules"] = str(ds_proposal)
 
+    bot_script_candidates: Dict[str, Dict[str, Any]] = {}
+    raw_bot_scripts = review.get("bot_scripts") if isinstance(review.get("bot_scripts"), dict) else {}
+    for agent_id in duel.AGENTS:
+        current_script = bot_scripts.load_bot_script(data_dir, agent_id)
+        candidate = raw_bot_scripts.get(agent_id) if isinstance(raw_bot_scripts, dict) else None
+        if not isinstance(candidate, dict):
+            candidate = current_script
+        if agent_id == "superwing":
+            candidate = bot_scripts.script_from_superwing_rules(candidate, sw_rules)
+        normalized = bot_scripts.normalize_bot_script(candidate, agent_id)
+        bot_script_candidates[agent_id] = normalized
+        proposal_path = strategy_rules.write_proposal(
+            data_dir,
+            review_id,
+            agent_id,
+            "_bot_script.json",
+            json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        proposed[f"{agent_id}_bot_script"] = str(proposal_path)
+
     promote = (not model_failed) and auto_promote_enabled(args)
     if promote:
         promoted["superwing_rules"] = str(strategy_rules.promote_superwing_rules(data_dir, sw_rules, source=f"review:{review_id}", rationale=str(review.get("superwing_rationale", ""))))
         promoted["deepseek_rules"] = str(strategy_rules.promote_deepseek_rules(data_dir, ds_rules_text, source=f"review:{review_id}", rationale=str(review.get("deepseek_rationale", ""))))
+        for agent_id, candidate in bot_script_candidates.items():
+            promoted[f"{agent_id}_bot_script"] = str(bot_scripts.write_bot_script(data_dir, agent_id, candidate, source=f"review:{review_id}"))
 
     record = {
         "ok": True,
