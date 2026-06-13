@@ -132,6 +132,64 @@ def load_env_file(env_file: Optional[pathlib.Path]) -> None:
             os.environ[k] = v
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int, low: int = 0, high: Optional[int] = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)).strip())
+    except Exception:
+        value = default
+    value = max(low, value)
+    if high is not None:
+        value = min(high, value)
+    return value
+
+
+def env_float(name: str, default: float, low: float = 0.0, high: Optional[float] = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)).strip())
+    except Exception:
+        value = default
+    value = max(low, value)
+    if high is not None:
+        value = min(high, value)
+    return value
+
+
+def deepseek_controls(cli_max_orders: int) -> Dict[str, Any]:
+    """Operator-controlled DeepSeek safety knobs.
+
+    DeepSeek is allowed to propose paper orders when the API key exists, but
+    applying those proposals to the paper wallet requires an explicit two-key
+    local env gate. The model cannot alter these values from its response.
+    """
+    hard_notional_cap = STARTING_EQUITY * MAX_TRADE_FRACTION
+    configured_max_orders = env_int("AURUM_DEEPSEEK_MAX_ORDERS", cli_max_orders, low=0, high=cli_max_orders)
+    configured_max_notional = env_float("AURUM_DEEPSEEK_MAX_NOTIONAL", hard_notional_cap, low=0.0, high=hard_notional_cap)
+    return {
+        "allow_paper_apply": env_bool("AURUM_DEEPSEEK_ALLOW_PAPER_APPLY", False),
+        "operator_confirm": os.environ.get("AURUM_DEEPSEEK_OPERATOR_CONFIRM", "").strip(),
+        "max_orders": configured_max_orders,
+        "max_notional_per_order": configured_max_notional,
+        "temperature": env_float("AURUM_DEEPSEEK_TEMPERATURE", 0.2, low=0.0, high=1.0),
+    }
+
+
+def require_deepseek_apply_authorized(controls: Dict[str, Any]) -> None:
+    if controls.get("allow_paper_apply") and controls.get("operator_confirm") == "ALLOW_DEEPSEEK_PAPER_APPLY":
+        return
+    raise DuelError(
+        "DeepSeek paper apply is locked; run with --no-apply for review, or set "
+        "AURUM_DEEPSEEK_ALLOW_PAPER_APPLY=true and "
+        "AURUM_DEEPSEEK_OPERATOR_CONFIRM=ALLOW_DEEPSEEK_PAPER_APPLY in the local env before uploading."
+    )
+
+
 def jsonish(value: Any) -> Any:
     if isinstance(value, str):
         s = value.strip()
@@ -362,11 +420,13 @@ def superwing_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], m
     }
 
 
-def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]]) -> Tuple[str, str]:
+def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any]) -> Tuple[str, str]:
     system = (
         "You are DeepSeek running a PAPER-ONLY Polymarket strategy test for Aurum. "
         "You cannot place real orders. You cannot request wallets, private keys, USDC, account logins, or geoblock bypass. "
-        "You must choose at most 2 small buy orders or hold. Output JSON only, no markdown."
+        f"You must choose at most {controls['max_orders']} small buy orders or hold. "
+        "Operator controls are enforced by the runner and cannot be overridden by your response. "
+        "Output JSON only, no markdown."
     )
     market_slate = []
     for m in markets:
@@ -385,8 +445,8 @@ def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]]) -> T
             "task": "Pick paper trades for the deepseek account. If edge is unclear, return no orders.",
             "account": compact_account(account),
             "risk_limits": {
-                "max_orders": 2,
-                "max_notional_per_order": round(STARTING_EQUITY * MAX_TRADE_FRACTION, 2),
+                "max_orders": controls["max_orders"],
+                "max_notional_per_order": round(float(controls["max_notional_per_order"]), 2),
                 "reserve_cash": RESERVE_CASH,
                 "allowed_side": "buy only",
                 "limit_price_required": True,
@@ -426,7 +486,7 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     raise DuelError("DeepSeek response did not contain a JSON object")
 
 
-def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]]) -> Dict[str, Any]:
+def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any]) -> Dict[str, Any]:
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         raise DuelError("DEEPSEEK_API_KEY is not set; cannot ask DeepSeek to self-decide")
@@ -434,11 +494,11 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]]) ->
     endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1/chat/completions").strip()
     if endpoint.rstrip("/").endswith("/v1"):
         endpoint = endpoint.rstrip("/") + "/chat/completions"
-    system, user = deepseek_prompt(account, markets)
+    system, user = deepseek_prompt(account, markets, controls)
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": 0.2,
+        "temperature": controls["temperature"],
         "max_tokens": 900,
     }
     req = urllib.request.Request(
@@ -474,6 +534,8 @@ def validate_and_apply(
     decision: Dict[str, Any],
     markets: List[Dict[str, Any]],
     apply: bool,
+    max_orders: int,
+    max_notional_per_order: float,
 ) -> Dict[str, Any]:
     if agent_id not in state["accounts"]:
         raise DuelError(f"unknown agent: {agent_id}")
@@ -486,9 +548,24 @@ def validate_and_apply(
         "agent_id": agent_id,
         "decision": decision,
         "applied": bool(apply),
+        "controls": {
+            "max_orders": max_orders,
+            "max_notional_per_order": round(max_notional_per_order, 4),
+        },
     }
     append_jsonl(decisions_path(data_dir), decision_record)
-    for order in decision.get("orders", []) or []:
+    orders = decision.get("orders", []) or []
+    if not isinstance(orders, list):
+        orders = []
+    for idx, order in enumerate(orders):
+        if idx >= max_orders:
+            rejections.append({
+                "ts": utc_now(),
+                "agent_id": agent_id,
+                "order": order,
+                "reason": f"order count exceeds configured max_orders={max_orders}",
+            })
+            continue
         try:
             market_id = str(order.get("market_id", ""))
             market = market_by_id.get(market_id)
@@ -497,7 +574,10 @@ def validate_and_apply(
             side = str(order.get("side", "")).lower()
             if side != "buy":
                 raise DuelError("only buy side is allowed in Phase 0")
-            notional = min(to_float(order.get("notional"), 0.0), STARTING_EQUITY * MAX_TRADE_FRACTION)
+            requested_notional = to_float(order.get("notional"), 0.0)
+            if requested_notional > max_notional_per_order:
+                raise DuelError(f"notional {requested_notional:.4f} exceeds configured cap {max_notional_per_order:.4f}")
+            notional = requested_notional
             if notional <= 0:
                 raise DuelError("notional must be positive")
             if float(account.get("cash", 0.0)) - notional < RESERVE_CASH:
@@ -606,13 +686,29 @@ def command_decide(args: argparse.Namespace) -> None:
     load_env_file(pathlib.Path(args.env_file) if args.env_file else None)
     state = init_state(data_dir, reset=False)
     markets = fetch_markets(args.limit, args.min_volume, args.mock_markets, args.allow_proxy)
+    validation_max_orders = args.max_orders
+    validation_max_notional = STARTING_EQUITY * MAX_TRADE_FRACTION
     if args.agent == "superwing":
         decision = superwing_decision(state["accounts"]["superwing"], markets, max_orders=args.max_orders)
     elif args.agent == "deepseek":
-        decision = deepseek_decision(state["accounts"]["deepseek"], markets)
+        controls = deepseek_controls(args.max_orders)
+        validation_max_orders = int(controls["max_orders"])
+        validation_max_notional = float(controls["max_notional_per_order"])
+        if not args.no_apply:
+            require_deepseek_apply_authorized(controls)
+        decision = deepseek_decision(state["accounts"]["deepseek"], markets, controls)
     else:
         raise DuelError(f"unknown agent: {args.agent}")
-    result = validate_and_apply(data_dir, state, args.agent, decision, markets, apply=not args.no_apply)
+    result = validate_and_apply(
+        data_dir,
+        state,
+        args.agent,
+        decision,
+        markets,
+        apply=not args.no_apply,
+        max_orders=validation_max_orders,
+        max_notional_per_order=validation_max_notional,
+    )
     print(json.dumps({"decision": decision, "result": result}, ensure_ascii=False, indent=2))
 
 

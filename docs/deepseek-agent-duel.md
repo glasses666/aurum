@@ -139,6 +139,22 @@ Do not put keys in chat. Put them in a chmod-600 `.env` on the server:
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1/chat/completions
 DEEPSEEK_MODEL=deepseek-chat
+
+# Default: review-only. DeepSeek may propose decisions, but cannot alter paper wallet state.
+AURUM_DEEPSEEK_ALLOW_PAPER_APPLY=false
+AURUM_DEEPSEEK_OPERATOR_CONFIRM=
+
+# Runner-enforced caps. DeepSeek cannot override them from its JSON response.
+AURUM_DEEPSEEK_MAX_ORDERS=2
+AURUM_DEEPSEEK_MAX_NOTIONAL=45
+AURUM_DEEPSEEK_TEMPERATURE=0.2
+```
+
+To let DeepSeek apply paper fills after reviewing a dry-run, the operator must change both gates locally and upload the env again:
+
+```text
+AURUM_DEEPSEEK_ALLOW_PAPER_APPLY=true
+AURUM_DEEPSEEK_OPERATOR_CONFIRM=ALLOW_DEEPSEEK_PAPER_APPLY
 ```
 
 Without `DEEPSEEK_API_KEY`, the runner can initialize wallets and run the `superwing` baseline, but it cannot actually ask DeepSeek to self-decide.
