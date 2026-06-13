@@ -127,7 +127,8 @@ def call_review_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
             "model": model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "max_tokens": 2400,
-            "temperature": 0.15,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
         }
         if os.environ.get("AURUM_REVIEW_THINKING", "enabled").strip().lower() == "enabled":
             payload["thinking"] = {"type": "enabled"}
