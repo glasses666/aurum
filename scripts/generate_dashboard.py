@@ -48,7 +48,7 @@ CSS = """
   --amber: #f3c969;
 }
 * { box-sizing: border-box; }
-html, body { min-height: 100%; }
+html, body { min-height: 100%; overflow-x: hidden; }
 body {
   margin: 0;
   background: var(--bg);
@@ -59,18 +59,22 @@ body {
 a { color: inherit; }
 .terminal {
   min-height: 100vh;
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
   display: grid;
-  grid-template-columns: 300px minmax(520px, 1fr) 390px;
+  grid-template-columns: clamp(230px, 20vw, 300px) minmax(0, 1fr) clamp(280px, 24vw, 360px);
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
 }
 .left-rail, .right-log {
+  min-width: 0;
   min-height: 100vh;
   background: #070707;
 }
 .left-rail { border-right: 1px solid var(--line); }
 .right-log { border-left: 1px solid var(--line); }
-.center-stage { min-width: 0; display: grid; grid-template-rows: auto 1fr auto; }
+.center-stage { min-width: 0; overflow: hidden; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; }
 .topbar {
   height: 66px;
   display: flex;
@@ -105,13 +109,24 @@ a { color: inherit; }
 .pill { border: 1px solid var(--line); color: var(--muted); padding: 3px 7px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
 .pill.green { color: var(--green); border-color: rgba(47,211,127,.35); }
 .pill.amber { color: var(--amber); border-color: rgba(243,201,105,.35); }
-.chart-wrap { position: relative; padding: 18px 22px 10px; min-height: 610px; }
-.chart-title { display: flex; justify-content: space-between; gap: 18px; align-items: end; margin-bottom: 12px; }
-.chart-title h2 { margin: 0; font-size: clamp(26px, 4vw, 46px); letter-spacing: -.06em; font-weight: 650; }
+.chart-wrap { position: relative; min-width: 0; padding: 18px 22px 10px; min-height: 0; overflow: hidden; }
+.chart-title { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 18px; align-items: end; margin-bottom: 12px; min-width: 0; }
+.chart-title > div:first-child { min-width: 0; }
+.chart-title h2 { margin: 0; font-size: clamp(28px, 3.2vw, 46px); letter-spacing: -.06em; font-weight: 650; line-height: .98; text-wrap: balance; }
 .chart-title p { margin: 7px 0 0; color: var(--muted); max-width: 780px; line-height: 1.45; }
-.legend-line { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; }
+.legend-line { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px 14px; color: var(--muted); font-size: 12px; max-width: min(280px, 100%); }
 .legend-line span { white-space: nowrap; }
-.chart { width: 100%; height: auto; display: block; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #050505; }
+.chart-shell {
+  width: 100%;
+  min-width: 0;
+  height: clamp(300px, calc(100vh - 304px), 560px);
+  min-height: 300px;
+  overflow: hidden;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #050505;
+}
+.chart { width: 100%; height: 100%; display: block; background: #050505; }
 .mid-grid { stroke: #171717; stroke-width: 1; }
 .axis { stroke: #333; stroke-width: 1; }
 .axis-label { fill: #7f7f7f; font-size: 11px; }
@@ -150,17 +165,26 @@ pre.rules {
   background: transparent;
 }
 .empty { color: var(--muted); padding: 18px 16px; line-height: 1.45; }
-@media (max-width: 1180px) {
-  .terminal { grid-template-columns: 270px minmax(440px, 1fr); }
+@media (max-width: 1280px) {
+  .chart-title { grid-template-columns: minmax(0, 1fr); }
+  .legend-line { justify-content: flex-start; max-width: 100%; }
+  .chart-title h2 { font-size: clamp(30px, 4vw, 44px); }
+  .chart-shell { height: clamp(280px, calc(100vh - 330px), 520px); min-height: 280px; }
+}
+@media (max-width: 1120px) {
+  .terminal { grid-template-columns: clamp(230px, 26vw, 270px) minmax(0, 1fr); }
   .right-log { grid-column: 1 / -1; min-height: auto; border-left: 0; border-top: 1px solid var(--line); }
   .log-list { max-height: 420px; }
 }
 @media (max-width: 860px) {
   .terminal { display: block; }
   .left-rail, .right-log { min-height: auto; border: 0; border-bottom: 1px solid var(--line); }
-  .topbar, .chart-title, .meta { display: block; height: auto; }
+  .topbar, .meta { display: block; height: auto; }
   .topbar { padding: 16px; }
   .chart-wrap { padding: 16px; min-height: auto; }
+  .chart-title { display: block; }
+  .legend-line { margin-top: 12px; }
+  .chart-shell { height: clamp(260px, 62vw, 420px); min-height: 260px; }
   .stage-footer { grid-template-columns: 1fr 1fr; }
 }
 """
@@ -605,23 +629,25 @@ def trade_chart(
     else:
         btc_line = f'<text x="{left + 20}" y="{top + plot_h/2:.1f}" fill="#777" font-size="16">waiting for Bitcoin recorder frames</text>'
     return f"""
-    <svg class="chart" viewBox="0 0 {width} {height}" role="img" aria-label="Bitcoin market line, agent ROI lines, and trade points">
-      {''.join(grid)}
-      <line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}"/>
-      <line class="axis" x1="{width-right}" y1="{top}" x2="{width-right}" y2="{height-bottom}"/>
-      <line class="axis" x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}"/>
-      <text class="axis-label" x="{left}" y="22">BTC market price / probability</text>
-      <text class="axis-label" x="{width-right-88}" y="22">agent ROI</text>
-      <text class="axis-label" x="{left}" y="{height-20}">{esc(short_time(btc[0].get('ts') if btc else 'start'))}</text>
-      <text class="axis-label" x="{width-right-70}" y="{height-20}">{esc(short_time(btc[-1].get('ts') if btc else 'now'))}</text>
-      <text class="axis-label" x="14" y="{top+8}">{btc_high:.3f}</text>
-      <text class="axis-label" x="14" y="{height-bottom}">{btc_low:.3f}</text>
-      <text class="axis-label" x="{width-right+10}" y="{top+8}">{fmt_pct(roi_high)}</text>
-      <text class="axis-label" x="{width-right+10}" y="{height-bottom}">{fmt_pct(roi_low)}</text>
-      {btc_line}
-      {''.join(roi_lines)}
-      {''.join(pips)}
-    </svg>
+    <div class="chart-shell">
+      <svg class="chart" viewBox="0 0 {width} {height}" preserveAspectRatio="none" role="img" aria-label="Bitcoin market line, agent ROI lines, and trade points">
+        {''.join(grid)}
+        <line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}"/>
+        <line class="axis" x1="{width-right}" y1="{top}" x2="{width-right}" y2="{height-bottom}"/>
+        <line class="axis" x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}"/>
+        <text class="axis-label" x="{left}" y="22">BTC market price / probability</text>
+        <text class="axis-label" x="{width-right-88}" y="22">agent ROI</text>
+        <text class="axis-label" x="{left}" y="{height-20}">{esc(short_time(btc[0].get('ts') if btc else 'start'))}</text>
+        <text class="axis-label" x="{width-right-70}" y="{height-20}">{esc(short_time(btc[-1].get('ts') if btc else 'now'))}</text>
+        <text class="axis-label" x="14" y="{top+8}">{btc_high:.3f}</text>
+        <text class="axis-label" x="14" y="{height-bottom}">{btc_low:.3f}</text>
+        <text class="axis-label" x="{width-right+10}" y="{top+8}">{fmt_pct(roi_high)}</text>
+        <text class="axis-label" x="{width-right+10}" y="{height-bottom}">{fmt_pct(roi_low)}</text>
+        {btc_line}
+        {''.join(roi_lines)}
+        {''.join(pips)}
+      </svg>
+    </div>
     """
 
 
