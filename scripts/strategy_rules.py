@@ -42,9 +42,10 @@ DEFAULT_DEEPSEEK_RULES = """# DeepSeek paper strategy rules
 """
 
 FORBIDDEN_RULE_TERMS = re.compile(
-    r"(?i)(private\s*key|wallet\s*seed|seed\s*phrase|real\s*order|live\s*trading|"
-    r"deposit\s*usdc|send\s*usdc|geoblock\s*bypass|bypass\s*geo|clob\s*secret|"
-    r"api\s*secret|signature\s*key)"
+    r"(?i)((use|enter|paste|provide|store|send|request|connect).{0,40}"
+    r"(private\s*keys?|wallet\s*seed|seed\s*phrase|api\s*secret|clob\s*secret)|"
+    r"((place|send|execute).{0,30}(real|live).{0,20}order)|"
+    r"(deposit.{0,20}usdc)|(bypass.{0,20}geoblock)|(live\s*trading\s*(=|:)?\s*(true|on|enabled)))"
 )
 
 
