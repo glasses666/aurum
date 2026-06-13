@@ -20,12 +20,14 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import strategy_rules
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit={limit}"
+GAMMA_SEARCH_URL = "https://gamma-api.polymarket.com/public-search?q={query}"
 
 STARTING_EQUITY = 1500.0
 RESERVE_CASH = 300.0
@@ -35,6 +37,7 @@ MAX_TOTAL_RISK_FRACTION = 0.35
 SLIPPAGE_BPS = 50  # 0.50 percentage points in probability terms.
 
 AGENTS = ("superwing", "deepseek")
+BITCOIN_TERMS = ("bitcoin", "btc", "satoshi")
 
 
 class DuelError(RuntimeError):
@@ -235,6 +238,49 @@ def fetch_json(url: str, timeout: float = 12.0, allow_proxy: bool = False) -> An
         return json.loads(resp.read().decode("utf-8"))
 
 
+def duel_universe() -> str:
+    return os.environ.get("AURUM_DUEL_UNIVERSE", "").strip().lower()
+
+
+def market_matches_universe(market: Dict[str, Any], universe: str) -> bool:
+    if not universe or universe in {"all", "any", "general"}:
+        return True
+    text = " ".join(
+        str(market.get(k, ""))
+        for k in ("question", "slug", "category", "description", "market_id", "condition_id")
+    ).lower()
+    if universe in {"bitcoin", "btc"}:
+        return any(term in text for term in BITCOIN_TERMS)
+    return universe in text
+
+
+def extract_search_market_items(raw: Any) -> List[Dict[str, Any]]:
+    """Flatten Gamma public-search responses into market-like raw records."""
+    items: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    if not isinstance(raw, dict):
+        return items
+    for key in ("markets", "results"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            items.extend(x for x in value if isinstance(x, dict))
+    events = raw.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_title = event.get("title") or event.get("question") or ""
+            event_slug = event.get("slug") or ""
+            for market in event.get("markets", []) or []:
+                if isinstance(market, dict):
+                    merged = dict(market)
+                    merged.setdefault("event_title", event_title)
+                    merged.setdefault("event_slug", event_slug)
+                    items.append(merged)
+    return items
+
+
 def normalize_market(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     outcomes = jsonish(raw.get("outcomes")) or []
     prices = jsonish(raw.get("outcomePrices")) or []
@@ -261,8 +307,10 @@ def normalize_market(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     return {
         "market_id": market_id,
+        "condition_id": str(raw.get("conditionId") or raw.get("condition_id") or ""),
         "question": question[:280],
         "slug": raw.get("slug") or raw.get("market_slug") or "",
+        "category": raw.get("category") or raw.get("event_title") or raw.get("event_slug") or "",
         "volume": to_float(raw.get("volume") or raw.get("volumeNum") or raw.get("volume24hr") or raw.get("volume24hrClob"), 0.0),
         "liquidity": to_float(raw.get("liquidity") or raw.get("liquidityNum"), 0.0),
         "end_date": raw.get("endDate") or raw.get("end_date") or raw.get("endDateIso") or "",
@@ -306,13 +354,28 @@ def fetch_markets(limit: int, min_volume: float, mock: bool, allow_proxy: bool) 
     if mock:
         markets = mock_markets()
     else:
-        raw = fetch_json(GAMMA_MARKETS_URL.format(limit=max(limit * 3, limit)), allow_proxy=allow_proxy)
-        if isinstance(raw, dict) and "markets" in raw:
-            raw_items = raw.get("markets") or []
-        elif isinstance(raw, list):
-            raw_items = raw
-        else:
-            raw_items = []
+        universe = duel_universe()
+        search_query = os.environ.get("AURUM_DUEL_SEARCH_QUERY", "").strip()
+        if universe in {"bitcoin", "btc"} and not search_query:
+            search_query = "bitcoin"
+        raw_items: List[Dict[str, Any]] = []
+        if search_query:
+            try:
+                raw_search = fetch_json(
+                    GAMMA_SEARCH_URL.format(query=urllib.parse.quote(search_query)),
+                    allow_proxy=allow_proxy,
+                )
+                raw_items = extract_search_market_items(raw_search)
+            except Exception:
+                raw_items = []
+        if not raw_items:
+            raw = fetch_json(GAMMA_MARKETS_URL.format(limit=max(limit * 8, limit)), allow_proxy=allow_proxy)
+            if isinstance(raw, dict) and "markets" in raw:
+                raw_items = raw.get("markets") or []
+            elif isinstance(raw, list):
+                raw_items = raw
+            else:
+                raw_items = []
         markets = []
         for item in raw_items:
             if not isinstance(item, dict):
@@ -320,6 +383,9 @@ def fetch_markets(limit: int, min_volume: float, mock: bool, allow_proxy: bool) 
             m = normalize_market(item)
             if m:
                 markets.append(m)
+    universe = duel_universe()
+    if universe and universe not in {"all", "any", "general"}:
+        markets = [m for m in markets if market_matches_universe(m, universe)]
     markets = [m for m in markets if m.get("volume", 0.0) >= min_volume]
     markets.sort(key=lambda m: (m.get("volume", 0.0), m.get("liquidity", 0.0)), reverse=True)
     return markets[:limit]
@@ -765,6 +831,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        load_env_file(pathlib.Path(args.env_file) if getattr(args, "env_file", None) else None)
         args.func(args)
         return 0
     except Exception as exc:

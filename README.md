@@ -49,5 +49,6 @@ Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting f
 - Guangzhou ECS preflight result: [`docs/vps-preflight-ailcloud-esc-20260613.md`](docs/vps-preflight-ailcloud-esc-20260613.md)
 - VPS provider shortlist: [`docs/vps-provider-shortlist.md`](docs/vps-provider-shortlist.md)
 - DeepSeek/SuperWing paper-wallet duel: [`docs/deepseek-agent-duel.md`](docs/deepseek-agent-duel.md)
+- Bitcoin-only trading terminal dashboard v2: [`docs/bitcoin-terminal-dashboard-v2.md`](docs/bitcoin-terminal-dashboard-v2.md)
 - Paper duel scheduling and VPS timer: [`docs/paper-duel-scheduling.md`](docs/paper-duel-scheduling.md)
 - Public dashboard and 5h strategy review: [`docs/public-dashboard-and-strategy-review.md`](docs/public-dashboard-and-strategy-review.md)

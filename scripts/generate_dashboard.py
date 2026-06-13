@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the public Aurum paper-duel transparency dashboard.
+"""Generate the public Aurum paper-duel trading terminal dashboard.
 
 Static output only. It reads paper-ledger/tick/review files and writes an HTML
 snapshot that can be served by nginx. No API keys or env secrets are emitted.
@@ -13,19 +13,179 @@ import html
 import json
 import os
 import pathlib
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import agent_duel as duel
 import strategy_rules
 
 AGENT_LABELS = {
-    "superwing": "SuperWing baseline",
-    "deepseek": "DeepSeek agent",
+    "superwing": "SuperWing",
+    "deepseek": "DeepSeek",
 }
+
+AGENT_COLORS = {
+    "superwing": "#a78bfa",
+    "deepseek": "#22d3ee",
+}
+
+BITCOIN_TERMS = ("bitcoin", "btc", "satoshi")
+
+CSS = """
+:root {
+  color-scheme: dark;
+  --bg: #050505;
+  --panel: #0a0a0a;
+  --line: #222;
+  --line-soft: #151515;
+  --text: #f5f5f5;
+  --muted: #8a8a8a;
+  --muted-2: #5e5e5e;
+  --btc: #f7931a;
+  --superwing: #a78bfa;
+  --deepseek: #22d3ee;
+  --green: #2fd37f;
+  --red: #ff5c5c;
+  --amber: #f3c969;
+}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+a { color: inherit; }
+.terminal {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 300px minmax(520px, 1fr) 390px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.left-rail, .right-log {
+  min-height: 100vh;
+  background: #070707;
+}
+.left-rail { border-right: 1px solid var(--line); }
+.right-log { border-left: 1px solid var(--line); }
+.center-stage { min-width: 0; display: grid; grid-template-rows: auto 1fr auto; }
+.topbar {
+  height: 66px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 0 22px;
+  border-bottom: 1px solid var(--line);
+  background: #060606;
+}
+.brand { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+.brand h1 { margin: 0; font-size: 21px; letter-spacing: -.04em; font-weight: 650; }
+.brand span, .meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.meta { display: flex; gap: 16px; align-items: center; }
+.rail-section { padding: 16px 16px 18px; border-bottom: 1px solid var(--line); }
+.rail-title { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; margin-bottom: 12px; }
+.big-number { font-size: 34px; line-height: 1; letter-spacing: -.06em; font-weight: 680; }
+.caption { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.agent-row, .rank-row, .log-row, .position-row {
+  display: grid;
+  gap: 6px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.agent-row:first-of-type, .rank-row:first-of-type, .log-row:first-of-type, .position-row:first-of-type { border-top: 0; }
+.agent-head, .rank-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.agent-name { font-weight: 650; letter-spacing: -.02em; }
+.agent-sub, .tiny { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.agent-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; color: var(--muted); font-size: 12px; }
+.agent-stats b { display: block; color: var(--text); font-size: 15px; margin-top: 2px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; vertical-align: middle; margin-right: 8px; background: currentColor; }
+.pill { border: 1px solid var(--line); color: var(--muted); padding: 3px 7px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+.pill.green { color: var(--green); border-color: rgba(47,211,127,.35); }
+.pill.amber { color: var(--amber); border-color: rgba(243,201,105,.35); }
+.chart-wrap { position: relative; padding: 18px 22px 10px; min-height: 610px; }
+.chart-title { display: flex; justify-content: space-between; gap: 18px; align-items: end; margin-bottom: 12px; }
+.chart-title h2 { margin: 0; font-size: clamp(26px, 4vw, 46px); letter-spacing: -.06em; font-weight: 650; }
+.chart-title p { margin: 7px 0 0; color: var(--muted); max-width: 780px; line-height: 1.45; }
+.legend-line { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; }
+.legend-line span { white-space: nowrap; }
+.chart { width: 100%; height: auto; display: block; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #050505; }
+.mid-grid { stroke: #171717; stroke-width: 1; }
+.axis { stroke: #333; stroke-width: 1; }
+.axis-label { fill: #7f7f7f; font-size: 11px; }
+.trade-pip { stroke: #050505; stroke-width: 2; }
+.stage-footer {
+  border-top: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  min-height: 104px;
+}
+.footer-cell { padding: 14px 16px; border-right: 1px solid var(--line); }
+.footer-cell:last-child { border-right: 0; }
+.footer-cell span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .11em; }
+.footer-cell b { display: block; margin-top: 8px; font-size: 18px; letter-spacing: -.03em; }
+.log-head { height: 66px; padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+.log-head h2 { margin: 0; font-size: 18px; letter-spacing: -.03em; }
+.log-list { max-height: calc(100vh - 66px); overflow: auto; }
+.log-row { padding: 12px 16px; grid-template-columns: 62px 1fr; }
+.log-time { color: var(--muted-2); font-size: 11px; }
+.log-main { min-width: 0; }
+.log-top { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.log-action { font-weight: 650; }
+.log-market { color: var(--muted); font-size: 12px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.log-detail { color: var(--text); font-size: 12px; line-height: 1.45; }
+.log-note { color: var(--muted); font-size: 11px; line-height: 1.35; margin-top: 4px; }
+pre.rules {
+  margin: 10px 0 0;
+  padding: 10px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line-soft);
+  max-height: 190px;
+  overflow: auto;
+  color: var(--muted);
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  background: transparent;
+}
+.empty { color: var(--muted); padding: 18px 16px; line-height: 1.45; }
+@media (max-width: 1180px) {
+  .terminal { grid-template-columns: 270px minmax(440px, 1fr); }
+  .right-log { grid-column: 1 / -1; min-height: auto; border-left: 0; border-top: 1px solid var(--line); }
+  .log-list { max-height: 420px; }
+}
+@media (max-width: 860px) {
+  .terminal { display: block; }
+  .left-rail, .right-log { min-height: auto; border: 0; border-bottom: 1px solid var(--line); }
+  .topbar, .chart-title, .meta { display: block; height: auto; }
+  .topbar { padding: 16px; }
+  .chart-wrap { padding: 16px; min-height: auto; }
+  .stage-footer { grid-template-columns: 1fr 1fr; }
+}
+"""
 
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_ts(value: Any) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    s = str(value).replace("Z", "+00:00")
+    try:
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def short_time(value: Any) -> str:
+    parsed = parse_ts(value)
+    if parsed:
+        return parsed.strftime("%H:%M:%S")
+    text = str(value or "")
+    return text[11:19] if len(text) >= 19 else text[:8]
 
 
 def read_jsonl(path: pathlib.Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -34,7 +194,7 @@ def read_jsonl(path: pathlib.Path, limit: Optional[int] = None) -> List[Dict[str
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if limit is not None:
         lines = lines[-limit:]
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for line in lines:
         if not line.strip():
             continue
@@ -49,13 +209,18 @@ def read_jsonl(path: pathlib.Path, limit: Optional[int] = None) -> List[Dict[str
 
 def read_json(path: pathlib.Path, default: Any) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         return default
 
 
 def esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def trunc(value: Any, limit: int = 86) -> str:
+    text = str(value if value is not None else "")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def fmt_money(value: Any) -> str:
@@ -65,11 +230,21 @@ def fmt_money(value: Any) -> str:
         return "0.00"
 
 
-def fmt_pct(value: Any) -> str:
+def fmt_pct(value: Any, already_pct: bool = False) -> str:
     try:
-        return f"{float(value) * 100:+.2f}%"
+        v = float(value)
+        if not already_pct:
+            v *= 100
+        return f"{v:+.2f}%"
     except Exception:
         return "+0.00%"
+
+
+def fmt_price(value: Any) -> str:
+    try:
+        return f"{float(value):.3f}"
+    except Exception:
+        return "—"
 
 
 def env_public(env_file: Optional[pathlib.Path]) -> Dict[str, str]:
@@ -78,6 +253,10 @@ def env_public(env_file: Optional[pathlib.Path]) -> Dict[str, str]:
         "AURUM_DUEL_LIMIT",
         "AURUM_DUEL_MIN_VOLUME",
         "AURUM_DUEL_MAX_ORDERS",
+        "AURUM_DUEL_UNIVERSE",
+        "AURUM_DUEL_SEARCH_QUERY",
+        "AURUM_BOT_MIN_INTERVAL_SEC",
+        "AURUM_FIRST_CONTEST_DAYS",
         "AURUM_DEEPSEEK_ALLOW_PAPER_APPLY",
         "AURUM_DEEPSEEK_MAX_ORDERS",
         "AURUM_DEEPSEEK_MAX_NOTIONAL",
@@ -118,145 +297,98 @@ def latest_scores(state: Dict[str, Any], ticks: List[Dict[str, Any]]) -> List[Di
     return rows
 
 
-def score_chart(ticks: List[Dict[str, Any]]) -> str:
-    series: Dict[str, List[float]] = {"superwing": [], "deepseek": []}
-    labels: List[str] = []
-    for tick in ticks[-48:]:
-        labels.append(str(tick.get("ts", tick.get("tick_id", "")))[:16])
+def market_is_bitcoin(market: Dict[str, Any]) -> bool:
+    text = " ".join(
+        str(market.get(k, "")) for k in ("question", "slug", "title", "category", "description")
+    ).lower()
+    return any(term in text for term in BITCOIN_TERMS)
+
+
+def choose_bitcoin_market(markets: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = [m for m in markets if isinstance(m, dict) and market_is_bitcoin(m)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda m: (float(m.get("volume", 0.0) or 0.0), float(m.get("liquidity", 0.0) or 0.0)), reverse=True)
+    return candidates[0]
+
+
+def yes_price(market: Dict[str, Any]) -> Optional[float]:
+    outcomes = market.get("outcomes") or []
+    if not isinstance(outcomes, list):
+        return None
+    chosen = None
+    for item in outcomes:
+        if str(item.get("name", "")).lower() in {"yes", "up", "higher", "above"}:
+            chosen = item
+            break
+    if chosen is None and outcomes:
+        chosen = outcomes[0]
+    try:
+        return float(chosen.get("price")) if chosen else None
+    except Exception:
+        return None
+
+
+def snapshot_records(data_dir: pathlib.Path, ticks: List[Dict[str, Any]], limit: int = 160) -> List[Dict[str, Any]]:
+    seen: set[pathlib.Path] = set()
+    paths: List[pathlib.Path] = []
+    root = data_dir / "snapshots"
+    if root.exists():
+        paths.extend(sorted(root.glob("*.json"))[-limit:])
+    for tick in ticks[-limit:]:
+        raw = tick.get("snapshot_file")
+        if raw:
+            p = pathlib.Path(str(raw))
+            if p.exists():
+                paths.append(p)
+    rows = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        row = read_json(path, None)
+        if isinstance(row, dict):
+            rows.append(row)
+    rows.sort(key=lambda r: str(r.get("ts") or r.get("snapshot_id") or ""))
+    return rows[-limit:]
+
+
+def bitcoin_series(data_dir: pathlib.Path, ticks: List[Dict[str, Any]], state: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], str]:
+    points: List[Dict[str, Any]] = []
+    latest_market: Optional[Dict[str, Any]] = None
+    for snap in snapshot_records(data_dir, ticks):
+        market = choose_bitcoin_market(snap.get("markets", []) or [])
+        if not market:
+            continue
+        price = yes_price(market)
+        if price is None:
+            continue
+        latest_market = market
+        points.append({"ts": snap.get("ts") or snap.get("snapshot_id"), "value": price, "market": market})
+    if not latest_market:
+        latest_market = choose_bitcoin_market(state.get("last_markets", []) if isinstance(state, dict) else [])
+        if latest_market:
+            price = yes_price(latest_market)
+            if price is not None:
+                points.append({"ts": state.get("updated_at") or utc_now(), "value": price, "market": latest_market})
+    return points[-120:], latest_market, "btc_market_yes_price"
+
+
+def roi_series(ticks: List[Dict[str, Any]], state: Dict[str, Any], scores: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    series: Dict[str, List[Dict[str, Any]]] = {"superwing": [], "deepseek": []}
+    for tick in ticks[-120:]:
         by_agent = {row.get("agent_id"): row for row in tick.get("scores", []) if isinstance(row, dict)}
         for agent in series:
-            series[agent].append(float(by_agent.get(agent, {}).get("score", 0.0)))
-    if not labels:
-        labels = ["start", "now"]
-        series = {"superwing": [0.0, 0.0], "deepseek": [0.0, 0.0]}
-    values = [v for arr in series.values() for v in arr] or [0.0]
-    low = min(values + [-0.5])
-    high = max(values + [0.5])
-    if high == low:
-        high += 1
-        low -= 1
-    width, height = 820, 260
-    pad_l, pad_r, pad_t, pad_b = 52, 24, 24, 42
-    plot_w = width - pad_l - pad_r
-    plot_h = height - pad_t - pad_b
-
-    def pt(idx: int, value: float, n: int) -> str:
-        x = pad_l + (idx / max(1, n - 1)) * plot_w
-        y = pad_t + (1 - ((value - low) / (high - low))) * plot_h
-        return f"{x:.1f},{y:.1f}"
-
-    lines = []
-    colors = {"superwing": "#8b5cf6", "deepseek": "#22d3ee"}
-    for agent, arr in series.items():
-        points = " ".join(pt(i, v, len(arr)) for i, v in enumerate(arr))
-        lines.append(f'<polyline points="{points}" fill="none" stroke="{colors[agent]}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>')
-    zero_y = pad_t + (1 - ((0 - low) / (high - low))) * plot_h
-    return f"""
-    <svg class="chart" viewBox="0 0 {width} {height}" role="img" aria-label="ROI score history">
-      <rect x="0" y="0" width="{width}" height="{height}" rx="18" fill="rgba(255,255,255,.035)"/>
-      <line x1="{pad_l}" y1="{zero_y:.1f}" x2="{width-pad_r}" y2="{zero_y:.1f}" stroke="rgba(255,255,255,.22)" stroke-dasharray="5 7"/>
-      <text x="{pad_l}" y="20" fill="rgba(255,255,255,.55)" font-size="12">score / ROI%</text>
-      <text x="{pad_l}" y="{height-12}" fill="rgba(255,255,255,.45)" font-size="11">{esc(labels[0])}</text>
-      <text x="{width-pad_r-150}" y="{height-12}" fill="rgba(255,255,255,.45)" font-size="11">{esc(labels[-1])}</text>
-      {''.join(lines)}
-    </svg>
-    """
-
-
-def agent_cards(scores: List[Dict[str, Any]], state: Dict[str, Any], env: Dict[str, str]) -> str:
-    by_agent = {row.get("agent_id"): row for row in scores}
-    out = []
-    for agent in duel.AGENTS:
-        row = by_agent.get(agent, {})
-        account = state.get("accounts", {}).get(agent, {}) if isinstance(state, dict) else {}
-        model = "deterministic baseline"
-        if agent == "deepseek":
-            model = env.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        out.append(f"""
-        <section class="agent-card {agent}">
-          <div class="agent-top"><span class="agent-name">{esc(AGENT_LABELS[agent])}</span><span class="pill">{esc(model)}</span></div>
-          <div class="metrics">
-            <div><span>初始资金</span><b>{fmt_money(account.get('starting_equity', row.get('starting_equity', 1500)))}</b></div>
-            <div><span>目前资金</span><b>{fmt_money(row.get('portfolio_value', account.get('cash', 1500)))}</b></div>
-            <div><span>现金</span><b>{fmt_money(row.get('cash', account.get('cash', 1500)))}</b></div>
-            <div><span>ROI / 分数</span><b>{fmt_pct(row.get('roi', 0))}</b></div>
-          </div>
-          <p class="muted">持仓 {esc(row.get('open_positions', len(account.get('positions', {}))))} · 已记录交易 {esc(len(account.get('trades', [])))} · 风险事件 {esc(len(account.get('risk_events', [])))}</p>
-        </section>
-        """)
-    return "\n".join(out)
-
-
-def flow_cards(env: Dict[str, str], rules: Dict[str, Any], latest_tick: Optional[Dict[str, Any]], latest_review: Optional[Dict[str, Any]]) -> str:
-    mode = env.get("AURUM_DUEL_MODE", latest_tick.get("mode", "review_only") if latest_tick else "review_only")
-    review_model = env.get("AURUM_REVIEW_MODEL", "deepseek-v4-pro")
-    auto_promote = env.get("AURUM_RULE_AUTO_PROMOTE", "false")
-    ds_apply = env.get("AURUM_DEEPSEEK_ALLOW_PAPER_APPLY", "false")
-    return f"""
-    <section class="flow">
-      <div class="step"><b>1 抓市场</b><span>VPS 每小时取同一份 Polymarket slate</span></div>
-      <div class="arrow">→</div>
-      <div class="step"><b>2 同场决策</b><span>SuperWing + DeepSeek 共用 snapshot</span></div>
-      <div class="arrow">→</div>
-      <div class="step"><b>3 本地风控</b><span>buy-only · max_orders={esc(env.get('AURUM_DUEL_MAX_ORDERS', env.get('AURUM_DEEPSEEK_MAX_ORDERS', '2')))} · DS notional≤{esc(env.get('AURUM_DEEPSEEK_MAX_NOTIONAL', '45'))}</span></div>
-      <div class="arrow">→</div>
-      <div class="step"><b>4 账本模式</b><span class="status">{esc(mode)} · DS paper apply={esc(ds_apply)}</span></div>
-      <div class="arrow">→</div>
-      <div class="step"><b>5 5h复盘</b><span>{esc(review_model)} · prompt auto-update={esc(auto_promote)}</span></div>
-    </section>
-    <section class="legend">
-      <div><b>当前不是黑箱：</b>网站公开显示资金、tick、决策、拒单、规则、复盘版本。</div>
-      <div><b>安全边界：</b>没有真钱钱包、没有私钥、没有真实下单；公开页不输出任何 API key。</div>
-      <div><b>最新 tick：</b>{esc((latest_tick or {}).get('tick_id', 'none'))}</div>
-      <div><b>最新复盘：</b>{esc((latest_review or {}).get('review_id', 'none'))}</div>
-    </section>
-    """
-
-
-def latest_decisions(ticks: List[Dict[str, Any]], decisions: List[Dict[str, Any]], limit: int = 14) -> str:
-    rows = []
-    # Prefer tick-level records because they show same-snapshot decisions.
-    for tick in ticks[-limit:][::-1]:
-        agents = tick.get("agents", {})
-        for agent in duel.AGENTS:
-            info = agents.get(agent, {}) if isinstance(agents, dict) else {}
-            decision = info.get("decision", {}) if isinstance(info, dict) else {}
-            result = info.get("result", {}) if isinstance(info, dict) else {}
-            orders = decision.get("orders", []) or []
-            fills = result.get("fills", []) or []
-            rejections = result.get("rejections", []) or []
-            rows.append(f"""
-            <li>
-              <span class="time">{esc(tick.get('ts', '')[:19])}</span>
-              <b>{esc(agent)}</b>
-              <span>orders {len(orders)} · fills {len(fills)} · rejects {len(rejections)}</span>
-              <em>{esc(decision.get('notes', ''))}</em>
-            </li>
-            """)
-    if not rows:
-        for item in decisions[-limit:][::-1]:
-            decision = item.get("decision", {})
-            rows.append(f"<li><span class='time'>{esc(item.get('ts','')[:19])}</span><b>{esc(item.get('agent_id'))}</b><span>orders {len(decision.get('orders', []) or [])}</span><em>{esc(decision.get('notes',''))}</em></li>")
-    return "<ul class='timeline'>" + "\n".join(rows[:limit]) + "</ul>"
-
-
-def review_panel(reviews: List[Dict[str, Any]]) -> str:
-    if not reviews:
-        return "<p class='muted'>还没有 5h 高级复盘记录。</p>"
-    latest = reviews[-1]
-    findings = latest.get("findings", []) or []
-    changes = latest.get("promoted", {}) or latest.get("proposed", {}) or {}
-    return f"""
-    <div class="review-card">
-      <div class="agent-top"><span class="agent-name">最新 5h 高级复盘</span><span class="pill">{esc(latest.get('review_model', ''))}</span></div>
-      <p>{esc(latest.get('summary', ''))}</p>
-      <p class="muted">review_id={esc(latest.get('review_id', ''))} · auto_promote={esc(latest.get('auto_promote', False))}</p>
-      <h3>发现</h3>
-      <ul>{''.join('<li>'+esc(x)+'</li>' for x in findings[:6])}</ul>
-      <h3>规则更新</h3>
-      <pre>{esc(json.dumps(changes, ensure_ascii=False, indent=2)[:2600])}</pre>
-    </div>
-    """
+            row = by_agent.get(agent)
+            if row:
+                series[agent].append({"ts": tick.get("ts"), "value": float(row.get("roi", 0.0) or 0.0)})
+    if not any(series.values()):
+        now = state.get("updated_at") if isinstance(state, dict) else utc_now()
+        by_agent = {row.get("agent_id"): row for row in scores if isinstance(row, dict)}
+        for agent in series:
+            row = by_agent.get(agent, {})
+            series[agent].append({"ts": now, "value": float(row.get("roi", 0.0) or 0.0)})
+    return series
 
 
 def read_reviews(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
@@ -271,24 +403,257 @@ def read_reviews(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def rules_panel(rules: Dict[str, Any]) -> str:
+def extract_trade_events(ticks: List[Dict[str, Any]], decisions: List[Dict[str, Any]], limit: int = 80) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for tick in ticks[-80:]:
+        tick_ts = tick.get("ts") or tick.get("tick_id")
+        agents = tick.get("agents", {}) if isinstance(tick.get("agents"), dict) else {}
+        for agent in duel.AGENTS:
+            info = agents.get(agent, {}) if isinstance(agents, dict) else {}
+            decision = info.get("decision", {}) if isinstance(info, dict) else {}
+            result = info.get("result", {}) if isinstance(info, dict) else {}
+            for order in decision.get("orders", []) or []:
+                if isinstance(order, dict):
+                    rows.append({
+                        "ts": tick_ts,
+                        "agent_id": agent,
+                        "kind": "ORDER",
+                        "side": str(order.get("side", "buy")).upper(),
+                        "notional": order.get("notional"),
+                        "price": order.get("limit_price"),
+                        "market_id": order.get("market_id"),
+                        "question": order.get("question", "") or order.get("market", ""),
+                        "outcome": order.get("outcome"),
+                        "note": order.get("rationale", ""),
+                    })
+            for fill in result.get("fills", []) or []:
+                if isinstance(fill, dict):
+                    rows.append({
+                        "ts": fill.get("ts") or tick_ts,
+                        "agent_id": agent,
+                        "kind": "FILL",
+                        "side": str(fill.get("side", "buy")).upper(),
+                        "notional": fill.get("notional"),
+                        "price": fill.get("fill_price"),
+                        "market_id": fill.get("market_id"),
+                        "question": fill.get("question", ""),
+                        "outcome": fill.get("outcome"),
+                        "note": fill.get("rationale", ""),
+                    })
+            for reject in result.get("rejections", []) or []:
+                if isinstance(reject, dict):
+                    order = reject.get("order", {}) if isinstance(reject.get("order"), dict) else {}
+                    rows.append({
+                        "ts": reject.get("ts") or tick_ts,
+                        "agent_id": agent,
+                        "kind": "REJECT",
+                        "side": str(order.get("side", "buy")).upper(),
+                        "notional": order.get("notional"),
+                        "price": order.get("limit_price"),
+                        "market_id": order.get("market_id"),
+                        "question": order.get("question", ""),
+                        "outcome": order.get("outcome"),
+                        "note": reject.get("reason", ""),
+                    })
+            # Hold/no-trade notes are useful for audit, but they drown the trading log.
+            # Only emit them as a fallback when there are no order/fill/reject rows at all.
+    if not rows:
+        for item in decisions[-limit:]:
+            decision = item.get("decision", {}) if isinstance(item.get("decision"), dict) else {}
+            for order in decision.get("orders", []) or []:
+                if isinstance(order, dict):
+                    rows.append({
+                        "ts": item.get("ts"),
+                        "agent_id": item.get("agent_id"),
+                        "kind": "ORDER",
+                        "side": str(order.get("side", "buy")).upper(),
+                        "notional": order.get("notional"),
+                        "price": order.get("limit_price"),
+                        "market_id": order.get("market_id"),
+                        "question": order.get("question", ""),
+                        "outcome": order.get("outcome"),
+                        "note": order.get("rationale", ""),
+                    })
+    rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+    return rows[:limit]
+
+
+def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env: Dict[str, str]) -> str:
+    score_by_agent = {row.get("agent_id"): row for row in scores if isinstance(row, dict)}
+    ranked = sorted(scores, key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
+    rank_by_agent = {row.get("agent_id"): idx + 1 for idx, row in enumerate(ranked)}
+    parts: List[str] = []
+    for agent in duel.AGENTS:
+        row = score_by_agent.get(agent, {})
+        account = state.get("accounts", {}).get(agent, {}) if isinstance(state, dict) else {}
+        model = "fixed baseline"
+        if agent == "deepseek":
+            model = env.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        color = AGENT_COLORS[agent]
+        parts.append(f"""
+        <div class="agent-row">
+          <div class="agent-head">
+            <span class="agent-name" style="color:{color}"><span class="dot"></span>{esc(AGENT_LABELS[agent])}</span>
+            <span class="pill">rank #{esc(rank_by_agent.get(agent, '—'))}</span>
+          </div>
+          <div class="agent-sub">{esc(model)} · {esc(env.get('AURUM_DUEL_MODE', account.get('mode', 'paper')))}</div>
+          <div class="agent-stats">
+            <span>equity<b>{fmt_money(row.get('portfolio_value', account.get('cash', 1500)))}</b></span>
+            <span>ROI<b>{fmt_pct(row.get('roi', 0))}</b></span>
+            <span>cash<b>{fmt_money(row.get('cash', account.get('cash', 1500)))}</b></span>
+            <span>trades<b>{esc(len(account.get('trades', [])))}</b></span>
+          </div>
+        </div>
+        """)
+    return "\n".join(parts)
+
+
+def positions_panel(scores: List[Dict[str, Any]]) -> str:
+    rows: List[str] = []
+    for score in scores:
+        for detail in score.get("details", []) or []:
+            rows.append(f"""
+            <div class="position-row">
+              <div class="rank-head"><span>{esc(score.get('agent_id'))}</span><span>{fmt_money(detail.get('value'))}</span></div>
+              <div class="tiny">{esc(detail.get('key'))} · shares {esc(round(float(detail.get('shares', 0.0)), 4))} · mark {fmt_price(detail.get('mark'))}</div>
+            </div>
+            """)
+    if not rows:
+        return "<div class='caption'>暂无持仓。review_only 阶段会先记录建议/拒单；开 paper_apply 后这里会变成真实纸盘仓位。</div>"
+    return "\n".join(rows[:8])
+
+
+def rule_excerpt(rules: Dict[str, Any]) -> str:
     sw = rules.get("superwing", {})
     ds = rules.get("deepseek_rules_excerpt", "")
-    versions = rules.get("versions", []) or []
+    payload = {
+        "superwing": {k: sw.get(k) for k in ("name", "version", "price_min", "price_max", "max_notional", "min_volume")},
+        "deepseek_excerpt": str(ds)[:650],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def x_for_index(idx: int, total: int, left: float, width: float) -> float:
+    if total <= 1:
+        return left + width * 0.5
+    return left + (idx / (total - 1)) * width
+
+
+def line_path(values: List[float], low: float, high: float, left: float, top: float, width: float, height: float) -> str:
+    if not values:
+        return ""
+    span = high - low if high != low else 1.0
+    pts = []
+    for idx, value in enumerate(values):
+        x = x_for_index(idx, len(values), left, width)
+        y = top + (1 - ((value - low) / span)) * height
+        pts.append(f"{x:.1f},{y:.1f}")
+    return " ".join(pts)
+
+
+def trade_chart(
+    btc: List[Dict[str, Any]],
+    roi: Dict[str, List[Dict[str, Any]]],
+    events: List[Dict[str, Any]],
+) -> str:
+    width, height = 1060, 560
+    left, right, top, bottom = 62, 62, 36, 56
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    btc_values = [float(p.get("value", 0.0)) for p in btc]
+    roi_values = [float(p.get("value", 0.0)) for arr in roi.values() for p in arr]
+    btc_low = max(0.0, min(btc_values or [0.45]) - 0.03)
+    btc_high = min(1.0, max(btc_values or [0.55]) + 0.03)
+    if btc_high - btc_low < 0.08:
+        mid = (btc_high + btc_low) / 2
+        btc_low, btc_high = max(0.0, mid - 0.04), min(1.0, mid + 0.04)
+    roi_low = min(roi_values + [-0.004])
+    roi_high = max(roi_values + [0.004])
+    if roi_high == roi_low:
+        roi_high += 0.01
+        roi_low -= 0.01
+    btc_points = line_path(btc_values, btc_low, btc_high, left, top, plot_w, plot_h)
+    roi_lines = []
+    for agent, arr in roi.items():
+        vals = [float(p.get("value", 0.0)) for p in arr]
+        points = line_path(vals, roi_low, roi_high, left, top, plot_w, plot_h)
+        if points:
+            roi_lines.append(f'<polyline points="{points}" fill="none" stroke="{AGENT_COLORS[agent]}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity=".95"/>')
+    grid = []
+    for i in range(6):
+        y = top + i * plot_h / 5
+        grid.append(f'<line class="mid-grid" x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}"/>')
+    pips = []
+    event_points = [e for e in events if e.get("kind") in {"ORDER", "FILL"} and e.get("price") is not None]
+    for idx, event in enumerate(event_points[:30]):
+        raw_price = event.get("price")
+        if raw_price is None:
+            continue
+        try:
+            price = float(raw_price)
+        except Exception:
+            continue
+        x = x_for_index(max(0, len(btc_values) - 1 - (idx % max(1, len(btc_values)))), max(2, len(btc_values)), left, plot_w)
+        span = btc_high - btc_low if btc_high != btc_low else 1.0
+        y = top + (1 - ((price - btc_low) / span)) * plot_h
+        agent = str(event.get("agent_id") or "")
+        color = AGENT_COLORS.get(agent, "#fff")
+        shape = "r='5'" if event.get("kind") == "FILL" else "r='3.5'"
+        pips.append(f'<circle class="trade-pip" cx="{x:.1f}" cy="{y:.1f}" {shape} fill="{color}" opacity=".95"><title>{esc(agent)} {esc(event.get("kind"))} {fmt_price(price)}</title></circle>')
+    if btc_points:
+        btc_line = f'<polyline points="{btc_points}" fill="none" stroke="var(--btc)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>'
+    else:
+        btc_line = f'<text x="{left + 20}" y="{top + plot_h/2:.1f}" fill="#777" font-size="16">waiting for Bitcoin recorder frames</text>'
     return f"""
-    <div class="rules-grid">
-      <section>
-        <h3>SuperWing 当前规则</h3>
-        <pre>{esc(json.dumps(sw, ensure_ascii=False, indent=2))}</pre>
-      </section>
-      <section>
-        <h3>DeepSeek 当前 prompt 规则</h3>
-        <pre>{esc(ds)}</pre>
-      </section>
-    </div>
-    <h3>规则版本流水</h3>
-    <ul class="compact-list">{''.join('<li>'+esc(v.get('ts',''))+' · '+esc(v.get('agent_id',''))+' · '+esc(v.get('action',''))+'</li>' for v in versions[-8:])}</ul>
+    <svg class="chart" viewBox="0 0 {width} {height}" role="img" aria-label="Bitcoin market line, agent ROI lines, and trade points">
+      {''.join(grid)}
+      <line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}"/>
+      <line class="axis" x1="{width-right}" y1="{top}" x2="{width-right}" y2="{height-bottom}"/>
+      <line class="axis" x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}"/>
+      <text class="axis-label" x="{left}" y="22">BTC market price / probability</text>
+      <text class="axis-label" x="{width-right-88}" y="22">agent ROI</text>
+      <text class="axis-label" x="{left}" y="{height-20}">{esc(short_time(btc[0].get('ts') if btc else 'start'))}</text>
+      <text class="axis-label" x="{width-right-70}" y="{height-20}">{esc(short_time(btc[-1].get('ts') if btc else 'now'))}</text>
+      <text class="axis-label" x="14" y="{top+8}">{btc_high:.3f}</text>
+      <text class="axis-label" x="14" y="{height-bottom}">{btc_low:.3f}</text>
+      <text class="axis-label" x="{width-right+10}" y="{top+8}">{fmt_pct(roi_high)}</text>
+      <text class="axis-label" x="{width-right+10}" y="{height-bottom}">{fmt_pct(roi_low)}</text>
+      {btc_line}
+      {''.join(roi_lines)}
+      {''.join(pips)}
+    </svg>
     """
+
+
+def event_log(events: List[Dict[str, Any]]) -> str:
+    if not events:
+        return "<div class='empty'>暂无交易事件。Bitcoin-only bot demo 会先显示 ORDER / FILL / REJECT / NOTE。</div>"
+    rows = []
+    for item in events[:80]:
+        agent = str(item.get("agent_id") or "")
+        color = AGENT_COLORS.get(agent, "#ddd")
+        notional = item.get("notional")
+        price = item.get("price")
+        rows.append(f"""
+        <div class="log-row">
+          <div class="log-time">{esc(short_time(item.get('ts')))}</div>
+          <div class="log-main">
+            <div class="log-top"><span class="log-action" style="color:{color}">{esc(item.get('kind'))} · {esc(AGENT_LABELS.get(agent, agent))}</span><span class="pill">{esc(item.get('side'))}</span></div>
+            <div class="log-detail">{esc(item.get('outcome') or '')} · ${fmt_money(notional)} @ {fmt_price(price)}</div>
+            <div class="log-market">{esc(trunc(item.get('question') or item.get('market_id') or 'market', 96))}</div>
+            <div class="log-note">{esc(trunc(item.get('note'), 150))}</div>
+          </div>
+        </div>
+        """)
+    return "\n".join(rows)
+
+
+def latest_review_summary(reviews: List[Dict[str, Any]]) -> str:
+    if not reviews:
+        return "No 5h pro review yet."
+    latest = reviews[-1]
+    summary = latest.get("summary") or latest.get("public_dashboard_note") or "review recorded"
+    return f"{latest.get('review_id', '')} · {summary}"
 
 
 def render(args: argparse.Namespace) -> pathlib.Path:
@@ -299,14 +664,23 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     strategy_rules.ensure_default_rules(data_dir)
     env = env_public(env_file)
     state = read_json(data_dir / "state.json", {"accounts": {}})
-    ticks = read_jsonl(data_dir / "ticks.jsonl", limit=240)
-    decisions = read_jsonl(data_dir / "decisions.jsonl", limit=200)
+    ticks = read_jsonl(data_dir / "ticks.jsonl", limit=320)
+    decisions = read_jsonl(data_dir / "decisions.jsonl", limit=240)
     reviews = read_reviews(data_dir)
     rules = strategy_rules.summarize_rules(data_dir)
     scores = latest_scores(state, ticks)
-    latest_tick = ticks[-1] if ticks else None
-    latest_review = reviews[-1] if reviews else None
+    scores.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
+    latest_tick = ticks[-1] if ticks else {}
+    btc, latest_btc_market, btc_source = bitcoin_series(data_dir, ticks, state)
+    roi = roi_series(ticks, state, scores)
+    events = extract_trade_events(ticks, decisions)
     updated_at = utc_now()
+    universe = env.get("AURUM_DUEL_UNIVERSE", "bitcoin").lower() or "bitcoin"
+    contest_days = env.get("AURUM_FIRST_CONTEST_DAYS", "7")
+    min_interval = env.get("AURUM_BOT_MIN_INTERVAL_SEC", "5")
+    mode = env.get("AURUM_DUEL_MODE", latest_tick.get("mode", "review_only"))
+    market_question = latest_btc_market.get("question") if latest_btc_market else "Waiting for first Bitcoin snapshot"
+    latest_btc_price = btc[-1]["value"] if btc else None
 
     html_doc = f"""<!doctype html>
 <html lang="zh-CN">
@@ -314,73 +688,64 @@ def render(args: argparse.Namespace) -> pathlib.Path:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex,nofollow" />
-  <title>Aurum Paper Duel Transparency</title>
-  <style>
-    :root {{ color-scheme: dark; --bg:#070915; --panel:rgba(255,255,255,.065); --line:rgba(255,255,255,.12); --text:#eff6ff; --muted:rgba(239,246,255,.66); --cyan:#22d3ee; --violet:#8b5cf6; --green:#34d399; --amber:#fbbf24; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Inter","Segoe UI",sans-serif; background: radial-gradient(circle at top left, rgba(139,92,246,.28), transparent 36rem), radial-gradient(circle at top right, rgba(34,211,238,.18), transparent 34rem), var(--bg); color:var(--text); }}
-    main {{ width:min(1180px, calc(100vw - 32px)); margin:0 auto; padding:34px 0 60px; }}
-    header {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-end; margin-bottom:24px; }}
-    h1 {{ margin:0; font-size:clamp(32px,5vw,58px); letter-spacing:-.05em; }}
-    h2 {{ margin:28px 0 14px; font-size:22px; letter-spacing:-.02em; }}
-    h3 {{ margin:16px 0 8px; font-size:15px; color:rgba(255,255,255,.78); }}
-    .subtitle {{ margin:8px 0 0; color:var(--muted); max-width:760px; line-height:1.55; }}
-    .stamp {{ text-align:right; color:var(--muted); font-size:13px; }}
-    .grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }}
-    .agent-card, .panel, .review-card, .legend, .flow, .rules-grid section {{ border:1px solid var(--line); background:linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,.045)); border-radius:24px; padding:18px; box-shadow:0 24px 70px rgba(0,0,0,.24); }}
-    .agent-card.deepseek {{ border-color:rgba(34,211,238,.28); }} .agent-card.superwing {{ border-color:rgba(139,92,246,.32); }}
-    .agent-top {{ display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:14px; }}
-    .agent-name {{ font-weight:700; font-size:20px; }}
-    .pill {{ border:1px solid var(--line); background:rgba(255,255,255,.08); color:rgba(255,255,255,.78); border-radius:999px; padding:6px 10px; font-size:12px; white-space:nowrap; }}
-    .metrics {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }}
-    .metrics div {{ border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:12px; background:rgba(0,0,0,.16); }}
-    .metrics span {{ display:block; color:var(--muted); font-size:12px; }}
-    .metrics b {{ display:block; margin-top:6px; font-size:22px; letter-spacing:-.03em; }}
-    .muted {{ color:var(--muted); line-height:1.55; }}
-    .flow {{ display:grid; grid-template-columns:1fr auto 1fr auto 1fr auto 1fr auto 1fr; gap:10px; align-items:stretch; }}
-    .step {{ border-radius:18px; padding:14px; background:rgba(0,0,0,.2); border:1px solid rgba(255,255,255,.08); min-height:100px; }}
-    .step b, .step span {{ display:block; }} .step span {{ margin-top:10px; color:var(--muted); line-height:1.35; font-size:13px; }} .status {{ color:var(--green)!important; }}
-    .arrow {{ align-self:center; color:rgba(255,255,255,.36); }}
-    .legend {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 20px; margin-top:12px; color:var(--muted); }}
-    .chart {{ width:100%; height:auto; display:block; }}
-    .timeline, .compact-list {{ list-style:none; padding:0; margin:0; display:grid; gap:8px; }}
-    .timeline li, .compact-list li {{ display:grid; grid-template-columns:150px 100px 150px 1fr; gap:10px; align-items:start; border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:10px; background:rgba(0,0,0,.18); }}
-    .timeline em {{ color:var(--muted); font-style:normal; }} .time {{ color:rgba(255,255,255,.48); font-variant-numeric:tabular-nums; }}
-    .rules-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
-    pre {{ overflow:auto; max-height:430px; margin:0; padding:14px; border-radius:16px; background:rgba(0,0,0,.34); border:1px solid rgba(255,255,255,.08); color:rgba(239,246,255,.82); line-height:1.45; font-size:12px; white-space:pre-wrap; }}
-    footer {{ margin-top:34px; color:rgba(255,255,255,.42); font-size:12px; }}
-    @media (max-width:900px) {{ .grid,.rules-grid,.legend {{ grid-template-columns:1fr; }} .flow {{ grid-template-columns:1fr; }} .arrow {{ display:none; }} .metrics {{ grid-template-columns:repeat(2,1fr); }} header {{ display:block; }} .stamp {{ text-align:left; margin-top:12px; }} .timeline li {{ grid-template-columns:1fr; }} }}
-  </style>
+  <title>Aurum BTC Paper Duel Terminal</title>
+  <style>{CSS}</style>
 </head>
 <body>
-<main>
-  <header>
-    <div>
-      <h1>Aurum Paper Duel</h1>
-      <p class="subtitle">公开透明面板：LLM 资金、交易动态、规则流程、统计图和 5h 高级复盘。当前仍是 paper-only；页面不含任何 API key、钱包、私钥或真实交易凭证。</p>
-    </div>
-    <div class="stamp">generated<br>{esc(updated_at)}<br>tick count {len(ticks)}</div>
-  </header>
+  <main class="terminal">
+    <aside class="left-rail">
+      <section class="rail-section">
+        <div class="rail-title"><span>Contest</span><span class="pill amber">first {esc(contest_days)} days</span></div>
+        <div class="big-number">BTC only</div>
+        <div class="caption">第一版只交易 Bitcoin 相关 Polymarket 市场。共享 recorder，同源数据；agent 只比策略，不比谁抓到不同盘口。</div>
+      </section>
+      <section class="rail-section">
+        <div class="rail-title"><span>Agents</span><span>{esc(mode)}</span></div>
+        {agent_status_panel(scores, state, env)}
+      </section>
+      <section class="rail-section">
+        <div class="rail-title"><span>Positions</span><span>paper</span></div>
+        {positions_panel(scores)}
+      </section>
+      <section class="rail-section">
+        <div class="rail-title"><span>Rules</span><span>visible</span></div>
+        <div class="caption">bot v2 目标：agent 写受限策略规格；固定执行引擎做 5s+ paper 自动交易。</div>
+        <pre class="rules">{esc(rule_excerpt(rules))}</pre>
+      </section>
+    </aside>
 
-  <div class="grid">{agent_cards(scores, state, env)}</div>
+    <section class="center-stage">
+      <div class="topbar">
+        <div class="brand"><h1>Aurum Trading Terminal</h1><span>paper-only · no wallet · no live order</span></div>
+        <div class="meta"><span>generated {esc(updated_at)}</span><span>ticks {len(ticks)}</span><span>btc frames {len(btc)}</span></div>
+      </div>
+      <div class="chart-wrap">
+        <div class="chart-title">
+          <div>
+            <h2>Bitcoin price × agent ROI × trade points</h2>
+            <p>{esc(market_question)} · latest BTC market price {fmt_price(latest_btc_price)} · source {esc(btc_source)}</p>
+          </div>
+          <div class="legend-line">
+            <span style="color:var(--btc)">● BTC market line</span>
+            <span style="color:var(--superwing)">● SuperWing ROI / trades</span>
+            <span style="color:var(--deepseek)">● DeepSeek ROI / trades</span>
+          </div>
+        </div>
+        {trade_chart(btc, roi, events)}
+      </div>
+      <div class="stage-footer">
+        <div class="footer-cell"><span>Universe</span><b>{esc(universe)}</b></div>
+        <div class="footer-cell"><span>Fastest bot interval</span><b>{esc(min_interval)}s hard floor</b></div>
+        <div class="footer-cell"><span>Latest tick</span><b>{esc(latest_tick.get('tick_id', 'none'))}</b></div>
+        <div class="footer-cell"><span>Latest 5h review</span><b>{esc(trunc(latest_review_summary(reviews), 72))}</b></div>
+      </div>
+    </section>
 
-  <h2>一眼看懂：当前交易流程</h2>
-  {flow_cards(env, rules, latest_tick, latest_review)}
-
-  <h2>统计图</h2>
-  <section class="panel">{score_chart(ticks)}<p class="muted">紫色=SuperWing，青色=DeepSeek。Score = mark-to-market ROI × 100。</p></section>
-
-  <h2>交易动态</h2>
-  <section class="panel">{latest_decisions(ticks, decisions)}</section>
-
-  <h2>5h 高级复盘与规则更新</h2>
-  <section class="panel">{review_panel(reviews)}</section>
-
-  <h2>当前规则 / Prompt</h2>
-  <section class="panel">{rules_panel(rules)}</section>
-
-  <footer>Research-only public transparency page. No live wallet, no private key, no real order execution.</footer>
-</main>
+    <aside class="right-log">
+      <div class="log-head"><h2>Event Log</h2><span class="pill">orders / fills / rejects / notes</span></div>
+      <div class="log-list">{event_log(events)}</div>
+    </aside>
+  </main>
 </body>
 </html>
 """
@@ -388,17 +753,21 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     (out_dir / "index.html").write_text(html_doc, encoding="utf-8")
     manifest = {
         "ok": True,
+        "view": "trade_terminal_v2",
         "generated_at": updated_at,
         "tick_count": len(ticks),
-        "latest_tick": (latest_tick or {}).get("tick_id"),
-        "latest_review": (latest_review or {}).get("review_id"),
+        "btc_frame_count": len(btc),
+        "latest_tick": latest_tick.get("tick_id"),
+        "latest_review": (reviews[-1] if reviews else {}).get("review_id"),
+        "universe": universe,
+        "market_question": market_question,
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out_dir / "index.html"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Generate Aurum public static dashboard")
+    p = argparse.ArgumentParser(description="Generate Aurum public static trading terminal dashboard")
     p.add_argument("--data-dir", default="data/paper_duel")
     p.add_argument("--env-file", default=".env")
     p.add_argument("--output-dir", default="public/dashboard")
