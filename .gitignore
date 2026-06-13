@@ -19,6 +19,7 @@ build/
 
 # Local agent/runtime artifacts
 .hermes/
+.worktrees/
 artifacts/
 logs/
 *.log
