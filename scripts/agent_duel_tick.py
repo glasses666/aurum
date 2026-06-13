@@ -125,7 +125,15 @@ def run_tick(args: argparse.Namespace) -> Dict[str, Any]:
     if apply_paper:
         duel.require_deepseek_apply_authorized(deepseek_controls)
 
-    deepseek_decision = duel.deepseek_decision(state["accounts"]["deepseek"], markets, deepseek_controls, data_dir=data_dir)
+    try:
+        deepseek_decision = duel.deepseek_decision(state["accounts"]["deepseek"], markets, deepseek_controls, data_dir=data_dir)
+    except Exception as exc:
+        deepseek_decision = {
+            "agent_id": "deepseek",
+            "orders": [],
+            "notes": f"DeepSeek decision error; held safely: {exc}",
+            "error": str(exc),
+        }
     deepseek_result = duel.validate_and_apply(
         data_dir,
         state,
