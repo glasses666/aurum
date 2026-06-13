@@ -196,7 +196,25 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     duel.load_env_file(env_file)
     strategy_rules.ensure_default_rules(data_dir)
     ctx = review_context(data_dir, args.limit_ticks)
-    review = call_review_model(ctx)
+    try:
+        review = call_review_model(ctx)
+        model_failed = False
+        model_error = ""
+    except Exception as exc:
+        model_failed = True
+        model_error = str(exc)
+        review = {
+            "summary": "Strategy review model output was not parseable; no rule changes promoted in this maintenance cycle.",
+            "findings": [f"review_model_error: {model_error[:500]}"],
+            "superwing_rules": strategy_rules.load_superwing_rules(data_dir),
+            "superwing_rationale": "Fallback only; keep current SuperWing rules.",
+            "deepseek_rules_md": strategy_rules.load_deepseek_rules(data_dir),
+            "deepseek_rationale": "Fallback only; keep current DeepSeek rules.",
+            "risk_notes": ["No rule promotion was performed because the review model output failed validation."],
+            "public_dashboard_note": "Strategy review fallback: malformed model output; current rules kept unchanged.",
+            "review_model": "fallback_no_promote",
+            "structured_retry_used": True,
+        }
     review_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
     proposed: Dict[str, Any] = {}
     promoted: Dict[str, Any] = {}
@@ -212,7 +230,7 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     ds_proposal = strategy_rules.write_proposal(data_dir, review_id, "deepseek", "_rules.md", ds_rules_text)
     proposed["deepseek_rules"] = str(ds_proposal)
 
-    promote = auto_promote_enabled(args)
+    promote = (not model_failed) and auto_promote_enabled(args)
     if promote:
         promoted["superwing_rules"] = str(strategy_rules.promote_superwing_rules(data_dir, sw_rules, source=f"review:{review_id}", rationale=str(review.get("superwing_rationale", ""))))
         promoted["deepseek_rules"] = str(strategy_rules.promote_deepseek_rules(data_dir, ds_rules_text, source=f"review:{review_id}", rationale=str(review.get("deepseek_rationale", ""))))
@@ -222,6 +240,9 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         "review_id": review_id,
         "ts": duel.utc_now(),
         "review_model": review.get("review_model"),
+        "review_status": "fallback_no_promote" if model_failed else "model_ok",
+        "review_model_error": model_error if model_failed else "",
+        "structured_retry_used": bool(review.get("structured_retry_used")),
         "auto_promote": promote,
         "summary": review.get("summary", ""),
         "findings": review.get("findings", []),
