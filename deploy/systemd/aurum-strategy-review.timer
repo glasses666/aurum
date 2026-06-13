@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Aurum advanced strategy review every 5 hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=5h
+Persistent=true
+RandomizedDelaySec=180
+Unit=aurum-strategy-review.service
+
+[Install]
+WantedBy=timers.target

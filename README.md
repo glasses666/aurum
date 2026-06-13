@@ -50,3 +50,4 @@ Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting f
 - VPS provider shortlist: [`docs/vps-provider-shortlist.md`](docs/vps-provider-shortlist.md)
 - DeepSeek/SuperWing paper-wallet duel: [`docs/deepseek-agent-duel.md`](docs/deepseek-agent-duel.md)
 - Paper duel scheduling and VPS timer: [`docs/paper-duel-scheduling.md`](docs/paper-duel-scheduling.md)
+- Public dashboard and 5h strategy review: [`docs/public-dashboard-and-strategy-review.md`](docs/public-dashboard-and-strategy-review.md)

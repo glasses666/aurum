@@ -17,6 +17,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import agent_duel as duel
+import strategy_rules
 
 FORBIDDEN_LIVE_ENV_SUBSTRINGS = (
     "PRIVATE_KEY",
@@ -104,7 +105,7 @@ def run_tick(args: argparse.Namespace) -> Dict[str, Any]:
 
     apply_paper = mode == "paper_apply"
 
-    superwing_decision = duel.superwing_decision(state["accounts"]["superwing"], markets, max_orders=args.max_orders)
+    superwing_decision = duel.superwing_decision(state["accounts"]["superwing"], markets, max_orders=args.max_orders, data_dir=data_dir)
     superwing_result = duel.validate_and_apply(
         data_dir,
         state,
@@ -124,7 +125,7 @@ def run_tick(args: argparse.Namespace) -> Dict[str, Any]:
     if apply_paper:
         duel.require_deepseek_apply_authorized(deepseek_controls)
 
-    deepseek_decision = duel.deepseek_decision(state["accounts"]["deepseek"], markets, deepseek_controls)
+    deepseek_decision = duel.deepseek_decision(state["accounts"]["deepseek"], markets, deepseek_controls, data_dir=data_dir)
     deepseek_result = duel.validate_and_apply(
         data_dir,
         state,
@@ -162,6 +163,7 @@ def run_tick(args: argparse.Namespace) -> Dict[str, Any]:
             },
         },
         "scores": scores,
+        "strategy_rules": strategy_rules.summarize_rules(data_dir),
     }
     append_jsonl(tick_path(data_dir), tick)
     return tick

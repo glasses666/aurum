@@ -11,6 +11,8 @@ Aurum's DeepSeek/SuperWing duel is scheduled on the VPS with systemd timers, not
 - App path: `/opt/aurum/app`
 - Env path: `/opt/aurum/.env` (`aurum:aurum`, mode `600`)
 - Data path: `/opt/aurum/data/paper_duel`
+- Public dashboard path: `/opt/aurum/public/dashboard`
+- Public dashboard generator: `scripts/generate_dashboard.py`
 - Lock path: `/opt/aurum/run/duel.lock`
 - Unit: `aurum-paper-duel-tick.service`
 - Timer: `aurum-paper-duel-tick.timer`
@@ -27,7 +29,8 @@ Do not schedule separate jobs for SuperWing and DeepSeek. One tick must:
 2. fetch one Polymarket market snapshot;
 3. feed the same snapshot to SuperWing and DeepSeek;
 4. run local validation/risk checks for both;
-5. write one tick record and one score snapshot.
+5. write one tick record and one score snapshot;
+6. regenerate the static public dashboard.
 
 The shared tick entrypoint is:
 

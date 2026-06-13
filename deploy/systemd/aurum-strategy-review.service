@@ -1,5 +1,5 @@
 [Unit]
-Description=Aurum paper duel unified tick (review-only by default)
+Description=Aurum 5h advanced strategy review and rule prompt update
 Wants=network-online.target
 After=network-online.target
 
@@ -13,7 +13,8 @@ Environment=AURUM_ENV_FILE=/opt/aurum/.env
 Environment=AURUM_DATA_DIR=/opt/aurum/data/paper_duel
 Environment=AURUM_RUN_DIR=/opt/aurum/run
 Environment=AURUM_LOG_DIR=/opt/aurum/logs
-ExecStart=/opt/aurum/app/scripts/run_paper_duel_tick.sh
+Environment=AURUM_PUBLIC_DASHBOARD_DIR=/opt/aurum/public/dashboard
+ExecStart=/opt/aurum/app/scripts/run_strategy_review.sh
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

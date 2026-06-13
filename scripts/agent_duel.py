@@ -23,6 +23,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import strategy_rules
+
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit={limit}"
 
 STARTING_EQUITY = 1500.0
@@ -83,6 +85,7 @@ def new_account(agent_id: str) -> Dict[str, Any]:
 
 def init_state(data_dir: pathlib.Path, reset: bool = False) -> Dict[str, Any]:
     ensure_data_dir(data_dir)
+    strategy_rules.ensure_default_rules(data_dir)
     p = state_path(data_dir)
     if p.exists() and not reset:
         return load_state(data_dir)
@@ -384,20 +387,27 @@ def compact_account(account: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def superwing_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], max_orders: int = 2) -> Dict[str, Any]:
-    """Conservative deterministic baseline.
+def superwing_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], max_orders: int = 2, data_dir: Optional[pathlib.Path] = None) -> Dict[str, Any]:
+    """Conservative deterministic baseline with versioned, visible rules.
 
-    Looks for liquid binary markets with a cheaper outcome in the 0.25-0.48 band.
-    It is intentionally boring: small notional, explicit limit, no forced trade.
+    The review job may update the JSON rule file, but this code still enforces
+    safe ranges and paper-only buy orders.
     """
+    rules = strategy_rules.load_superwing_rules(data_dir) if data_dir else dict(strategy_rules.DEFAULT_SUPERWING_RULES)
     orders = []
-    max_notional = min(30.0, STARTING_EQUITY * MAX_TRADE_FRACTION)
+    max_notional = min(float(rules.get("max_notional", 30.0)), STARTING_EQUITY * MAX_TRADE_FRACTION)
+    price_min = float(rules.get("price_min", 0.25))
+    price_max = float(rules.get("price_max", 0.48))
+    limit_buffer = float(rules.get("limit_buffer", 0.015))
+    min_volume = float(rules.get("min_volume", 0.0))
     for m in markets:
+        if float(m.get("volume", 0.0)) < min_volume:
+            continue
         candidates = sorted(m["outcomes"], key=lambda o: o["price"])
         chosen = None
         for outcome in candidates:
             p = float(outcome["price"])
-            if 0.25 <= p <= 0.48:
+            if price_min <= p <= price_max:
                 chosen = outcome
                 break
         if not chosen:
@@ -408,9 +418,9 @@ def superwing_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], m
                 "outcome": chosen["name"],
                 "side": "buy",
                 "notional": max_notional,
-                "limit_price": round(min(0.99, float(chosen["price"]) + 0.015), 4),
-                "confidence": 0.51,
-                "rationale": "Liquid underdog/near-even paper probe; small capped risk.",
+                "limit_price": round(min(0.99, float(chosen["price"]) + limit_buffer), 4),
+                "confidence": float(rules.get("confidence", 0.51)),
+                "rationale": str(rules.get("selection", "Liquid underdog/near-even paper probe; small capped risk."))[:500],
             }
         )
         if len(orders) >= max_orders:
@@ -418,11 +428,13 @@ def superwing_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], m
     return {
         "agent_id": "superwing",
         "orders": orders,
-        "notes": "Conservative baseline: small capped buys only; hold if no liquid underdog band exists.",
+        "notes": f"{rules.get('name', 'Conservative baseline')}: {rules.get('notes', 'small capped buys only; hold if no setup exists.')}",
+        "rules_version": rules.get("version"),
+        "rules_updated_at": rules.get("updated_at"),
     }
 
 
-def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any]) -> Tuple[str, str]:
+def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any], strategy_text: str = "") -> Tuple[str, str]:
     system = (
         "You are DeepSeek running a PAPER-ONLY Polymarket strategy test for Aurum. "
         "You cannot place real orders. You cannot request wallets, private keys, USDC, account logins, or geoblock bypass. "
@@ -453,6 +465,7 @@ def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], cont
                 "allowed_side": "buy only",
                 "limit_price_required": True,
             },
+            "current_strategy_rules": strategy_text[:4500],
             "markets": market_slate,
             "required_output_schema": {
                 "agent_id": "deepseek",
@@ -488,7 +501,7 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     raise DuelError("DeepSeek response did not contain a JSON object")
 
 
-def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any]) -> Dict[str, Any]:
+def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any], data_dir: Optional[pathlib.Path] = None) -> Dict[str, Any]:
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         raise DuelError("DEEPSEEK_API_KEY is not set; cannot ask DeepSeek to self-decide")
@@ -496,7 +509,8 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
     endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1/chat/completions").strip()
     if endpoint.rstrip("/").endswith("/v1"):
         endpoint = endpoint.rstrip("/") + "/chat/completions"
-    system, user = deepseek_prompt(account, markets, controls)
+    strategy_text = strategy_rules.load_deepseek_rules(data_dir) if data_dir else ""
+    system, user = deepseek_prompt(account, markets, controls, strategy_text=strategy_text)
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -532,6 +546,8 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
     decision.setdefault("orders", [])
     decision.setdefault("notes", "")
     decision["raw_model"] = model
+    if data_dir:
+        decision["strategy_rules_length"] = len(strategy_text)
     return decision
 
 
@@ -697,14 +713,14 @@ def command_decide(args: argparse.Namespace) -> None:
     validation_max_orders = args.max_orders
     validation_max_notional = STARTING_EQUITY * MAX_TRADE_FRACTION
     if args.agent == "superwing":
-        decision = superwing_decision(state["accounts"]["superwing"], markets, max_orders=args.max_orders)
+        decision = superwing_decision(state["accounts"]["superwing"], markets, max_orders=args.max_orders, data_dir=data_dir)
     elif args.agent == "deepseek":
         controls = deepseek_controls(args.max_orders)
         validation_max_orders = int(controls["max_orders"])
         validation_max_notional = float(controls["max_notional_per_order"])
         if not args.no_apply:
             require_deepseek_apply_authorized(controls)
-        decision = deepseek_decision(state["accounts"]["deepseek"], markets, controls)
+        decision = deepseek_decision(state["accounts"]["deepseek"], markets, controls, data_dir=data_dir)
     else:
         raise DuelError(f"unknown agent: {args.agent}")
     result = validate_and_apply(
