@@ -51,13 +51,15 @@ Server runtime paths:
 - Rule history: `/opt/aurum/data/paper_duel/strategy_rules/history/`
 - Review records: `/opt/aurum/data/paper_duel/strategy_reviews/`
 
-## Timers
+## Runtime services
 
-The paper-duel tick remains hourly:
+The corrected paper-duel hot path is resident, not hourly:
 
 ```text
-aurum-paper-duel-tick.timer
+aurum-bot-loop.service
 ```
+
+It executes versioned mechanical bot scripts from `/opt/aurum/data/paper_duel/bot_scripts/current/` with a hard 5s minimum interval and a 15s default interval. The old `aurum-paper-duel-tick.timer` is kept only as a manual fallback/smoke path unless explicitly re-enabled.
 
 The advanced strategy review runs every 5 hours:
 

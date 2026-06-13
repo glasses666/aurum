@@ -329,7 +329,7 @@ def paper_execution_rules() -> Dict[str, Any]:
         "intermediary_fees_modeled": False,
         "slippage_bps": SLIPPAGE_BPS,
         "min_order_usdc": MIN_PAPER_ORDER_USDC,
-        "allowed_side": "buy only",
+        "allowed_side": "buy and sell",
     }
 
 
@@ -651,7 +651,7 @@ def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], cont
                 "max_orders": controls["max_orders"],
                 "max_notional_per_order": round(float(controls["max_notional_per_order"]), 2),
                 "reserve_cash": RESERVE_CASH,
-                "allowed_side": "buy only",
+                "allowed_side": "buy and sell",
                 "limit_price_required": True,
             },
             "paper_execution_rules": paper_execution_rules(),
@@ -845,14 +845,8 @@ def validate_and_apply(
             if not market:
                 raise DuelError("unknown market_id")
             side = str(order.get("side", "")).lower()
-            if side != "buy":
-                raise DuelError("only buy side is allowed in Phase 0")
-            requested_notional = to_float(order.get("notional"), 0.0)
-            if requested_notional > max_notional_per_order:
-                raise DuelError(f"notional {requested_notional:.4f} exceeds configured cap {max_notional_per_order:.4f}")
-            notional = requested_notional
-            if notional < MIN_PAPER_ORDER_USDC:
-                raise DuelError(f"notional must be at least Polymarket paper minimum {MIN_PAPER_ORDER_USDC:.2f} USDC")
+            if side not in {"buy", "sell"}:
+                raise DuelError("only buy or sell side is allowed in paper mode")
             outcome_name = str(order.get("outcome", ""))
             outcome = None
             for o in market.get("outcomes", []):
@@ -862,76 +856,146 @@ def validate_and_apply(
             if not outcome:
                 raise DuelError("unknown outcome")
             observed_price = float(outcome["price"])
-            fill_price = min(0.99, observed_price + SLIPPAGE_BPS / 10000.0)
             limit_price = to_float(order.get("limit_price"), 0.0)
             if not (0.01 <= limit_price <= 0.99):
                 raise DuelError("valid limit_price is required")
-            if fill_price > limit_price:
-                raise DuelError(f"fill_price {fill_price:.4f} exceeds limit_price {limit_price:.4f}")
-            shares = notional / fill_price
-            fee, fee_rate, fee_category = estimate_taker_fee(shares, fill_price, market)
-            gross_cost = notional + fee
-            if float(account.get("cash", 0.0)) - gross_cost < RESERVE_CASH:
-                raise DuelError("reserve cash would be breached after Polymarket taker fee")
-            if account_exposure(account) + gross_cost > STARTING_EQUITY * MAX_TOTAL_RISK_FRACTION:
-                raise DuelError("total open-risk cap would be breached after Polymarket taker fee")
-            if market_exposure(account, market_id) + gross_cost > STARTING_EQUITY * MAX_MARKET_FRACTION:
-                raise DuelError("per-market exposure cap would be breached after Polymarket taker fee")
             pos_key = market_id + "::" + str(outcome["name"])
-            fill = {
-                "ts": utc_now(),
-                "agent_id": agent_id,
-                "market_id": market_id,
-                "question": market["question"],
-                "outcome": outcome["name"],
-                "side": "buy",
-                "notional": round(notional, 4),
-                "observed_price": round(observed_price, 4),
-                "fill_price": round(fill_price, 4),
-                "shares": round(shares, 6),
-                "fee": round(fee, FEE_PRECISION_PLACES),
-                "fee_rate": fee_rate,
-                "fee_category": fee_category,
-                "gross_cost": round(gross_cost, 5),
-                "paper_execution_role": "taker",
-                "fee_formula": "shares * fee_rate * price * (1 - price)",
-                "rationale": str(order.get("rationale", ""))[:500],
-            }
-            fills.append(fill)
-            if apply:
-                existing = account["positions"].get(pos_key)
-                if existing:
-                    old_shares = float(existing.get("shares", 0.0))
-                    old_cost = float(existing.get("cost_basis", 0.0))
-                    new_shares = old_shares + shares
-                    new_cost = old_cost + gross_cost
-                    existing.update(
-                        {
-                            "shares": new_shares,
-                            "cost_basis": new_cost,
-                            "avg_price": new_cost / new_shares if new_shares else fill_price,
+
+            if side == "buy":
+                requested_notional = to_float(order.get("notional"), 0.0)
+                if requested_notional > max_notional_per_order:
+                    raise DuelError(f"notional {requested_notional:.4f} exceeds configured cap {max_notional_per_order:.4f}")
+                notional = requested_notional
+                if notional < MIN_PAPER_ORDER_USDC:
+                    raise DuelError(f"notional must be at least Polymarket paper minimum {MIN_PAPER_ORDER_USDC:.2f} USDC")
+                fill_price = min(0.99, observed_price + SLIPPAGE_BPS / 10000.0)
+                if fill_price > limit_price:
+                    raise DuelError(f"fill_price {fill_price:.4f} exceeds limit_price {limit_price:.4f}")
+                shares = notional / fill_price
+                fee, fee_rate, fee_category = estimate_taker_fee(shares, fill_price, market)
+                gross_cost = notional + fee
+                if float(account.get("cash", 0.0)) - gross_cost < RESERVE_CASH:
+                    raise DuelError("reserve cash would be breached after Polymarket taker fee")
+                if account_exposure(account) + gross_cost > STARTING_EQUITY * MAX_TOTAL_RISK_FRACTION:
+                    raise DuelError("total open-risk cap would be breached after Polymarket taker fee")
+                if market_exposure(account, market_id) + gross_cost > STARTING_EQUITY * MAX_MARKET_FRACTION:
+                    raise DuelError("per-market exposure cap would be breached after Polymarket taker fee")
+                fill = {
+                    "ts": utc_now(),
+                    "agent_id": agent_id,
+                    "market_id": market_id,
+                    "question": market["question"],
+                    "outcome": outcome["name"],
+                    "side": "buy",
+                    "notional": round(notional, 4),
+                    "observed_price": round(observed_price, 4),
+                    "fill_price": round(fill_price, 4),
+                    "shares": round(shares, 6),
+                    "fee": round(fee, FEE_PRECISION_PLACES),
+                    "fee_rate": fee_rate,
+                    "fee_category": fee_category,
+                    "gross_cost": round(gross_cost, 5),
+                    "paper_execution_role": "taker",
+                    "fee_formula": "shares * fee_rate * price * (1 - price)",
+                    "rationale": str(order.get("rationale", ""))[:500],
+                }
+                fills.append(fill)
+                if apply:
+                    existing = account["positions"].get(pos_key)
+                    if existing:
+                        old_shares = float(existing.get("shares", 0.0))
+                        old_cost = float(existing.get("cost_basis", 0.0))
+                        new_shares = old_shares + shares
+                        new_cost = old_cost + gross_cost
+                        existing.update(
+                            {
+                                "shares": new_shares,
+                                "cost_basis": new_cost,
+                                "avg_price": new_cost / new_shares if new_shares else fill_price,
+                                "last_price": observed_price,
+                                "fees_paid": round(float(existing.get("fees_paid", 0.0)) + fee, FEE_PRECISION_PLACES),
+                                "updated_at": utc_now(),
+                            }
+                        )
+                    else:
+                        account["positions"][pos_key] = {
+                            "market_id": market_id,
+                            "question": market["question"],
+                            "outcome": outcome["name"],
+                            "shares": shares,
+                            "cost_basis": gross_cost,
+                            "avg_price": gross_cost / shares if shares else fill_price,
                             "last_price": observed_price,
-                            "fees_paid": round(float(existing.get("fees_paid", 0.0)) + fee, FEE_PRECISION_PLACES),
+                            "fees_paid": fee,
+                            "fee_category": fee_category,
+                            "created_at": utc_now(),
                             "updated_at": utc_now(),
                         }
-                    )
-                else:
-                    account["positions"][pos_key] = {
-                        "market_id": market_id,
-                        "question": market["question"],
-                        "outcome": outcome["name"],
-                        "shares": shares,
-                        "cost_basis": gross_cost,
-                        "avg_price": gross_cost / shares if shares else fill_price,
-                        "last_price": observed_price,
-                        "fees_paid": fee,
-                        "fee_category": fee_category,
-                        "created_at": utc_now(),
-                        "updated_at": utc_now(),
-                    }
-                account["cash"] = float(account.get("cash", 0.0)) - gross_cost
-                account.setdefault("trades", []).append(fill)
-                account["updated_at"] = utc_now()
+                    account["cash"] = float(account.get("cash", 0.0)) - gross_cost
+                    account.setdefault("trades", []).append(fill)
+                    account["updated_at"] = utc_now()
+            else:
+                existing = account["positions"].get(pos_key)
+                if not existing:
+                    raise DuelError("cannot sell without an open position")
+                held_shares = float(existing.get("shares", 0.0))
+                requested_shares = to_float(order.get("shares"), 0.0)
+                requested_notional = to_float(order.get("notional"), 0.0)
+                if requested_shares <= 0 and requested_notional > 0:
+                    requested_shares = requested_notional / max(0.01, observed_price)
+                shares = min(held_shares, requested_shares)
+                if shares <= 0:
+                    raise DuelError("sell order requires positive shares or notional")
+                fill_price = max(0.01, observed_price - SLIPPAGE_BPS / 10000.0)
+                if fill_price < limit_price:
+                    raise DuelError(f"fill_price {fill_price:.4f} is below limit_price {limit_price:.4f}")
+                fee, fee_rate, fee_category = estimate_taker_fee(shares, fill_price, market)
+                gross_proceeds = shares * fill_price
+                net_proceeds = gross_proceeds - fee
+                if net_proceeds <= 0:
+                    raise DuelError("sell proceeds would be non-positive after fee")
+                fill = {
+                    "ts": utc_now(),
+                    "agent_id": agent_id,
+                    "market_id": market_id,
+                    "question": market["question"],
+                    "outcome": outcome["name"],
+                    "side": "sell",
+                    "notional": round(gross_proceeds, 4),
+                    "observed_price": round(observed_price, 4),
+                    "fill_price": round(fill_price, 4),
+                    "shares": round(shares, 6),
+                    "fee": round(fee, FEE_PRECISION_PLACES),
+                    "fee_rate": fee_rate,
+                    "fee_category": fee_category,
+                    "gross_proceeds": round(gross_proceeds, 5),
+                    "net_proceeds": round(net_proceeds, 5),
+                    "paper_execution_role": "taker",
+                    "fee_formula": "shares * fee_rate * price * (1 - price)",
+                    "rationale": str(order.get("rationale", ""))[:500],
+                }
+                fills.append(fill)
+                if apply:
+                    remaining_shares = held_shares - shares
+                    old_cost = float(existing.get("cost_basis", 0.0))
+                    cost_reduction = old_cost * (shares / held_shares) if held_shares else 0.0
+                    if remaining_shares <= 1e-9:
+                        account["positions"].pop(pos_key, None)
+                    else:
+                        new_cost = max(0.0, old_cost - cost_reduction)
+                        existing.update(
+                            {
+                                "shares": remaining_shares,
+                                "cost_basis": new_cost,
+                                "avg_price": (new_cost / remaining_shares) if remaining_shares else fill_price,
+                                "last_price": observed_price,
+                                "fees_paid": round(float(existing.get("fees_paid", 0.0)) + fee, FEE_PRECISION_PLACES),
+                                "updated_at": utc_now(),
+                            }
+                        )
+                    account["cash"] = float(account.get("cash", 0.0)) + net_proceeds
+                    account.setdefault("trades", []).append(fill)
+                    account["updated_at"] = utc_now()
         except Exception as exc:
             rejection = {"ts": utc_now(), "agent_id": agent_id, "order": order, "reason": str(exc)}
             rejections.append(rejection)

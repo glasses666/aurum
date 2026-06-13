@@ -16,7 +16,7 @@ GitHub scout result:
 3. `TauricResearch/TradingAgents` and `virattt/ai-hedge-fund` are strong LLM-finance frameworks, but they are stock/portfolio research systems and heavier than needed for first Polymarket paper testing.
 4. `LangGraph` is a good orchestration substrate later if the decision loop needs durable multi-step state, but Phase 0 does not need that complexity.
 
-Decision: start with Aurum-owned stdlib Python harness for auditable local state, then optionally attach `polymarket-paper-trader` as an MCP/reference engine once the local ledger rules are proven.
+Decision: start with Aurum-owned stdlib Python harness for auditable local state. The corrected hot path is a resident mechanical bot loop: the agent/review layer writes versioned JSON bot scripts, and the bot loop executes those scripts mechanically without a per-tick LLM call.
 
 ## Safety boundary
 
@@ -99,7 +99,7 @@ DeepSeek receives a compact market slate and the account state, then must output
 }
 ```
 
-Allowed side in Phase 0: `buy` only. Sells/cancels arrive after the ledger has proper position accounting and forward execution evidence.
+Allowed side in the corrected mechanical-bot lane: `buy` and `sell`. Sells are paper-only position exits triggered by scripted take-profit / stop-loss / max-hold rules after the ledger has an open position.
 
 ## Fill model
 

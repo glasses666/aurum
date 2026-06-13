@@ -1,51 +1,92 @@
 # Paper Duel Scheduling
 
-Aurum's DeepSeek/SuperWing duel is scheduled on the VPS with systemd timers, not Hermes cron.
+Aurum's corrected hot path is a **resident mechanical bot loop** on the VPS, not an hourly LLM suggestion timer.
 
-## Current stage
+## Current target stage
 
-- Mode: `review_only`
-- Frequency: hourly, at minute `:07` with up to 90s randomized delay
-- Execution host: Aurum VPS
-- Runtime user: `aurum`
-- App path: `/opt/aurum/app`
-- Env path: `/opt/aurum/.env` (`aurum:aurum`, mode `600`)
-- Data path: `/opt/aurum/data/paper_duel`
-- Public dashboard path: `/opt/aurum/public/dashboard`
-- Public dashboard generator: `scripts/generate_dashboard.py`
-- Lock path: `/opt/aurum/run/duel.lock`
-- Unit: `aurum-paper-duel-tick.service`
-- Timer: `aurum-paper-duel-tick.timer`
+- Mode: `paper_apply` for pre-contest paper stability trading.
+- Execution host: Aurum VPS.
+- Runtime user: `aurum`.
+- App path: `/opt/aurum/app`.
+- Env path: `/opt/aurum/.env` (`aurum:aurum`, mode `600`).
+- Data path: `/opt/aurum/data/paper_duel`.
+- Public dashboard path: `/opt/aurum/public/dashboard`.
+- Lock path: `/opt/aurum/run/duel.lock`.
+- Resident unit: `aurum-bot-loop.service`.
+- Legacy one-shot tick unit: `aurum-paper-duel-tick.service` for manual fallback/smoke only.
 
-## Why systemd instead of Hermes cron
+## Corrected architecture
 
-The trading loop should not depend on Telegram, the local Mac, Hermes gateway uptime, or main-model quota. Hermes cron can audit/report later, but the VPS owns the deterministic paper-duel tick.
+```text
+agent/review layer
+  -> writes versioned mechanical bot scripts
+     /opt/aurum/data/paper_duel/bot_scripts/current/{superwing,deepseek}.json
+  -> resident bot loop reads those scripts
+  -> one shared Bitcoin market snapshot per loop
+  -> each bot mechanically emits buy/sell/hold orders
+  -> runner validates risk, fills paper orders, fees, ledger, dashboard
+```
+
+The bot layer does **not** ask an LLM every tick. DeepSeek/SuperWing rules may be generated or reviewed by agents, but the hot loop executes JSON scripts mechanically.
+
+## Timing
+
+The resident loop clamps timing with:
+
+```text
+AURUM_BOT_MIN_INTERVAL_SEC=5
+AURUM_BOT_DEFAULT_INTERVAL_SEC=15
+```
+
+Default behavior:
+
+- hard minimum interval: `5s`;
+- default script interval: `15s`;
+- the loop sleeps after each tick so it stays resident instead of spawning a new process every few seconds.
+
+The old hourly timer remains only as a fallback/manual smoke path unless explicitly re-enabled:
+
+```text
+aurum-paper-duel-tick.timer
+```
 
 ## Fairness rule
 
-Do not schedule separate jobs for SuperWing and DeepSeek. One tick must:
+Do not schedule separate jobs for SuperWing and DeepSeek. One resident-loop tick must:
 
 1. acquire the duel lock;
-2. fetch one Polymarket market snapshot;
-3. feed the same snapshot to SuperWing and DeepSeek;
+2. fetch one Polymarket Bitcoin market snapshot;
+3. feed the same snapshot to both mechanical bot scripts;
 4. run local validation/risk checks for both;
-5. write one tick record and one score snapshot;
+5. write one tick record and score snapshot;
 6. regenerate the static public dashboard.
 
-The shared tick entrypoint is:
+## Entrypoints
+
+Resident loop wrapper:
 
 ```bash
-python3 scripts/agent_duel_tick.py \
-  --env-file /opt/aurum/.env \
-  --data-dir /opt/aurum/data/paper_duel \
-  --mode review_only \
-  --limit 12
+/opt/aurum/app/scripts/run_bot_loop.sh
 ```
 
-The systemd service calls the wrapper:
+One local smoke tick without starting a daemon:
 
 ```bash
-/opt/aurum/app/scripts/run_paper_duel_tick.sh
+cd /opt/aurum/app
+runuser -u aurum -- python3 scripts/agent_bot_loop.py \
+  --env-file /opt/aurum/.env \
+  --data-dir /opt/aurum/data/paper_duel \
+  --mode paper_apply \
+  --limit 12 \
+  --once
+```
+
+Systemd:
+
+```bash
+systemctl enable --now aurum-bot-loop.service
+systemctl status aurum-bot-loop.service
+journalctl -u aurum-bot-loop.service -n 80 --no-pager
 ```
 
 ## Safety gates
@@ -60,46 +101,14 @@ AURUM_DEEPSEEK_ALLOW_PAPER_APPLY=true
 AURUM_DEEPSEEK_OPERATOR_CONFIRM=ALLOW_DEEPSEEK_PAPER_APPLY
 ```
 
-Current env keeps:
+## Mechanical script semantics
 
-```text
-AURUM_DUEL_MODE=review_only
-AURUM_DEEPSEEK_ALLOW_PAPER_APPLY=false
-```
+Each bot script contains:
 
-## Operational commands
+- `interval_sec` / `min_interval_sec`;
+- `allowed_sides: ["buy", "sell"]`;
+- `buy_when`: price band, volume floor, notional, limit buffer;
+- `sell_when`: take-profit, stop-loss, max-hold, exit fraction, limit buffer;
+- `hold_when`: reserve/risk safety constraints.
 
-Check timer:
-
-```bash
-systemctl status aurum-paper-duel-tick.timer
-systemctl list-timers --all | grep aurum
-```
-
-Run one immediate tick:
-
-```bash
-systemctl start aurum-paper-duel-tick.service
-```
-
-Read logs:
-
-```bash
-journalctl -u aurum-paper-duel-tick.service -n 80 --no-pager
-```
-
-Inspect latest data:
-
-```bash
-ls -lt /opt/aurum/data/paper_duel/snapshots | head
- tail -n 1 /opt/aurum/data/paper_duel/ticks.jsonl
-```
-
-## Stage promotion
-
-Recommended path:
-
-1. Run review-only hourly for at least 24h.
-2. Inspect DS decisions, rejections, JSON stability, and cost.
-3. Only then consider `paper_apply` for a finite 7-day paper contest.
-4. Keep live trading out of scope unless a separate authorized design review approves it.
+The paper runner still enforces global caps regardless of script content.
