@@ -691,21 +691,28 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     raise DuelError("DeepSeek response did not contain a JSON object")
 
 
-def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any], data_dir: Optional[pathlib.Path] = None) -> Dict[str, Any]:
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        raise DuelError("DEEPSEEK_API_KEY is not set; cannot ask DeepSeek to self-decide")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
-    endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1/chat/completions").strip()
-    if endpoint.rstrip("/").endswith("/v1"):
-        endpoint = endpoint.rstrip("/") + "/chat/completions"
-    strategy_text = strategy_rules.load_deepseek_rules(data_dir) if data_dir else ""
-    system, user = deepseek_prompt(account, markets, controls, strategy_text=strategy_text)
-    payload = {
+def deepseek_payload(
+    model: str,
+    system: str,
+    user: str,
+    controls: Dict[str, Any],
+    *,
+    structured_retry: bool = False,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "max_tokens": 900,
+        "response_format": {"type": "json_object"},
     }
+    if structured_retry:
+        payload["thinking"] = {"type": "disabled"}
+        payload["temperature"] = controls["temperature"]
+        payload["messages"] = [
+            {"role": "system", "content": system + " Return the final answer in the content field as one JSON object."},
+            {"role": "user", "content": user + "\n\nThe previous response was not parseable JSON. Retry with exactly one valid JSON object."},
+        ]
+        return payload
     if controls.get("thinking") in {"enabled", "disabled"}:
         payload["thinking"] = {"type": controls["thinking"]}
     if controls.get("thinking") == "enabled":
@@ -713,6 +720,10 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
             payload["reasoning_effort"] = controls["reasoning_effort"]
     else:
         payload["temperature"] = controls["temperature"]
+    return payload
+
+
+def call_deepseek_chat(endpoint: str, api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     req = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
@@ -726,16 +737,63 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
     opener = no_proxy_opener(False)
     try:
         with opener.open(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read(800).decode("utf-8", "replace") if exc.fp else ""
         raise DuelError(f"DeepSeek HTTP {exc.code}: {detail[:400]}") from exc
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    decision = extract_json_object(content)
+
+
+def extract_deepseek_decision_from_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    message = data.get("choices", [{}])[0].get("message", {}) or {}
+    candidates = [
+        str(message.get("content") or ""),
+        str(message.get("reasoning_content") or ""),
+    ]
+    last_error: Optional[Exception] = None
+    for content in candidates:
+        if not content.strip():
+            continue
+        try:
+            return extract_json_object(content)
+        except Exception as exc:
+            last_error = exc
+    raise DuelError(
+        "DeepSeek response did not contain a JSON object "
+        f"(message_keys={sorted(message.keys())}, content_len={len(candidates[0])}, reasoning_len={len(candidates[1])})"
+    ) from last_error
+
+
+def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any], data_dir: Optional[pathlib.Path] = None) -> Dict[str, Any]:
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        raise DuelError("DEEPSEEK_API_KEY is not set; cannot ask DeepSeek to self-decide")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
+    endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1/chat/completions").strip()
+    if endpoint.rstrip("/").endswith("/v1"):
+        endpoint = endpoint.rstrip("/") + "/chat/completions"
+    strategy_text = strategy_rules.load_deepseek_rules(data_dir) if data_dir else ""
+    system, user = deepseek_prompt(account, markets, controls, strategy_text=strategy_text)
+    first_payload = deepseek_payload(model, system, user, controls)
+    data = call_deepseek_chat(endpoint, api_key, first_payload)
+    retry_used = False
+    try:
+        decision = extract_deepseek_decision_from_response(data)
+    except Exception as first_exc:
+        if env_bool("AURUM_DEEPSEEK_STRUCTURED_RETRY", True):
+            retry_payload = deepseek_payload(model, system, user, controls, structured_retry=True)
+            retry_data = call_deepseek_chat(endpoint, api_key, retry_payload)
+            try:
+                decision = extract_deepseek_decision_from_response(retry_data)
+                retry_used = True
+            except Exception as retry_exc:
+                raise DuelError(f"DeepSeek JSON parse failed after structured retry: {retry_exc}") from first_exc
+        else:
+            raise
     decision.setdefault("agent_id", "deepseek")
     decision.setdefault("orders", [])
     decision.setdefault("notes", "")
     decision["raw_model"] = model
+    decision["structured_retry_used"] = retry_used
     if data_dir:
         decision["strategy_rules_length"] = len(strategy_text)
     return decision
