@@ -177,6 +177,7 @@ def deepseek_controls(cli_max_orders: int) -> Dict[str, Any]:
         "max_orders": configured_max_orders,
         "max_notional_per_order": configured_max_notional,
         "temperature": env_float("AURUM_DEEPSEEK_TEMPERATURE", 0.2, low=0.0, high=1.0),
+        "thinking": os.environ.get("AURUM_DEEPSEEK_THINKING", "disabled").strip().lower() or "disabled",
     }
 
 
@@ -501,6 +502,8 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
         "temperature": controls["temperature"],
         "max_tokens": 900,
     }
+    if controls.get("thinking") in {"enabled", "disabled"}:
+        payload["thinking"] = {"type": controls["thinking"]}
     req = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
