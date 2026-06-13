@@ -178,6 +178,7 @@ def deepseek_controls(cli_max_orders: int) -> Dict[str, Any]:
         "max_notional_per_order": configured_max_notional,
         "temperature": env_float("AURUM_DEEPSEEK_TEMPERATURE", 0.2, low=0.0, high=1.0),
         "thinking": os.environ.get("AURUM_DEEPSEEK_THINKING", "disabled").strip().lower() or "disabled",
+        "reasoning_effort": os.environ.get("AURUM_DEEPSEEK_REASONING_EFFORT", "high").strip().lower() or "high",
     }
 
 
@@ -499,11 +500,15 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": controls["temperature"],
         "max_tokens": 900,
     }
     if controls.get("thinking") in {"enabled", "disabled"}:
         payload["thinking"] = {"type": controls["thinking"]}
+    if controls.get("thinking") == "enabled":
+        if controls.get("reasoning_effort") in {"high", "max"}:
+            payload["reasoning_effort"] = controls["reasoning_effort"]
+    else:
+        payload["temperature"] = controls["temperature"]
     req = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
