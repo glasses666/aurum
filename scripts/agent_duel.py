@@ -490,7 +490,7 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         raise DuelError("DEEPSEEK_API_KEY is not set; cannot ask DeepSeek to self-decide")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
     endpoint = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1/chat/completions").strip()
     if endpoint.rstrip("/").endswith("/v1"):
         endpoint = endpoint.rstrip("/") + "/chat/completions"

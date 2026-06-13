@@ -138,7 +138,7 @@ Do not put keys in chat. Put them in a chmod-600 `.env` on the server:
 ```text
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1/chat/completions
-DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_MODEL=deepseek-v4-flash
 
 # Default: review-only. DeepSeek may propose decisions, but cannot alter paper wallet state.
 AURUM_DEEPSEEK_ALLOW_PAPER_APPLY=false
