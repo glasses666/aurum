@@ -98,11 +98,11 @@ Default review model:
 
 ```text
 AURUM_REVIEW_MODEL=deepseek-v4-pro
-AURUM_REVIEW_THINKING=enabled
+AURUM_REVIEW_THINKING=disabled
 AURUM_REVIEW_REASONING_EFFORT=high
 ```
 
-If the configured review model is unavailable, the script falls back to the normal decision model and records which model actually produced the review.
+If the configured review model is unavailable, the script falls back to the normal decision model and records which model actually produced the review. Review thinking is disabled by default because `deepseek-v4-pro` produced cleaner machine-parseable JSON in this mode; DeepSeek's per-tick decision lane still uses thinking/reasoning.
 
 ## Manual commands
 
