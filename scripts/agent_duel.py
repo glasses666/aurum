@@ -35,6 +35,23 @@ MAX_TRADE_FRACTION = 0.03
 MAX_MARKET_FRACTION = 0.08
 MAX_TOTAL_RISK_FRACTION = 0.35
 SLIPPAGE_BPS = 50  # 0.50 percentage points in probability terms.
+POLYMARKET_FEE_DOC_URL = "https://docs.polymarket.com/trading/fees"
+FEE_PRECISION_PLACES = 5
+MIN_PAPER_ORDER_USDC = 5.0
+TAKER_FEE_RATES = {
+    "crypto": 0.07,
+    "sports": 0.03,
+    "finance": 0.04,
+    "politics": 0.04,
+    "economics": 0.05,
+    "culture": 0.05,
+    "weather": 0.05,
+    "other": 0.05,
+    "general": 0.05,
+    "mentions": 0.04,
+    "tech": 0.04,
+    "geopolitics": 0.0,
+}
 
 AGENTS = ("superwing", "deepseek")
 BITCOIN_TERMS = ("bitcoin", "btc", "satoshi")
@@ -70,6 +87,22 @@ def append_jsonl(path: pathlib.Path, record: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def state_runtime_risk() -> Dict[str, Any]:
+    rules = paper_execution_rules()
+    return {
+        "max_trade_fraction": MAX_TRADE_FRACTION,
+        "max_market_fraction": MAX_MARKET_FRACTION,
+        "max_total_risk_fraction": MAX_TOTAL_RISK_FRACTION,
+        "slippage_bps": SLIPPAGE_BPS,
+        "paper_role": rules["paper_fill_role"],
+        "min_order_usdc": MIN_PAPER_ORDER_USDC,
+        "fee_formula": rules["taker_fee_formula"],
+        "fee_precision_places": FEE_PRECISION_PLACES,
+        "taker_fee_rates": TAKER_FEE_RATES,
+        "fee_source": POLYMARKET_FEE_DOC_URL,
+    }
+
+
 def new_account(agent_id: str) -> Dict[str, Any]:
     return {
         "agent_id": agent_id,
@@ -96,12 +129,7 @@ def init_state(data_dir: pathlib.Path, reset: bool = False) -> Dict[str, Any]:
         "version": 1,
         "created_at": utc_now(),
         "updated_at": utc_now(),
-        "risk": {
-            "max_trade_fraction": MAX_TRADE_FRACTION,
-            "max_market_fraction": MAX_MARKET_FRACTION,
-            "max_total_risk_fraction": MAX_TOTAL_RISK_FRACTION,
-            "slippage_bps": SLIPPAGE_BPS,
-        },
+        "risk": state_runtime_risk(),
         "accounts": {agent: new_account(agent) for agent in AGENTS},
         "last_markets": [],
     }
@@ -114,7 +142,9 @@ def load_state(data_dir: pathlib.Path) -> Dict[str, Any]:
     p = state_path(data_dir)
     if not p.exists():
         raise DuelError(f"state does not exist; run init first: {p}")
-    return json.loads(p.read_text(encoding="utf-8"))
+    state = json.loads(p.read_text(encoding="utf-8"))
+    state["risk"] = state_runtime_risk()
+    return state
 
 
 def save_state(data_dir: pathlib.Path, state: Dict[str, Any]) -> None:
@@ -219,6 +249,90 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def fee_category_for_market(market: Dict[str, Any]) -> str:
+    """Classify a market into the Polymarket public fee categories.
+
+    The official trading-fees page states fees are market/category-specific and
+    markets may expose feesEnabled. Gamma/search records do not always carry the
+    exact CLOB fee descriptor, so this paper engine uses explicit market flags
+    when present and otherwise maps visible category/text conservatively.
+    """
+    if optional_bool(market.get("fees_enabled")) is False:
+        return "disabled"
+    text = " ".join(
+        str(market.get(k, ""))
+        for k in ("fee_category", "category", "question", "slug", "description", "market_id", "condition_id")
+    ).lower()
+    if any(term in text for term in BITCOIN_TERMS) or "crypto" in text or "ethereum" in text or "solana" in text:
+        return "crypto"
+    if any(term in text for term in ("sport", "nba", "nfl", "mlb", "nhl", "soccer", "tennis", "ufc")):
+        return "sports"
+    if any(term in text for term in ("geopolitic", "world event", "war", "ceasefire", "ukraine", "russia", "israel", "iran")):
+        return "geopolitics"
+    if any(term in text for term in ("finance", "stock", "equity", "fed", "rate", "treasury")):
+        return "finance"
+    if "politic" in text or "election" in text:
+        return "politics"
+    if "econom" in text or "inflation" in text or "gdp" in text:
+        return "economics"
+    if "weather" in text or "temperature" in text or "hurricane" in text:
+        return "weather"
+    if "mention" in text:
+        return "mentions"
+    if "tech" in text or "artificial intelligence" in text or "software" in text:
+        return "tech"
+    if "culture" in text or "music" in text or "movie" in text or "celebrity" in text:
+        return "culture"
+    return "other"
+
+
+def taker_fee_rate_for_market(market: Dict[str, Any]) -> float:
+    if optional_bool(market.get("fees_enabled")) is False:
+        return 0.0
+    category = fee_category_for_market(market)
+    if category == "disabled":
+        return 0.0
+    return float(TAKER_FEE_RATES.get(category, TAKER_FEE_RATES["other"]))
+
+
+def estimate_taker_fee(shares: float, price: float, market: Dict[str, Any]) -> Tuple[float, float, str]:
+    category = fee_category_for_market(market)
+    rate = 0.0 if category == "disabled" else float(TAKER_FEE_RATES.get(category, TAKER_FEE_RATES["other"]))
+    raw_fee = max(0.0, shares * rate * price * (1.0 - price))
+    return round(raw_fee, FEE_PRECISION_PLACES), rate, category
+
+
+def paper_execution_rules() -> Dict[str, Any]:
+    return {
+        "source": POLYMARKET_FEE_DOC_URL,
+        "paper_fill_role": "taker",
+        "maker_fee_rate": 0.0,
+        "maker_rebates_credited": False,
+        "taker_fee_formula": "fee = shares * fee_rate * price * (1 - price)",
+        "fee_precision_places": FEE_PRECISION_PLACES,
+        "fee_note": "Fees are protocol/category-specific and applied at match time; paper fills model immediate taker fills unless a future maker/queue simulator is added.",
+        "taker_fee_rates": TAKER_FEE_RATES,
+        "deposit_withdraw_polymarket_fee": 0.0,
+        "intermediary_fees_modeled": False,
+        "slippage_bps": SLIPPAGE_BPS,
+        "min_order_usdc": MIN_PAPER_ORDER_USDC,
+        "allowed_side": "buy only",
+    }
+
+
 def no_proxy_opener(allow_proxy: bool) -> urllib.request.OpenerDirector:
     if allow_proxy:
         return urllib.request.build_opener()
@@ -311,6 +425,8 @@ def normalize_market(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "question": question[:280],
         "slug": raw.get("slug") or raw.get("market_slug") or "",
         "category": raw.get("category") or raw.get("event_title") or raw.get("event_slug") or "",
+        "fee_category": raw.get("feeCategory") or raw.get("fee_category") or raw.get("category") or "",
+        "fees_enabled": optional_bool(raw.get("feesEnabled") if "feesEnabled" in raw else raw.get("fees_enabled")),
         "volume": to_float(raw.get("volume") or raw.get("volumeNum") or raw.get("volume24hr") or raw.get("volume24hrClob"), 0.0),
         "liquidity": to_float(raw.get("liquidity") or raw.get("liquidityNum"), 0.0),
         "end_date": raw.get("endDate") or raw.get("end_date") or raw.get("endDateIso") or "",
@@ -324,6 +440,7 @@ def mock_markets() -> List[Dict[str, Any]]:
             "market_id": "mock-election-1",
             "question": "Mock: Will Candidate A win the election?",
             "slug": "mock-election-1",
+            "category": "Politics",
             "volume": 250000.0,
             "liquidity": 50000.0,
             "end_date": "2026-12-31T00:00:00Z",
@@ -333,6 +450,7 @@ def mock_markets() -> List[Dict[str, Any]]:
             "market_id": "mock-fed-1",
             "question": "Mock: Will the Fed cut rates by September?",
             "slug": "mock-fed-1",
+            "category": "Finance",
             "volume": 140000.0,
             "liquidity": 22000.0,
             "end_date": "2026-09-30T00:00:00Z",
@@ -342,6 +460,9 @@ def mock_markets() -> List[Dict[str, Any]]:
             "market_id": "mock-crypto-1",
             "question": "Mock: Will BTC close above 150k this year?",
             "slug": "mock-crypto-1",
+            "category": "Crypto",
+            "fee_category": "Crypto",
+            "fees_enabled": True,
             "volume": 180000.0,
             "liquidity": 35000.0,
             "end_date": "2026-12-31T00:00:00Z",
@@ -517,6 +638,8 @@ def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], cont
                 "volume": m.get("volume", 0),
                 "liquidity": m.get("liquidity", 0),
                 "end_date": m.get("end_date", ""),
+                "fee_category": fee_category_for_market(m),
+                "taker_fee_rate": taker_fee_rate_for_market(m),
                 "outcomes": [{"name": o["name"], "price": o["price"]} for o in m.get("outcomes", [])],
             }
         )
@@ -531,6 +654,7 @@ def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], cont
                 "allowed_side": "buy only",
                 "limit_price_required": True,
             },
+            "paper_execution_rules": paper_execution_rules(),
             "current_strategy_rules": strategy_text[:4500],
             "markets": market_slate,
             "required_output_schema": {
@@ -641,6 +765,7 @@ def validate_and_apply(
         "controls": {
             "max_orders": max_orders,
             "max_notional_per_order": round(max_notional_per_order, 4),
+            "paper_execution_rules": paper_execution_rules(),
         },
     }
     append_jsonl(decisions_path(data_dir), decision_record)
@@ -668,14 +793,8 @@ def validate_and_apply(
             if requested_notional > max_notional_per_order:
                 raise DuelError(f"notional {requested_notional:.4f} exceeds configured cap {max_notional_per_order:.4f}")
             notional = requested_notional
-            if notional <= 0:
-                raise DuelError("notional must be positive")
-            if float(account.get("cash", 0.0)) - notional < RESERVE_CASH:
-                raise DuelError("reserve cash would be breached")
-            if account_exposure(account) + notional > STARTING_EQUITY * MAX_TOTAL_RISK_FRACTION:
-                raise DuelError("total open-risk cap would be breached")
-            if market_exposure(account, market_id) + notional > STARTING_EQUITY * MAX_MARKET_FRACTION:
-                raise DuelError("per-market exposure cap would be breached")
+            if notional < MIN_PAPER_ORDER_USDC:
+                raise DuelError(f"notional must be at least Polymarket paper minimum {MIN_PAPER_ORDER_USDC:.2f} USDC")
             outcome_name = str(order.get("outcome", ""))
             outcome = None
             for o in market.get("outcomes", []):
@@ -692,6 +811,14 @@ def validate_and_apply(
             if fill_price > limit_price:
                 raise DuelError(f"fill_price {fill_price:.4f} exceeds limit_price {limit_price:.4f}")
             shares = notional / fill_price
+            fee, fee_rate, fee_category = estimate_taker_fee(shares, fill_price, market)
+            gross_cost = notional + fee
+            if float(account.get("cash", 0.0)) - gross_cost < RESERVE_CASH:
+                raise DuelError("reserve cash would be breached after Polymarket taker fee")
+            if account_exposure(account) + gross_cost > STARTING_EQUITY * MAX_TOTAL_RISK_FRACTION:
+                raise DuelError("total open-risk cap would be breached after Polymarket taker fee")
+            if market_exposure(account, market_id) + gross_cost > STARTING_EQUITY * MAX_MARKET_FRACTION:
+                raise DuelError("per-market exposure cap would be breached after Polymarket taker fee")
             pos_key = market_id + "::" + str(outcome["name"])
             fill = {
                 "ts": utc_now(),
@@ -704,6 +831,12 @@ def validate_and_apply(
                 "observed_price": round(observed_price, 4),
                 "fill_price": round(fill_price, 4),
                 "shares": round(shares, 6),
+                "fee": round(fee, FEE_PRECISION_PLACES),
+                "fee_rate": fee_rate,
+                "fee_category": fee_category,
+                "gross_cost": round(gross_cost, 5),
+                "paper_execution_role": "taker",
+                "fee_formula": "shares * fee_rate * price * (1 - price)",
                 "rationale": str(order.get("rationale", ""))[:500],
             }
             fills.append(fill)
@@ -713,13 +846,14 @@ def validate_and_apply(
                     old_shares = float(existing.get("shares", 0.0))
                     old_cost = float(existing.get("cost_basis", 0.0))
                     new_shares = old_shares + shares
-                    new_cost = old_cost + notional
+                    new_cost = old_cost + gross_cost
                     existing.update(
                         {
                             "shares": new_shares,
                             "cost_basis": new_cost,
                             "avg_price": new_cost / new_shares if new_shares else fill_price,
                             "last_price": observed_price,
+                            "fees_paid": round(float(existing.get("fees_paid", 0.0)) + fee, FEE_PRECISION_PLACES),
                             "updated_at": utc_now(),
                         }
                     )
@@ -729,13 +863,15 @@ def validate_and_apply(
                         "question": market["question"],
                         "outcome": outcome["name"],
                         "shares": shares,
-                        "cost_basis": notional,
-                        "avg_price": fill_price,
+                        "cost_basis": gross_cost,
+                        "avg_price": gross_cost / shares if shares else fill_price,
                         "last_price": observed_price,
+                        "fees_paid": fee,
+                        "fee_category": fee_category,
                         "created_at": utc_now(),
                         "updated_at": utc_now(),
                     }
-                account["cash"] = float(account.get("cash", 0.0)) - notional
+                account["cash"] = float(account.get("cash", 0.0)) - gross_cost
                 account.setdefault("trades", []).append(fill)
                 account["updated_at"] = utc_now()
         except Exception as exc:

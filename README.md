@@ -52,3 +52,4 @@ Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting f
 - Bitcoin-only trading terminal dashboard v2: [`docs/bitcoin-terminal-dashboard-v2.md`](docs/bitcoin-terminal-dashboard-v2.md)
 - Paper duel scheduling and VPS timer: [`docs/paper-duel-scheduling.md`](docs/paper-duel-scheduling.md)
 - Public dashboard and 5h strategy review: [`docs/public-dashboard-and-strategy-review.md`](docs/public-dashboard-and-strategy-review.md)
+- Polymarket-style paper execution rules and taker-fee model: [`docs/polymarket-paper-execution-rules.md`](docs/polymarket-paper-execution-rules.md)

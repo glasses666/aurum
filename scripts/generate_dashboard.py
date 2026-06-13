@@ -164,6 +164,10 @@ pre.rules {
   white-space: pre-wrap;
   background: transparent;
 }
+.rule-list { display: grid; gap: 8px; margin-top: 8px; }
+.rule-line { display: flex; justify-content: space-between; gap: 10px; padding-top: 8px; border-top: 1px solid var(--line-soft); color: var(--muted); font-size: 12px; line-height: 1.35; }
+.rule-line:first-child { border-top: 0; padding-top: 0; }
+.rule-line b { color: var(--text); font-weight: 600; text-align: right; }
 .empty { color: var(--muted); padding: 18px 16px; line-height: 1.45; }
 @media (max-width: 1280px) {
   .chart-title { grid-template-columns: minmax(0, 1fr); }
@@ -291,6 +295,9 @@ def env_public(env_file: Optional[pathlib.Path]) -> Dict[str, str]:
         "AURUM_RULE_AUTO_PROMOTE",
         "AURUM_REVIEW_INTERVAL_HOURS",
         "AURUM_PUBLIC_DASHBOARD_DIR",
+        "AURUM_PAPER_TRADE_ROLE",
+        "AURUM_POLYMARKET_FEE_MODE",
+        "AURUM_POLY_MIN_ORDER_USDC",
     }
     out: Dict[str, str] = {}
     if env_file and env_file.exists():
@@ -459,6 +466,10 @@ def extract_trade_events(ticks: List[Dict[str, Any]], decisions: List[Dict[str, 
                         "side": str(fill.get("side", "buy")).upper(),
                         "notional": fill.get("notional"),
                         "price": fill.get("fill_price"),
+                        "fee": fill.get("fee"),
+                        "fee_rate": fill.get("fee_rate"),
+                        "fee_category": fill.get("fee_category"),
+                        "gross_cost": fill.get("gross_cost"),
                         "market_id": fill.get("market_id"),
                         "question": fill.get("question", ""),
                         "outcome": fill.get("outcome"),
@@ -555,6 +566,24 @@ def rule_excerpt(rules: Dict[str, Any]) -> str:
         "deepseek_excerpt": str(ds)[:650],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def polymarket_rules_panel() -> str:
+    rules = duel.paper_execution_rules()
+    crypto_rate = float(rules["taker_fee_rates"].get("crypto", 0.0))
+    other_rate = float(rules["taker_fee_rates"].get("other", 0.0))
+    return f"""
+      <div class="rule-list">
+        <div class="rule-line"><span>Fill role</span><b>{esc(rules['paper_fill_role']).upper()}</b></div>
+        <div class="rule-line"><span>Fee formula</span><b>shares × rate × p × (1-p)</b></div>
+        <div class="rule-line"><span>BTC/Crypto taker rate</span><b>{crypto_rate:.2%}</b></div>
+        <div class="rule-line"><span>Other/general rate</span><b>{other_rate:.2%}</b></div>
+        <div class="rule-line"><span>Maker fee/rebate</span><b>0 fee · rebate not credited</b></div>
+        <div class="rule-line"><span>Fee precision</span><b>{rules['fee_precision_places']} decimals</b></div>
+        <div class="rule-line"><span>Min paper order</span><b>${fmt_money(rules['min_order_usdc'])}</b></div>
+      </div>
+      <div class="caption">按 Polymarket fee docs: taker fee 在 match time 计算；当前 paper fill 都按 taker，maker queue/rebate 等 recorder v2 再模拟。</div>
+    """
 
 
 def x_for_index(idx: int, total: int, left: float, width: float) -> float:
@@ -660,12 +689,16 @@ def event_log(events: List[Dict[str, Any]]) -> str:
         color = AGENT_COLORS.get(agent, "#ddd")
         notional = item.get("notional")
         price = item.get("price")
+        fee = item.get("fee")
+        fee_text = f" · fee ${fmt_money(fee)}" if fee is not None else ""
+        fee_category = item.get("fee_category")
+        fee_category_text = f" · {fee_category}" if fee_category else ""
         rows.append(f"""
         <div class="log-row">
           <div class="log-time">{esc(short_time(item.get('ts')))}</div>
           <div class="log-main">
             <div class="log-top"><span class="log-action" style="color:{color}">{esc(item.get('kind'))} · {esc(AGENT_LABELS.get(agent, agent))}</span><span class="pill">{esc(item.get('side'))}</span></div>
-            <div class="log-detail">{esc(item.get('outcome') or '')} · ${fmt_money(notional)} @ {fmt_price(price)}</div>
+            <div class="log-detail">{esc(item.get('outcome') or '')} · ${fmt_money(notional)} @ {fmt_price(price)}{esc(fee_text)}{esc(fee_category_text)}</div>
             <div class="log-market">{esc(trunc(item.get('question') or item.get('market_id') or 'market', 96))}</div>
             <div class="log-note">{esc(trunc(item.get('note'), 150))}</div>
           </div>
@@ -734,6 +767,10 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         {positions_panel(scores)}
       </section>
       <section class="rail-section">
+        <div class="rail-title"><span>Polymarket Rules</span><span>fees</span></div>
+        {polymarket_rules_panel()}
+      </section>
+      <section class="rail-section">
         <div class="rail-title"><span>Rules</span><span>visible</span></div>
         <div class="caption">bot v2 目标：agent 写受限策略规格；固定执行引擎做 5s+ paper 自动交易。</div>
         <pre class="rules">{esc(rule_excerpt(rules))}</pre>
@@ -787,6 +824,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         "latest_review": (reviews[-1] if reviews else {}).get("review_id"),
         "universe": universe,
         "market_question": market_question,
+        "paper_execution_rules": duel.paper_execution_rules(),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out_dir / "index.html"

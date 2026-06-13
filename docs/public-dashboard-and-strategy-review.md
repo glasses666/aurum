@@ -11,6 +11,7 @@ The dashboard removes the black-box feeling from the SuperWing vs DeepSeek paper
 - current paper funds and ROI score;
 - recent trading dynamics: orders, fills, rejections, notes;
 - the current trading flow and safety gates;
+- the Polymarket-style paper execution rules, including taker-fee formula/rates;
 - the current SuperWing rules and DeepSeek strategy prompt;
 - a score-history chart;
 - the latest 5h advanced review and rule updates.
@@ -33,6 +34,7 @@ The site includes `noindex,nofollow` by default, because it is public for inspec
 Local repo files:
 
 - `scripts/generate_dashboard.py` — static dashboard generator.
+- `scripts/agent_duel.py` — paper ledger, risk gates, taker-fee accounting, and decision validation.
 - `scripts/strategy_rules.py` — versioned SuperWing and DeepSeek paper-strategy rule files.
 - `scripts/strategy_review.py` — 5h advanced review and rule-prompt updater.
 - `scripts/run_strategy_review.sh` — server wrapper with `flock`.
@@ -66,6 +68,14 @@ aurum-strategy-review.timer
 The tick service also regenerates the static dashboard after each successful tick. The 5h review service regenerates it after each review.
 
 ## Rule-update policy
+
+Paper execution rules are separate from model strategy rules. The ledger now models Polymarket-like immediate taker fills with:
+
+```text
+fee = shares * fee_rate * price * (1 - price)
+```
+
+For the first Bitcoin contest, BTC/crypto markets use the Crypto taker fee rate from Polymarket's trading fee docs. The dashboard left rail displays the fee formula/rates, and fill events include fee/category when present. See `docs/polymarket-paper-execution-rules.md`.
 
 The review model can propose and, if explicitly gated, promote strategy-rule updates.
 
