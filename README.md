@@ -44,6 +44,7 @@ Early builder/research prototype.
 Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting for official access, Aurum should run a local paper account over public market/orderbook data.
 
 - Local paper account rules: [`docs/local-paper-account-rules.md`](docs/local-paper-account-rules.md)
+- Polymarket market recorder: [`docs/polymarket-market-recorder.md`](docs/polymarket-market-recorder.md)
 - Deployment architecture: [`docs/deployment-architecture.md`](docs/deployment-architecture.md)
 - VPS preflight runbook: [`docs/vps-preflight.md`](docs/vps-preflight.md)
 - Guangzhou ECS preflight result: [`docs/vps-preflight-ailcloud-esc-20260613.md`](docs/vps-preflight-ailcloud-esc-20260613.md)

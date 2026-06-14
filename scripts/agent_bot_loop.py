@@ -20,10 +20,10 @@ from typing import Any, Dict, List, Optional
 import agent_duel as duel
 import bot_scripts
 import generate_dashboard
+import market_recorder
 import strategy_rules
 
 _STOP = False
-
 
 def _handle_stop(signum: int, frame: Any) -> None:  # pragma: no cover - signal wiring
     global _STOP
@@ -83,6 +83,46 @@ def duel_tick_forbidden_tokens() -> tuple[str, ...]:
     )
 
 
+def recorder_data_root(data_dir: pathlib.Path) -> pathlib.Path:
+    configured = os.environ.get("AURUM_RECORDER_DATA_DIR", "").strip()
+    if configured:
+        return pathlib.Path(configured)
+    if data_dir.name == "paper_duel":
+        return data_dir.parent
+    return data_dir
+
+
+def filter_recorded_markets_for_tick(markets: List[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
+    min_volume = float(args.min_volume or 0.0)
+    limit = int(args.limit or 0)
+    filtered = [market for market in markets if float(market.get("volume") or 0.0) >= min_volume]
+    if limit > 0:
+        filtered = filtered[:limit]
+    return filtered
+
+
+def load_markets_for_tick(data_dir: pathlib.Path, args: argparse.Namespace) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    max_stale = int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180"))
+    try:
+        root = recorder_data_root(data_dir)
+        health = market_recorder.recorder_health(root, max_stale_seconds=max_stale)
+        if not health.get("ok"):
+            raise RuntimeError("recorder health not ok: " + ",".join(health.get("errors", [])))
+        recorded = market_recorder.load_latest_markets(root, max_stale_seconds=max_stale)
+        markets = filter_recorded_markets_for_tick(recorded["markets"], args)
+        if not markets:
+            raise RuntimeError("recorder latest_markets empty after tick filters")
+        return markets, {
+            "source": recorded.get("source", "market_recorder"),
+            "ts": recorded.get("ts"),
+            "max_stale_seconds": max_stale,
+            "health_ok": True,
+        }
+    except Exception as exc:
+        markets = duel.fetch_markets(args.limit, args.min_volume, args.mock_markets, args.allow_proxy)
+        return markets, {"source": "direct_fetch_fallback", "reason": type(exc).__name__}
+
+
 def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
     data_dir = pathlib.Path(args.data_dir)
     duel.ensure_data_dir(data_dir)
@@ -100,7 +140,7 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
 
     snapshot_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
     state = duel.init_state(data_dir, reset=False)
-    markets = duel.fetch_markets(args.limit, args.min_volume, args.mock_markets, args.allow_proxy)
+    markets, market_source = load_markets_for_tick(data_dir, args)
     if not markets:
         raise duel.DuelError("no eligible markets returned for mechanical bot tick")
 
@@ -112,6 +152,7 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
         "limit": args.limit,
         "min_volume": args.min_volume,
         "market_count": len(markets),
+        "market_source": market_source,
         "markets": markets,
     }
     snapshot_file = snapshots_dir(data_dir) / f"{snapshot_id}.json"
@@ -153,6 +194,7 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
         "loop_interval_sec": loop_interval(data_dir),
         "snapshot_file": str(snapshot_file),
         "market_count": len(markets),
+        "market_source": market_source,
         "shared_snapshot": True,
         "agents": agent_records,
         "scores": scores,

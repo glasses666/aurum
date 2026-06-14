@@ -1,8 +1,11 @@
 import json
+import os
 import pathlib
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -10,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import agent_duel
 import bot_scripts
 import agent_bot_loop
+import market_recorder
 import strategy_rules
 
 
@@ -232,6 +236,75 @@ class MechanicalBotScriptTests(unittest.TestCase):
             decision = bot_scripts.mechanical_decision_for_agent(account, markets, script)
 
         self.assertEqual(decision["orders"], [])
+
+    def test_bot_loop_consumes_only_healthy_recorder_markets_with_tick_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "normalized" / "polymarket").mkdir(parents=True)
+            (root / "reports").mkdir(parents=True)
+            ts = "2026-06-14T03:30:00+00:00"
+            markets = [
+                {"market_id": "low", "question": "Will Bitcoin stay quiet?", "volume": 10, "outcomes": [{"name": "Yes", "price": 0.4}, {"name": "No", "price": 0.6}]},
+                {"market_id": "high", "question": "Will Bitcoin hit 100k?", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]},
+                {"market_id": "second", "question": "Will Bitcoin hit 120k?", "volume": 7000, "outcomes": [{"name": "Yes", "price": 0.35}, {"name": "No", "price": 0.65}]},
+            ]
+            (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
+                json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": markets})
+            )
+            (root / "reports" / "market_recorder_health.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "ts": ts,
+                        "sources": {
+                            "gamma_markets": {"ok_frames": 1},
+                            "clob_markets": {"ok_frames": 1},
+                            "data_trades": {"ok_frames": 1},
+                            "clob_book": {"ok_frames": 1},
+                        },
+                    }
+                )
+            )
+            args = types.SimpleNamespace(limit=1, min_volume=1000, mock_markets="", allow_proxy=False)
+            with mock.patch.dict(os.environ, {"AURUM_RECORDER_MAX_STALE_SECONDS": "999999999"}, clear=False):
+                loaded, source = agent_bot_loop.load_markets_for_tick(root / "paper_duel", args)
+
+        self.assertEqual(source["source"], "polymarket_market_recorder_v0")
+        self.assertEqual([market["market_id"] for market in loaded], ["high"])
+
+    def test_bot_loop_falls_back_when_recorder_health_is_bad_even_if_latest_markets_exists(self):
+        class BrokenBookFetcher:
+            def __call__(self, url, timeout=12.0):
+                if "gamma" in url:
+                    return [
+                        {
+                            "id": "btc",
+                            "question": "Will Bitcoin hit 100k?",
+                            "outcomes": '["Yes", "No"]',
+                            "outcomePrices": '["0.42", "0.58"]',
+                            "clobTokenIds": '["tok_yes", "tok_no"]',
+                        }
+                    ]
+                if "clob.polymarket.com/markets" in url:
+                    return {"markets": []}
+                if "data-api.polymarket.com/trades" in url:
+                    return []
+                if "clob.polymarket.com/book" in url:
+                    raise RuntimeError("book unavailable")
+                raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            market_recorder.capture_once(root, fetcher=BrokenBookFetcher(), now=lambda: "2026-06-14T03:30:00+00:00", max_books=1)
+            self.assertFalse(json.loads((root / "reports" / "market_recorder_health.json").read_text())["ok"])
+            fallback_markets = [{"market_id": "fallback", "question": "Will Bitcoin recover?", "volume": 1, "outcomes": [{"name": "Yes", "price": 0.4}, {"name": "No", "price": 0.6}]}]
+            args = types.SimpleNamespace(limit=1, min_volume=0, mock_markets="", allow_proxy=False)
+            with mock.patch.object(agent_duel, "fetch_markets", return_value=fallback_markets) as fetch_markets:
+                loaded, source = agent_bot_loop.load_markets_for_tick(root / "paper_duel", args)
+
+        fetch_markets.assert_called_once_with(1, 0, "", False)
+        self.assertEqual(source["source"], "direct_fetch_fallback")
+        self.assertEqual(loaded, fallback_markets)
 
     def test_superwing_rules_do_not_accept_schema_echo_placeholders(self):
         rules = strategy_rules.normalize_superwing_rules(

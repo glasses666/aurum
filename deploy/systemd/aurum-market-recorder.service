@@ -1,0 +1,37 @@
+[Unit]
+Description=Aurum Polymarket public market-data recorder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=aurum
+Group=aurum
+WorkingDirectory=/opt/aurum/app
+Environment=APP_DIR=/opt/aurum/app
+Environment=AURUM_RECORDER_DATA_DIR=/opt/aurum/data
+Environment=AURUM_RECORDER_INTERVAL_SEC=30
+Environment=AURUM_RECORDER_MAX_BOOKS=20
+Environment=AURUM_RECORDER_MAX_STALE_SECONDS=180
+ExecStart=/opt/aurum/app/scripts/run_market_recorder.sh
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/aurum/data /opt/aurum/logs /opt/aurum/run
+ReadOnlyPaths=/opt/aurum/app
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

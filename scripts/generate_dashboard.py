@@ -16,6 +16,7 @@ import pathlib
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import agent_duel as duel
+import market_recorder
 import strategy_rules
 
 AGENT_LABELS = {
@@ -715,6 +716,33 @@ def latest_review_summary(reviews: List[Dict[str, Any]]) -> str:
     return f"{latest.get('review_id', '')} · {summary}"
 
 
+def recorder_data_root(data_dir: pathlib.Path) -> pathlib.Path:
+    configured = os.environ.get("AURUM_RECORDER_DATA_DIR", "").strip()
+    if configured:
+        return pathlib.Path(configured)
+    if data_dir.name == "paper_duel":
+        return data_dir.parent
+    return data_dir
+
+
+def recorder_panel(data_dir: pathlib.Path) -> str:
+    root = recorder_data_root(data_dir)
+    health = market_recorder.recorder_health(root, max_stale_seconds=int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180")))
+    last = health.get("last_capture", {}) if isinstance(health.get("last_capture"), dict) else {}
+    sources = last.get("sources", {}) if isinstance(last.get("sources"), dict) else {}
+    status = "live" if health.get("ok") else "check"
+    pill = "green" if health.get("ok") else "amber"
+    age = health.get("age_seconds", "n/a")
+    return f"""
+      <div class=\"rule-line\"><span>Status</span><b><span class=\"pill {pill}\">{esc(status)}</span></b></div>
+      <div class=\"rule-line\"><span>Age</span><b>{esc(age)}s</b></div>
+      <div class=\"rule-line\"><span>Markets</span><b>{esc(last.get('market_count', 0))}</b></div>
+      <div class=\"rule-line\"><span>Books</span><b>{esc((sources.get('clob_book') or {}).get('ok_frames', 0))}</b></div>
+      <div class=\"caption\">raw/normalized recorder root: {esc(str(root))}</div>
+      <div class=\"caption\">{esc(', '.join(health.get('errors', [])) or 'Gamma/CLOB/Data API frames captured independently from paper fills.')}</div>
+    """
+
+
 def render(args: argparse.Namespace) -> pathlib.Path:
     data_dir = pathlib.Path(args.data_dir)
     out_dir = pathlib.Path(args.output_dir)
@@ -756,7 +784,11 @@ def render(args: argparse.Namespace) -> pathlib.Path:
       <section class="rail-section">
         <div class="rail-title"><span>Contest</span><span class="pill amber">first {esc(contest_days)} days</span></div>
         <div class="big-number">BTC only</div>
-        <div class="caption">第一版只交易 Bitcoin 相关 Polymarket 市场。共享 recorder，同源数据；agent 只比策略，不比谁抓到不同盘口。</div>
+        <div class="caption">第一版只交易 Bitcoin 相关 Polymarket 市场。paper engine 消费独立 market_recorder 的同源数据；agent 只比策略，不比谁抓到不同盘口。</div>
+      </section>
+      <section class="rail-section">
+        <div class="rail-title"><span>Recorder</span><span>market data</span></div>
+        {recorder_panel(data_dir)}
       </section>
       <section class="rail-section">
         <div class="rail-title"><span>Agents</span><span>{esc(mode)}</span></div>
@@ -825,6 +857,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         "universe": universe,
         "market_question": market_question,
         "paper_execution_rules": duel.paper_execution_rules(),
+        "market_recorder": market_recorder.recorder_health(recorder_data_root(data_dir), max_stale_seconds=int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180"))),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out_dir / "index.html"
