@@ -307,8 +307,14 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     dashboard_dir = args.dashboard_dir or os.environ.get("AURUM_PUBLIC_DASHBOARD_DIR", "/opt/aurum/public/dashboard")
+    operator_dashboard_dir = args.operator_dashboard_dir or os.environ.get("AURUM_OPERATOR_DASHBOARD_DIR", "")
     try:
-        dash_args = argparse.Namespace(data_dir=str(data_dir), env_file=str(env_file or ""), output_dir=dashboard_dir)
+        dash_args = argparse.Namespace(
+            data_dir=str(data_dir),
+            env_file=str(env_file or ""),
+            output_dir=dashboard_dir,
+            operator_output_dir=operator_dashboard_dir,
+        )
         dashboard_path = generate_dashboard.render(dash_args)
         record["dashboard_path"] = str(dashboard_path)
         out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -323,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default="data/paper_duel")
     p.add_argument("--env-file", default=".env")
     p.add_argument("--dashboard-dir", default="")
+    p.add_argument("--operator-dashboard-dir", default="")
     p.add_argument("--limit-ticks", type=int, default=24)
     p.add_argument("--auto-promote", action="store_true", help="promote validated rule updates even without env gate")
     p.add_argument("--no-promote", action="store_true", help="write proposals only")

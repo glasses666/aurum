@@ -13,6 +13,7 @@ import html
 import json
 import os
 import pathlib
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import agent_duel as duel
@@ -31,6 +32,39 @@ AGENT_COLORS = {
 }
 
 BITCOIN_TERMS = ("bitcoin", "btc", "satoshi")
+REDACTED = "[redacted]"
+SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "bearer",
+    "authorization",
+    "private",
+    "ssh",
+    "host",
+    "hostname",
+    "ip",
+    "server",
+    "connection",
+    "env",
+    "data_dir",
+    "root",
+    "path",
+    "file",
+    "remote_error",
+)
+SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I),
+    re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    re.compile(r"(?:ssh|postgres|mysql|mongodb|redis)://[^\s\"']+", re.I),
+    re.compile(r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"),
+    re.compile(r"(?:^|[\s\"'])/(?:Users|home|root|opt|etc|var)/[^\s\"']+"),
+    re.compile(r"(?:^|[\s\"'])~/.ssh/[^\s\"']+"),
+)
 
 CSS = """
 :root {
@@ -281,6 +315,36 @@ def fmt_price(value: Any) -> str:
         return "—"
 
 
+def sensitive_key(key: Any) -> bool:
+    lower = str(key or "").lower()
+    return any(part in lower for part in SENSITIVE_KEY_PARTS)
+
+
+def redact_string(value: str) -> str:
+    redacted = value
+    for pattern in SENSITIVE_VALUE_PATTERNS:
+        redacted = pattern.sub(REDACTED, redacted)
+    return redacted
+
+
+def redact_value(value: Any, key: Any = "") -> Any:
+    if sensitive_key(key) and isinstance(value, (str, int, float, bool)):
+        return REDACTED
+    if isinstance(value, dict):
+        return {str(k): redact_value(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item, key) for item in value]
+    if isinstance(value, str):
+        return redact_string(value)
+    return value
+
+
+def safe_errors(errors: Any, limit: int = 8) -> List[str]:
+    if not isinstance(errors, list):
+        return []
+    return [str(redact_string(str(item)))[:160] for item in errors[:limit]]
+
+
 def env_public(env_file: Optional[pathlib.Path]) -> Dict[str, str]:
     allowed = {
         "AURUM_DUEL_MODE",
@@ -333,6 +397,50 @@ def latest_scores(state: Dict[str, Any], ticks: List[Dict[str, Any]]) -> List[Di
         if account:
             rows.append(duel.portfolio_value(account, prices))
     return rows
+
+
+def score_band(row: Dict[str, Any]) -> str:
+    try:
+        roi = float(row.get("roi", 0.0) or 0.0)
+    except Exception:
+        roi = 0.0
+    if roi >= 0.05:
+        return "strong up"
+    if roi >= 0.005:
+        return "up"
+    if roi <= -0.05:
+        return "drawdown"
+    if roi <= -0.005:
+        return "down"
+    return "flat"
+
+
+def coarse_scores(scores: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ranked = sorted(scores, key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
+    rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(ranked, 1):
+        agent = str(row.get("agent_id") or "unknown")
+        details = row.get("details") if isinstance(row.get("details"), list) else []
+        rows.append(
+            {
+                "agent_id": agent,
+                "label": AGENT_LABELS.get(agent, agent),
+                "rank": idx,
+                "score_band": score_band(row),
+                "position_bucket": bucket_count(len(details)),
+            }
+        )
+    return rows
+
+
+def bucket_count(count: int) -> str:
+    if count <= 0:
+        return "none"
+    if count <= 3:
+        return "1-3"
+    if count <= 10:
+        return "4-10"
+    return "10+"
 
 
 def market_is_bitcoin(market: Dict[str, Any]) -> bool:
@@ -510,6 +618,175 @@ def data_quality_banner(latest_tick: Dict[str, Any], ticks: List[Dict[str, Any]]
     """
 
 
+def latest_json_candidate(paths: Iterable[pathlib.Path]) -> Optional[Dict[str, Any]]:
+    for path in paths:
+        if not path.exists():
+            continue
+        if path.is_dir():
+            candidates = sorted(path.glob("*.json"))
+            if not candidates:
+                continue
+            path = candidates[-1]
+        value = read_json(path, None)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def public_recorder_summary(data_dir: pathlib.Path) -> Dict[str, Any]:
+    health = market_recorder.recorder_health(
+        recorder_data_root(data_dir),
+        max_stale_seconds=int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180")),
+    )
+    last = health.get("last_capture", {}) if isinstance(health.get("last_capture"), dict) else {}
+    manifest = last.get("manifest") if isinstance(last.get("manifest"), dict) else {}
+    coverage = last.get("book_coverage") if isinstance(last.get("book_coverage"), dict) else {}
+    sources = last.get("sources", {}) if isinstance(last.get("sources"), dict) else {}
+    return {
+        "ok": bool(health.get("ok")),
+        "age_seconds": health.get("age_seconds"),
+        "errors": safe_errors(health.get("errors", [])),
+        "market_count": last.get("market_count"),
+        "sources": {
+            source: {"ok_frames": (detail or {}).get("ok_frames")}
+            for source, detail in sources.items()
+            if isinstance(detail, dict)
+        },
+        "manifest": {
+            "ok": manifest.get("ok"),
+            "verification_scope": manifest.get("verification_scope"),
+            "max_rows": manifest.get("max_rows"),
+            "verified_rows": manifest.get("verified_rows"),
+            "latest_sequence": manifest.get("latest_sequence"),
+        },
+        "book_coverage": coverage,
+        "orderable_market_count": last.get("orderable_market_count"),
+    }
+
+
+def public_gate_summary(latest_tick: Dict[str, Any]) -> Dict[str, Any]:
+    gate = latest_tick.get("data_quality_gate") if isinstance(latest_tick.get("data_quality_gate"), dict) else {}
+    if not gate:
+        market_source = latest_tick.get("market_source") if isinstance(latest_tick.get("market_source"), dict) else {}
+        gate = market_source.get("data_quality_gate") if isinstance(market_source.get("data_quality_gate"), dict) else {}
+    return {
+        "decision": gate.get("decision", "UNKNOWN"),
+        "trade_allowed": bool(gate.get("trade_allowed")),
+        "hold_only": bool(gate.get("hold_only")),
+        "reason_codes": safe_errors(gate.get("reason_codes", [])),
+        "recorder_age_seconds": gate.get("recorder_age_seconds"),
+        "book_coverage": gate.get("book_coverage") if isinstance(gate.get("book_coverage"), dict) else {},
+        "orderable_market_count": gate.get("orderable_market_count"),
+        "manifest_verification_scope": gate.get("manifest_verification_scope"),
+        "manifest_verification_max_rows": gate.get("manifest_verification_max_rows"),
+        "manifest_verification_verified_rows": gate.get("manifest_verification_verified_rows"),
+    }
+
+
+def public_bot_registry_summary(data_dir: pathlib.Path) -> Dict[str, Any]:
+    verified = bot_scripts.verify_bot_registry_manifest(data_dir)
+    current = verified.get("current") if isinstance(verified.get("current"), dict) else {}
+    recorded = verified.get("recorded") if isinstance(verified.get("recorded"), dict) else {}
+    agents = current.get("agents") if isinstance(current.get("agents"), dict) else {}
+    return {
+        "ok": bool(verified.get("ok")),
+        "schema_version": current.get("schema_version") or recorded.get("schema_version"),
+        "errors": safe_errors(verified.get("errors", [])),
+        "agents": {
+            agent: {
+                "review_status": (entry or {}).get("review_status"),
+                "tradable": bool((entry or {}).get("tradable")),
+                "hold_only": bool((entry or {}).get("hold_only")),
+            }
+            for agent, entry in agents.items()
+            if isinstance(entry, dict)
+        },
+    }
+
+
+def backup_status(data_dir: pathlib.Path) -> Dict[str, Any]:
+    root = recorder_data_root(data_dir)
+    candidates = (
+        data_dir / "reports" / "aurum_stability_backup_status.json",
+        data_dir / "reports" / "stability_backup_status.json",
+        root / "reports" / "aurum_stability_backup_status.json",
+        root / "reports" / "stability_backup_status.json",
+        root / "reports" / "backup_status.json",
+    )
+    payload = latest_json_candidate(candidates)
+    if not payload:
+        return {"ok": None, "status": "missing"}
+    safe = redact_value(payload)
+    return {
+        "ok": bool(payload.get("ok")),
+        "status": "ok" if payload.get("ok") else "check",
+        "artifact_count": payload.get("artifact_count") or payload.get("file_count") or payload.get("snapshot_count"),
+        "contains_recorder_raw": bool(payload.get("contains_recorder_raw") or payload.get("recorder_raw")),
+        "contains_manifest": bool(payload.get("contains_manifest") or payload.get("manifest")),
+        "contains_features": bool(payload.get("contains_features") or payload.get("features")),
+        "contains_reports": bool(payload.get("contains_reports") or payload.get("reports")),
+        "redacted": safe,
+    }
+
+
+def replay_status(data_dir: pathlib.Path) -> Dict[str, Any]:
+    root = recorder_data_root(data_dir)
+    payload = latest_json_candidate(
+        (
+            data_dir / "replay_summary.json",
+            data_dir / "reports" / "replay_summary.json",
+            data_dir / "replays",
+            root / "reports" / "replay_summary.json",
+            root / "replays",
+        )
+    )
+    if not payload:
+        return {"ok": None, "status": "missing"}
+    return {
+        "ok": bool(payload.get("ok")),
+        "status": "ok" if payload.get("ok") else "check",
+        "mode": payload.get("mode"),
+        "market_count": payload.get("market_count"),
+        "bot_registry_ok": payload.get("bot_registry_ok"),
+        "risk_ledger_rows": payload.get("risk_ledger_rows"),
+    }
+
+
+def risk_ledger_status(data_dir: pathlib.Path) -> Dict[str, Any]:
+    path = data_dir / "risk_ledger.jsonl"
+    if not path.exists():
+        return {"ok": None, "status": "missing", "rows": 0}
+    rows = 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.strip():
+            rows += 1
+    return {"ok": True, "status": "present", "rows": rows}
+
+
+def public_runtime_status(data_dir: pathlib.Path, latest_tick: Dict[str, Any]) -> Dict[str, Any]:
+    recorder = public_recorder_summary(data_dir)
+    registry = public_bot_registry_summary(data_dir)
+    backup = backup_status(data_dir)
+    replay = replay_status(data_dir)
+    ledger = risk_ledger_status(data_dir)
+    gate = public_gate_summary(latest_tick)
+    runtime_complete = bool(
+        gate.get("decision") == "TRADE_ALLOWED"
+        and recorder.get("ok") is True
+        and registry.get("ok") is True
+        and backup.get("ok") is True
+    )
+    return {
+        "completion_state": "runtime-complete" if runtime_complete else "code-complete-only",
+        "data_quality_gate": gate,
+        "recorder": recorder,
+        "bot_registry": registry,
+        "backup": {k: v for k, v in backup.items() if k != "redacted"},
+        "replay": replay,
+        "risk_ledger": ledger,
+    }
+
+
 def read_reviews(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
     root = data_dir / "strategy_reviews"
     if not root.exists():
@@ -601,10 +878,42 @@ def extract_trade_events(ticks: List[Dict[str, Any]], decisions: List[Dict[str, 
     return rows[:limit]
 
 
+def public_tick_events(ticks: List[Dict[str, Any]], limit: int = 80) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for tick in ticks[-limit:]:
+        agents = tick.get("agents", {}) if isinstance(tick.get("agents"), dict) else {}
+        order_count = 0
+        fill_count = 0
+        reject_count = 0
+        for info in agents.values():
+            if not isinstance(info, dict):
+                continue
+            decision = info.get("decision", {}) if isinstance(info.get("decision"), dict) else {}
+            result = info.get("result", {}) if isinstance(info.get("result"), dict) else {}
+            order_count += len(decision.get("orders", []) or [])
+            fill_count += len(result.get("fills", []) or [])
+            reject_count += len(result.get("rejections", []) or [])
+        gate = tick.get("data_quality_gate") if isinstance(tick.get("data_quality_gate"), dict) else {}
+        rows.append(
+            {
+                "ts": tick.get("ts"),
+                "tick_id": tick.get("tick_id"),
+                "kind": "TICK",
+                "mode": tick.get("effective_mode") or tick.get("mode"),
+                "applied": bool(tick.get("applied")),
+                "market_count": tick.get("market_count"),
+                "decision": gate.get("decision", "UNKNOWN"),
+                "orders": order_count,
+                "fills": fill_count,
+                "rejects": reject_count,
+            }
+        )
+    rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+    return rows
+
+
 def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env: Dict[str, str], data_dir: Optional[pathlib.Path] = None) -> str:
-    score_by_agent = {row.get("agent_id"): row for row in scores if isinstance(row, dict)}
-    ranked = sorted(scores, key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
-    rank_by_agent = {row.get("agent_id"): idx + 1 for idx, row in enumerate(ranked)}
+    score_by_agent = {row.get("agent_id"): row for row in coarse_scores(scores) if isinstance(row, dict)}
     scripts: Dict[str, Dict[str, Any]] = {}
     if data_dir is not None:
         for agent in duel.AGENTS:
@@ -615,25 +924,23 @@ def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env:
     parts: List[str] = []
     for agent in duel.AGENTS:
         row = score_by_agent.get(agent, {})
-        account = state.get("accounts", {}).get(agent, {}) if isinstance(state, dict) else {}
         script = scripts.get(agent, {})
-        model = "fixed baseline"
-        if agent == "deepseek":
-            model = env.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
         status = script.get("status") or ("hold_only" if script.get("hold_only") else "active")
+        review = bot_scripts.review_status(script) if script else "unknown"
+        tradable = "tradable" if bot_scripts.script_tradable(script) else "hold-only"
         color = AGENT_COLORS[agent]
         parts.append(f"""
         <div class="agent-row">
           <div class="agent-head">
             <span class="agent-name" style="color:{color}"><span class="dot"></span>{esc(AGENT_LABELS[agent])}</span>
-            <span class="pill">rank #{esc(rank_by_agent.get(agent, '—'))}</span>
+            <span class="pill">rank #{esc(row.get('rank', '—'))}</span>
           </div>
-          <div class="agent-sub">{esc(model)} · {esc(env.get('AURUM_DUEL_MODE', account.get('mode', 'paper')))} · {esc(status)}</div>
+          <div class="agent-sub">{esc(env.get('AURUM_DUEL_MODE', 'review_only'))} · {esc(status)} · review {esc(review)}</div>
           <div class="agent-stats">
-            <span>equity<b>{fmt_money(row.get('portfolio_value', account.get('cash', 1500)))}</b></span>
-            <span>ROI<b>{fmt_pct(row.get('roi', 0))}</b></span>
-            <span>cash<b>{fmt_money(row.get('cash', account.get('cash', 1500)))}</b></span>
-            <span>trades<b>{esc(len(account.get('trades', [])))}</b></span>
+            <span>score band<b>{esc(row.get('score_band', 'unknown'))}</b></span>
+            <span>position bucket<b>{esc(row.get('position_bucket', 'unknown'))}</b></span>
+            <span>script gate<b>{esc(tradable)}</b></span>
+            <span>paper mode<b>aggregate only</b></span>
           </div>
         </div>
         """)
@@ -641,18 +948,23 @@ def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env:
 
 
 def positions_panel(scores: List[Dict[str, Any]]) -> str:
-    rows: List[str] = []
+    total_positions = 0
+    active_agents = 0
     for score in scores:
-        for detail in score.get("details", []) or []:
-            rows.append(f"""
-            <div class="position-row">
-              <div class="rank-head"><span>{esc(score.get('agent_id'))}</span><span>{fmt_money(detail.get('value'))}</span></div>
-              <div class="tiny">{esc(detail.get('key'))} · shares {esc(round(float(detail.get('shares', 0.0)), 4))} · mark {fmt_price(detail.get('mark'))}</div>
-            </div>
-            """)
-    if not rows:
-        return "<div class='caption'>暂无持仓。review_only 阶段会先记录建议/拒单；开 paper_apply 后这里会变成真实纸盘仓位。</div>"
-    return "\n".join(rows[:8])
+        details = score.get("details") if isinstance(score.get("details"), list) else []
+        total_positions += len(details)
+        if details:
+            active_agents += 1
+    return f"""
+      <div class="position-row">
+        <div class="rank-head"><span>Open exposure</span><span>{esc(bucket_count(total_positions))}</span></div>
+        <div class="tiny">aggregate paper-position bucket only; per-agent positions stay in operator output</div>
+      </div>
+      <div class="position-row">
+        <div class="rank-head"><span>Agents with exposure</span><span>{esc(bucket_count(active_agents))}</span></div>
+        <div class="tiny">no raw position keys, share counts, or account-like balances are public</div>
+      </div>
+    """
 
 
 def rule_excerpt(rules: Dict[str, Any]) -> str:
@@ -779,9 +1091,22 @@ def trade_chart(
 
 def event_log(events: List[Dict[str, Any]]) -> str:
     if not events:
-        return "<div class='empty'>暂无交易事件。Bitcoin-only bot demo 会先显示 ORDER / FILL / REJECT / NOTE。</div>"
+        return "<div class='empty'>暂无 tick 事件。公共视图只显示粗粒度 tick 汇总。</div>"
     rows = []
     for item in events[:80]:
+        if item.get("kind") == "TICK":
+            rows.append(f"""
+            <div class="log-row">
+              <div class="log-time">{esc(short_time(item.get('ts')))}</div>
+              <div class="log-main">
+                <div class="log-top"><span class="log-action">TICK · {esc(item.get('mode'))}</span><span class="pill">{esc(item.get('decision'))}</span></div>
+                <div class="log-detail">markets {esc(item.get('market_count'))} · orders {esc(item.get('orders'))} · fills {esc(item.get('fills'))} · rejects {esc(item.get('rejects'))}</div>
+                <div class="log-market">tick {esc(item.get('tick_id') or 'none')} · applied {esc(str(item.get('applied')).lower())}</div>
+                <div class="log-note">coarse public activity; detailed order and ledger diagnostics are operator-only</div>
+              </div>
+            </div>
+            """)
+            continue
         agent = str(item.get("agent_id") or "")
         color = AGENT_COLORS.get(agent, "#ddd")
         notional = item.get("notional")
@@ -822,27 +1147,99 @@ def recorder_data_root(data_dir: pathlib.Path) -> pathlib.Path:
 
 
 def recorder_panel(data_dir: pathlib.Path) -> str:
-    root = recorder_data_root(data_dir)
-    health = market_recorder.recorder_health(root, max_stale_seconds=int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180")))
-    last = health.get("last_capture", {}) if isinstance(health.get("last_capture"), dict) else {}
-    sources = last.get("sources", {}) if isinstance(last.get("sources"), dict) else {}
-    status = "live" if health.get("ok") else "check"
-    pill = "green" if health.get("ok") else "amber"
-    age = health.get("age_seconds", "n/a")
+    summary = public_recorder_summary(data_dir)
+    sources = summary.get("sources", {}) if isinstance(summary.get("sources"), dict) else {}
+    clob_book = sources.get("clob_book") if isinstance(sources.get("clob_book"), dict) else {}
+    status = "live" if summary.get("ok") else "check"
+    pill = "green" if summary.get("ok") else "amber"
+    age = summary.get("age_seconds", "n/a")
+    coverage = summary.get("book_coverage") if isinstance(summary.get("book_coverage"), dict) else {}
+    requested = coverage.get("requested_tokens", "unknown")
+    ok_tokens = coverage.get("ok_tokens", "unknown")
     return f"""
       <div class=\"rule-line\"><span>Status</span><b><span class=\"pill {pill}\">{esc(status)}</span></b></div>
       <div class=\"rule-line\"><span>Age</span><b>{esc(age)}s</b></div>
-      <div class=\"rule-line\"><span>Markets</span><b>{esc(last.get('market_count', 0))}</b></div>
-      <div class=\"rule-line\"><span>Books</span><b>{esc((sources.get('clob_book') or {}).get('ok_frames', 0))}</b></div>
-      <div class=\"caption\">raw/normalized recorder root: {esc(str(root))}</div>
-      <div class=\"caption\">{esc(', '.join(health.get('errors', [])) or 'Gamma/CLOB/Data API frames captured independently from paper fills.')}</div>
+      <div class=\"rule-line\"><span>Markets</span><b>{esc(summary.get('market_count', 0))}</b></div>
+      <div class=\"rule-line\"><span>Books</span><b>{esc(clob_book.get('ok_frames', 0))} · coverage {esc(ok_tokens)}/{esc(requested)}</b></div>
+      <div class=\"caption\">{esc(', '.join(summary.get('errors', [])) or 'Gamma/CLOB/Data API frames captured independently from paper fills.')}</div>
     """
+
+
+def runtime_panel(runtime: Dict[str, Any]) -> str:
+    registry = runtime.get("bot_registry") if isinstance(runtime.get("bot_registry"), dict) else {}
+    backup = runtime.get("backup") if isinstance(runtime.get("backup"), dict) else {}
+    replay = runtime.get("replay") if isinstance(runtime.get("replay"), dict) else {}
+    ledger = runtime.get("risk_ledger") if isinstance(runtime.get("risk_ledger"), dict) else {}
+    return f"""
+      <div class="rule-line"><span>Completion</span><b>{esc(runtime.get('completion_state', 'code-complete-only'))}</b></div>
+      <div class="rule-line"><span>Bot registry</span><b>{esc('ok' if registry.get('ok') else 'check')}</b></div>
+      <div class="rule-line"><span>Backup</span><b>{esc(backup.get('status', 'missing'))}</b></div>
+      <div class="rule-line"><span>Replay</span><b>{esc(replay.get('status', 'missing'))}</b></div>
+      <div class="rule-line"><span>Risk ledger</span><b>{esc(ledger.get('status', 'missing'))} · rows {esc(ledger.get('rows', 0))}</b></div>
+    """
+
+
+def write_operator_output(
+    operator_dir: pathlib.Path,
+    *,
+    data_dir: pathlib.Path,
+    state: Dict[str, Any],
+    ticks: List[Dict[str, Any]],
+    decisions: List[Dict[str, Any]],
+    reviews: List[Dict[str, Any]],
+    scores: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    runtime: Dict[str, Any],
+) -> pathlib.Path:
+    operator_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics = redact_value(
+        {
+            "ok": True,
+            "view": "operator_diagnostics_v1",
+            "generated_at": utc_now(),
+            "runtime": runtime,
+            "scores": scores,
+            "latest_tick": ticks[-1] if ticks else {},
+            "recent_ticks": ticks[-20:],
+            "recent_decisions": decisions[-40:],
+            "recent_events": events[:80],
+            "state": state,
+            "reviews": reviews[-5:],
+            "bot_registry": bot_scripts.verify_bot_registry_manifest(data_dir),
+            "market_recorder": market_recorder.recorder_health(
+                recorder_data_root(data_dir),
+                max_stale_seconds=int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180")),
+            ),
+            "backup": backup_status(data_dir),
+            "replay": replay_status(data_dir),
+            "risk_ledger": risk_ledger_status(data_dir),
+        }
+    )
+    (operator_dir / "operator.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    html_doc = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Aurum Operator Diagnostics</title>
+  <style>body{{font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#050505;color:#f5f5f5;margin:0;padding:24px}}pre{{white-space:pre-wrap}}</style>
+</head>
+<body>
+<h1>Aurum Operator Diagnostics</h1>
+<p>Redacted operator-only diagnostics. Do not publish this directory.</p>
+<pre>{esc(json.dumps(diagnostics, ensure_ascii=False, indent=2, sort_keys=True))}</pre>
+</body>
+</html>
+"""
+    (operator_dir / "index.html").write_text(html_doc, encoding="utf-8")
+    return operator_dir / "index.html"
 
 
 def render(args: argparse.Namespace) -> pathlib.Path:
     data_dir = pathlib.Path(args.data_dir)
     out_dir = pathlib.Path(args.output_dir)
     env_file = pathlib.Path(args.env_file) if args.env_file else None
+    operator_output = str(getattr(args, "operator_output_dir", "") or os.environ.get("AURUM_OPERATOR_DASHBOARD_DIR", "")).strip()
     duel.ensure_data_dir(data_dir)
     strategy_rules.ensure_default_rules(data_dir)
     env = env_public(env_file)
@@ -855,8 +1252,10 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     scores.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
     latest_tick = ticks[-1] if ticks else {}
     btc, latest_btc_market, btc_source = bitcoin_series(data_dir, ticks, state)
-    roi = roi_series(ticks, state, scores)
-    events = extract_trade_events(ticks, decisions)
+    roi: Dict[str, List[Dict[str, Any]]] = {}
+    public_events = public_tick_events(ticks)
+    operator_events = extract_trade_events(ticks, decisions)
+    runtime = public_runtime_status(data_dir, latest_tick)
     updated_at = utc_now()
     universe = env.get("AURUM_DUEL_UNIVERSE", "bitcoin").lower() or "bitcoin"
     contest_days = env.get("AURUM_FIRST_CONTEST_DAYS", "7")
@@ -887,6 +1286,10 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         {recorder_panel(data_dir)}
       </section>
       <section class="rail-section">
+        <div class="rail-title"><span>Runtime</span><span>proof status</span></div>
+        {runtime_panel(runtime)}
+      </section>
+      <section class="rail-section">
         <div class="rail-title"><span>Agents</span><span>{esc(mode)}</span></div>
         {agent_status_panel(scores, state, env, data_dir)}
       </section>
@@ -914,28 +1317,28 @@ def render(args: argparse.Namespace) -> pathlib.Path:
       <div class="chart-wrap">
         <div class="chart-title">
           <div>
-            <h2>Bitcoin price × agent ROI × trade points</h2>
+            <h2>Bitcoin recorder line × coarse score bands</h2>
             <p>{esc(market_question)} · latest BTC market price {fmt_price(latest_btc_price)} · source {esc(btc_source)}</p>
           </div>
           <div class="legend-line">
             <span style="color:var(--btc)">● BTC market line</span>
-            <span style="color:var(--superwing)">● SuperWing ROI / trades</span>
-            <span style="color:var(--deepseek)">● DeepSeek ROI / trades</span>
+            <span style="color:var(--superwing)">● SuperWing score band</span>
+            <span style="color:var(--deepseek)">● DeepSeek score band</span>
           </div>
         </div>
-        {trade_chart(btc, roi, events)}
+        {trade_chart(btc, roi, [])}
       </div>
       <div class="stage-footer">
         <div class="footer-cell"><span>Universe</span><b>{esc(universe)}</b></div>
         <div class="footer-cell"><span>Fastest bot interval</span><b>{esc(min_interval)}s hard floor</b></div>
-        <div class="footer-cell"><span>Latest tick</span><b>{esc(latest_tick.get('tick_id', 'none'))}</b></div>
+        <div class="footer-cell"><span>Runtime state</span><b>{esc(runtime.get('completion_state'))}</b></div>
         <div class="footer-cell"><span>Latest 5h review</span><b>{esc(trunc(latest_review_summary(reviews), 72))}</b></div>
       </div>
     </section>
 
     <aside class="right-log">
-      <div class="log-head"><h2>Event Log</h2><span class="pill">orders / fills / rejects / notes</span></div>
-      <div class="log-list">{event_log(events)}</div>
+      <div class="log-head"><h2>Activity Log</h2><span class="pill">coarse tick summary</span></div>
+      <div class="log-list">{event_log(public_events)}</div>
     </aside>
   </main>
 </body>
@@ -945,7 +1348,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     (out_dir / "index.html").write_text(html_doc, encoding="utf-8")
     manifest = {
         "ok": True,
-        "view": "trade_terminal_v2",
+        "view": "public_trade_terminal_v3",
         "generated_at": updated_at,
         "tick_count": len(ticks),
         "btc_frame_count": len(btc),
@@ -953,10 +1356,23 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         "latest_review": (reviews[-1] if reviews else {}).get("review_id"),
         "universe": universe,
         "market_question": market_question,
-        "paper_execution_rules": duel.paper_execution_rules(),
-        "market_recorder": market_recorder.recorder_health(recorder_data_root(data_dir), max_stale_seconds=int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180"))),
+        "scores": coarse_scores(scores),
+        "runtime": runtime,
+        "operator_output_enabled": bool(operator_output),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if operator_output:
+        write_operator_output(
+            pathlib.Path(operator_output),
+            data_dir=data_dir,
+            state=state,
+            ticks=ticks,
+            decisions=decisions,
+            reviews=reviews,
+            scores=scores,
+            events=operator_events,
+            runtime=runtime,
+        )
     return out_dir / "index.html"
 
 
@@ -965,6 +1381,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default="data/paper_duel")
     p.add_argument("--env-file", default=".env")
     p.add_argument("--output-dir", default="public/dashboard")
+    p.add_argument("--operator-output-dir", default="")
     return p
 
 

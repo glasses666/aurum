@@ -1,4 +1,5 @@
 import argparse
+import json
 import pathlib
 import sys
 import tempfile
@@ -8,6 +9,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import agent_duel
+import aurum_status_report
 import bot_scripts
 import generate_dashboard
 
@@ -132,6 +134,138 @@ class DashboardDataQualityTests(unittest.TestCase):
             html = path.read_text(encoding="utf-8")
 
         self.assertIn("yes · universe btc", html)
+
+    def test_public_dashboard_uses_coarse_aggregate_output_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            tick = {
+                "tick_id": "public-safe",
+                "ts": "2026-06-14T03:30:00+00:00",
+                "mode": "paper_apply",
+                "effective_mode": "paper_apply",
+                "applied": True,
+                "loop_interval_sec": 15,
+                "snapshot_file": "/Users/example/raw-snapshot-secret.json",
+                "market_count": 1,
+                "market_source": {"source": "polymarket_market_recorder_v0"},
+                "data_quality_gate": {"decision": "TRADE_ALLOWED", "reason_codes": []},
+                "scores": [
+                    {
+                        "agent_id": "superwing",
+                        "score": 1510.0,
+                        "portfolio_value": 1510.0,
+                        "cash": 1490.0,
+                        "roi": 0.0066,
+                        "details": [{"key": "private-position-key", "shares": 12.3456, "mark": 0.42, "value": 5.18}],
+                    }
+                ],
+                "agents": {
+                    "superwing": {
+                        "decision": {
+                            "orders": [
+                                {
+                                    "market_id": "private-market-key",
+                                    "question": "private-question",
+                                    "rationale": "private-rationale-123",
+                                }
+                            ]
+                        },
+                        "result": {"fills": [], "rejections": []},
+                    }
+                },
+            }
+            (data_dir / "ticks.jsonl").write_text(json.dumps(tick) + "\n", encoding="utf-8")
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = path.read_text(encoding="utf-8")
+            manifest = json.loads((out_dir / "manifest.json").read_text())
+
+        public_blob = html + json.dumps(manifest, sort_keys=True)
+        self.assertIn("score band", html)
+        self.assertIn("coarse tick summary", html)
+        self.assertIn("orders 1", html)
+        self.assertIn("Backup", html)
+        self.assertIn("Replay", html)
+        for forbidden in (
+            "private-position-key",
+            "private-market-key",
+            "private-question",
+            "private-rationale-123",
+            "raw-snapshot-secret",
+            '"cash"',
+            '"portfolio_value"',
+            '"details"',
+        ):
+            self.assertNotIn(forbidden, public_blob)
+        self.assertEqual(manifest["view"], "public_trade_terminal_v3")
+        self.assertEqual(manifest["scores"][0]["score_band"], "up")
+
+    def test_operator_output_is_redacted_but_keeps_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            operator_dir = root / "operator"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            dummy_host = ".".join(["192", "0", "2", "44"])
+            dummy_bearer = "Bearer " + "abcdefghijklmnop"
+            tick = {
+                "tick_id": "operator",
+                "ts": "2026-06-14T03:30:00+00:00",
+                "snapshot_file": "/Users/example/.ssh/private_key",
+                "remote_error": f"ssh failed against {dummy_host} with {dummy_bearer}",
+                "agents": {
+                    "superwing": {
+                        "decision": {"orders": [{"rationale": "operator-detail-rationale"}]},
+                        "result": {"fills": [], "rejections": []},
+                    }
+                },
+                "scores": [],
+            }
+            (data_dir / "ticks.jsonl").write_text(json.dumps(tick) + "\n", encoding="utf-8")
+
+            generate_dashboard.render(
+                argparse.Namespace(
+                    data_dir=str(data_dir),
+                    env_file="",
+                    output_dir=str(out_dir),
+                    operator_output_dir=str(operator_dir),
+                )
+            )
+            operator_json = (operator_dir / "operator.json").read_text(encoding="utf-8")
+
+        self.assertIn("operator-detail-rationale", operator_json)
+        self.assertIn("[redacted]", operator_json)
+        self.assertNotIn(".ssh", operator_json)
+        self.assertNotIn(dummy_host, operator_json)
+        self.assertNotIn(dummy_bearer, operator_json)
+
+    def test_status_report_includes_runtime_contract_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+
+            report = aurum_status_report.build_report(data_dir, root, max_stale_seconds=180)
+
+        self.assertEqual(report["completion_state"], "code-complete-only")
+        for key in (
+            "recorder",
+            "manifest",
+            "book_coverage",
+            "orderable_market_count",
+            "bot_registry",
+            "backup",
+            "replay",
+            "risk_ledger",
+        ):
+            self.assertIn(key, report)
 
 
 if __name__ == "__main__":
