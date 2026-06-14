@@ -18,7 +18,7 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 DEFAULT_GAMMA_URL = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&search=bitcoin"
 DEFAULT_CLOB_MARKETS_URL = "https://clob.polymarket.com/markets?limit=100"
@@ -195,6 +195,37 @@ def tail_text_lines(path: pathlib.Path, max_lines: Optional[int] = 200, chunk_si
     return data.splitlines()[-max_lines:]
 
 
+def iter_tail_text_lines(path: pathlib.Path, max_lines: Optional[int] = 200, chunk_size: int = 65536) -> Iterator[str]:
+    if max_lines is None:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                yield line.rstrip("\n")
+        return
+    if max_lines <= 0:
+        return
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        pending = b""
+        yielded = 0
+        while pos > 0 and yielded < max_lines:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            data = f.read(read_size) + pending
+            parts = data.split(b"\n")
+            pending = parts[0]
+            for raw_line in reversed(parts[1:]):
+                if yielded >= max_lines:
+                    break
+                if not raw_line and pos + read_size == f.tell():
+                    continue
+                yield raw_line.decode("utf-8", errors="replace")
+                yielded += 1
+        if pending and yielded < max_lines:
+            yield pending.decode("utf-8", errors="replace")
+
+
 def raw_file_stem(source: str) -> str:
     # Keep the source semantic singular while using a natural plural file for
     # a stream of many book frames.
@@ -269,6 +300,27 @@ def verify_manifest(
     prev: Optional[str] = None
     expected_sequence: Optional[int] = None
     frame_cache: Dict[pathlib.Path, Optional[Dict[str, str]]] = {}
+    needed_hashes_by_path: Dict[pathlib.Path, Set[str]] = {}
+
+    def record_needed_frame_hashes(lines: List[str]) -> None:
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            source = str(row.get("source") or "")
+            if source not in RAW_SOURCE_STEMS:
+                continue
+            rel_raw = str(row.get("path") or "")
+            rel_path = pathlib.Path(rel_raw)
+            expected_rel = pathlib.Path("raw") / "polymarket" / day / f"{RAW_SOURCE_STEMS[source]}.jsonl"
+            if rel_path.is_absolute() or ".." in rel_path.parts or rel_path != expected_rel:
+                continue
+            line_hash = str(row.get("line_sha256") or "")
+            if line_hash:
+                needed_hashes_by_path.setdefault(rel_path, set()).add(line_hash)
 
     def frame_index(rel_path: pathlib.Path) -> Optional[Dict[str, str]]:
         if rel_path in frame_cache:
@@ -277,16 +329,24 @@ def verify_manifest(
         if not frame_path.exists():
             frame_cache[rel_path] = None
             return None
+        needed_hashes = needed_hashes_by_path.get(rel_path, set())
         index: Dict[str, str] = {}
-        for frame_line in tail_text_lines(frame_path, effective_frame_tail_rows):
+        if not needed_hashes:
+            frame_cache[rel_path] = index
+            return index
+        for frame_line in iter_tail_text_lines(frame_path, effective_frame_tail_rows):
             if not frame_line.strip():
                 continue
             line_hash_value = sha256_text(frame_line)
+            if line_hash_value not in needed_hashes:
+                continue
             try:
                 frame = json.loads(frame_line)
                 index[line_hash_value] = str(frame.get("payload_sha256") or "")
             except Exception:
                 index[line_hash_value] = "__FRAME_JSON_ERROR__"
+            if needed_hashes.issubset(index):
+                break
         frame_cache[rel_path] = index
         return index
 
@@ -309,6 +369,7 @@ def verify_manifest(
                 out["errors"].append("manifest_boundary_sequence_error")
         except Exception:
             out["errors"].append("manifest_boundary_json_error")
+    record_needed_frame_hashes(manifest_lines)
 
     for line_no, line in enumerate(manifest_lines, start=1):
         if not line.strip():
