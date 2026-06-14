@@ -46,11 +46,11 @@ class ReplayFetcher:
 
 
 class RecorderReplayTests(unittest.TestCase):
-    def capture(self, root: pathlib.Path, *, ask_size: float = 100.0) -> None:
+    def capture(self, root: pathlib.Path, *, ask_size: float = 100.0, ts: str = "2026-06-14T03:30:00+00:00") -> None:
         market_recorder.capture_once(
             root,
             fetcher=ReplayFetcher(ask_size=ask_size),
-            now=lambda: "2026-06-14T03:30:00+00:00",
+            now=lambda: ts,
             max_books=2,
         )
 
@@ -106,6 +106,45 @@ class RecorderReplayTests(unittest.TestCase):
         self.assertIn("insufficient_recorded_ask_depth", result["rejections"][0]["reason"])
         self.assertEqual(ledger[-1]["event"], "order_rejected")
         self.assertEqual(ledger[-1]["rejection_reason"], "insufficient_recorded_ask_depth")
+
+    def test_tail_replay_frame_lookup_does_not_materialize_large_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.capture(root)
+            manifest_path = root / "raw" / "polymarket" / "2026-06-14" / "manifest.jsonl"
+            rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+            book_row = next(row for row in rows if row["source"] == "clob_book")
+
+            with mock.patch.object(market_recorder, "tail_text_lines", side_effect=AssertionError("tail materialized")):
+                frame_ref = recorder_replay.frame_for_manifest_row(root, book_row, max_frame_lines=2000)
+
+        self.assertIsNotNone(frame_ref)
+        self.assertEqual(frame_ref["source"], "clob_book")
+
+    def test_tail_replay_manifest_lookup_uses_bounded_iterator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.capture(root)
+            with mock.patch.object(market_recorder, "iter_tail_text_lines", wraps=market_recorder.iter_tail_text_lines) as iter_tail:
+                rows = recorder_replay.manifest_rows_for_ts(root, "2026-06-14T03:30:00+00:00", max_lines=50)
+
+        self.assertTrue(iter_tail.called)
+        self.assertGreaterEqual(len(rows), 4)
+        self.assertEqual(rows, sorted(rows, key=lambda row: row["sequence"]))
+
+    def test_tail_context_for_non_latest_timestamp_falls_back_to_full_manifest_lookup(self):
+        first_ts = "2026-06-14T03:30:00+00:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.capture(root, ts=first_ts)
+            for minute in range(31, 45):
+                self.capture(root, ts=f"2026-06-14T03:{minute:02d}:00+00:00")
+
+            context = recorder_replay.build_recorder_context(root, ts=first_ts, verify_scope="tail", max_rows=3)
+
+        self.assertEqual(context["ts"], first_ts)
+        self.assertEqual(context["source"], "polymarket_market_recorder_v0")
+        self.assertIn("clob_book", context["source_refs"])
 
     def test_replay_is_deterministic_for_fixed_recorder_and_scripts(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -40,12 +40,14 @@ def manifest_path_for_ts(data_dir: pathlib.Path, ts: str) -> pathlib.Path:
     return market_recorder.raw_day_dir(data_dir, ts) / "manifest.jsonl"
 
 
-def manifest_rows_for_ts(data_dir: pathlib.Path, ts: str) -> List[Dict[str, Any]]:
+def manifest_rows_for_ts(data_dir: pathlib.Path, ts: str, *, max_lines: Optional[int] = None) -> List[Dict[str, Any]]:
     manifest_path = manifest_path_for_ts(data_dir, ts)
     rows: List[Dict[str, Any]] = []
     if not manifest_path.exists():
         return rows
-    for line in manifest_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    iter_tail_text_lines = getattr(market_recorder, "iter_tail_text_lines")
+    manifest_sequence = getattr(market_recorder, "manifest_sequence")
+    for line in iter_tail_text_lines(manifest_path, max_lines):
         if not line.strip():
             continue
         try:
@@ -54,6 +56,7 @@ def manifest_rows_for_ts(data_dir: pathlib.Path, ts: str) -> List[Dict[str, Any]
             continue
         if str(row.get("ts") or "") == str(ts):
             rows.append(row)
+    rows.sort(key=lambda row: manifest_sequence(row.get("sequence")) or 0)
     return rows
 
 
@@ -65,7 +68,8 @@ def frame_for_manifest_row(data_dir: pathlib.Path, row: Dict[str, Any], *, max_f
     if not path.exists():
         return None
     expected_line_sha = str(row.get("line_sha256") or "")
-    for line_number, line in enumerate(market_recorder.tail_text_lines(path, max_frame_lines), 1):
+    iter_tail_text_lines = getattr(market_recorder, "iter_tail_text_lines")
+    for line_number, line in enumerate(iter_tail_text_lines(path, max_frame_lines), 1):
         if not line.strip():
             continue
         if market_recorder.sha256_text(line) != expected_line_sha:
@@ -108,7 +112,8 @@ def build_recorder_context(
 
     root = pathlib.Path(data_dir)
     latest = read_json(root / "normalized" / "polymarket" / "latest_markets.json")
-    capture_ts = str(ts or latest.get("ts") or "")
+    latest_ts = str(latest.get("ts") or "")
+    capture_ts = str(ts or latest_ts)
     if verify_scope not in {"tail", "full"}:
         raise ValueError("verify_scope must be tail or full")
     verified = market_recorder.verify_manifest(root, ts=capture_ts, max_rows=None if verify_scope == "full" else max_rows)
@@ -118,7 +123,9 @@ def build_recorder_context(
     orderable_path = root / "features" / "polymarket_orderable_feed.json"
     orderable_feed = read_json(orderable_path)
     orderable_feed_sha256 = hash_file(orderable_path)
-    manifest_rows = manifest_rows_for_ts(root, capture_ts)
+    use_bounded_manifest_lookup = verify_scope == "tail" and capture_ts == latest_ts
+    max_manifest_lines = max(50, int(max_rows or 500)) if use_bounded_manifest_lookup else None
+    manifest_rows = manifest_rows_for_ts(root, capture_ts, max_lines=max_manifest_lines)
     if not manifest_rows:
         raise RuntimeError("no manifest rows for recorder capture")
 
