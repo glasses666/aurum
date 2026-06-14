@@ -464,6 +464,18 @@ def data_quality_banner(latest_tick: Dict[str, Any], ticks: List[Dict[str, Any]]
     reasons = gate.get("reason_codes", []) if isinstance(gate.get("reason_codes"), list) else []
     reason_text = ",".join(str(reason) for reason in reasons) or "none"
     recorder_age = gate.get("recorder_age_seconds") or market_source.get("recorder_age_seconds")
+    coverage = gate.get("book_coverage") if isinstance(gate.get("book_coverage"), dict) else {}
+    requested_books = coverage.get("requested_tokens")
+    ok_books = coverage.get("ok_tokens")
+    coverage_text = "unknown" if requested_books is None or ok_books is None else f"{ok_books}/{requested_books}"
+    manifest_scope = gate.get("manifest_verification_scope") or "unknown"
+    manifest_max_rows = gate.get("manifest_verification_max_rows")
+    manifest_verified_rows = gate.get("manifest_verification_verified_rows")
+    manifest_text = f"{manifest_scope} max {manifest_max_rows if manifest_max_rows is not None else 'full'} verified {manifest_verified_rows if manifest_verified_rows is not None else 'unknown'}"
+    orderable_count = gate.get("orderable_market_count")
+    universe = str(gate.get("universe") or env.get("AURUM_DUEL_UNIVERSE") or "unknown")
+    normalized_universe = universe.strip().lower()
+    btc_only = "yes" if normalized_universe in {"bitcoin", "btc"} else "unknown" if universe == "unknown" else "no"
     latest_age = seconds_since(latest_tick.get("ts")) if latest_tick else None
     actual_interval = latest_tick.get("loop_interval_sec")
     configured_interval = env.get("AURUM_BOT_DEFAULT_INTERVAL_SEC") or env.get("AURUM_BOT_MIN_INTERVAL_SEC") or "unknown"
@@ -488,6 +500,9 @@ def data_quality_banner(latest_tick: Dict[str, Any], ticks: List[Dict[str, Any]]
         <div class=\"quality-item\">Data quality<b>{esc(decision)} · {esc(warning_text)}</b></div>
         <div class=\"quality-item\">Source<b>{esc(source)} · fallback ticks last 1h {fallback_ticks_last_hour(ticks, latest_tick)}</b></div>
         <div class=\"quality-item\">Recorder age<b>{esc('n/a' if recorder_age is None else str(recorder_age) + 's')} · latest tick age {esc('n/a' if latest_age is None else str(round(latest_age, 1)) + 's')}</b></div>
+        <div class=\"quality-item\">Manifest<b>{esc(manifest_text)}</b></div>
+        <div class=\"quality-item\">Book coverage<b>{esc(coverage_text)} · orderable markets {esc(orderable_count if orderable_count is not None else 'unknown')}</b></div>
+        <div class=\"quality-item\">BTC-only<b>{esc(btc_only)} · universe {esc(universe)}</b></div>
         <div class=\"quality-item\">Interval<b>actual {esc(actual_interval if actual_interval is not None else 'unknown')}s · configured {esc(configured_interval)}s</b></div>
         <div class=\"quality-item\">Reasons<b>{esc(reason_text)}</b></div>
         <div class=\"quality-item\">Tick<b>{esc(latest_tick.get('tick_id', 'none') if latest_tick else 'none')}</b></div>

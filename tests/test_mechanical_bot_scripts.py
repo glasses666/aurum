@@ -289,6 +289,7 @@ class MechanicalBotScriptTests(unittest.TestCase):
                     {
                         "ok": True,
                         "ts": ts,
+                        "source": "polymarket_market_recorder_v0",
                         "sources": {
                             "gamma_markets": {"ok_frames": 1},
                             "clob_markets": {"ok_frames": 1},
@@ -296,13 +297,22 @@ class MechanicalBotScriptTests(unittest.TestCase):
                             "clob_book": {"ok_frames": 2, "requested_tokens": 2},
                         },
                         "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-                        "manifest": {"ok": True, "frames": 4},
+                        "orderable_market_count": 1,
+                        "manifest": {"ok": True, "frames": 4, "verified_rows": 4, "latest_sequence": 4, "verification_scope": "tail", "max_rows": 500, "frame_tail_rows": 2000},
                     }
                 ),
                 encoding="utf-8",
             )
             (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
-                json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": [{"market_id": "btc", "question": "Will BTC?", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}]}),
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "source": "polymarket_market_recorder_v0",
+                        "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
+                        "orderable_market_count": 1,
+                        "markets": [{"market_id": "btc", "question": "Will BTC?", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+                    }
+                ),
                 encoding="utf-8",
             )
             data_dir = root / "paper_duel"
@@ -541,13 +551,22 @@ class MechanicalBotScriptTests(unittest.TestCase):
                 {"market_id": "second", "question": "Will Bitcoin hit 120k?", "volume": 7000, "outcomes": [{"name": "Yes", "price": 0.35}, {"name": "No", "price": 0.65}]},
             ]
             (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
-                json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": markets})
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "source": "polymarket_market_recorder_v0",
+                        "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
+                        "orderable_market_count": 1,
+                        "markets": markets,
+                    }
+                )
             )
             (root / "reports" / "market_recorder_health.json").write_text(
                 json.dumps(
                     {
                         "ok": True,
                         "ts": ts,
+                        "source": "polymarket_market_recorder_v0",
                         "sources": {
                             "gamma_markets": {"ok_frames": 1},
                             "clob_markets": {"ok_frames": 1},
@@ -555,7 +574,8 @@ class MechanicalBotScriptTests(unittest.TestCase):
                             "clob_book": {"ok_frames": 2, "requested_tokens": 2},
                         },
                         "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-                        "manifest": {"ok": True, "frames": 4},
+                        "orderable_market_count": 1,
+                        "manifest": {"ok": True, "frames": 4, "verified_rows": 4, "latest_sequence": 4, "verification_scope": "tail", "max_rows": 500, "frame_tail_rows": 2000},
                     }
                 )
             )

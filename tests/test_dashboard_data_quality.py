@@ -83,6 +83,56 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertIn("UNKNOWN · no gate", html)
         self.assertNotIn("TRADE_ALLOWED", html)
 
+    def test_dashboard_shows_recorder_manifest_book_and_universe_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            (data_dir / "ticks.jsonl").write_text(
+                (
+                    '{"tick_id":"fresh","ts":"2026-06-14T03:30:00+00:00","mode":"paper_apply",'
+                    '"loop_interval_sec":15,'
+                    '"market_source":{"source":"polymarket_market_recorder_v0"},'
+                    '"data_quality_gate":{"decision":"TRADE_ALLOWED","reason_codes":[],"recorder_age_seconds":12,'
+                    '"manifest_verification_scope":"tail","manifest_verification_max_rows":500,'
+                    '"manifest_verification_verified_rows":4,"book_coverage":{"requested_tokens":2,"ok_tokens":2},'
+                    '"orderable_market_count":1,"universe":"bitcoin"},'
+                    '"scores":[]}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = path.read_text(encoding="utf-8")
+
+        self.assertIn("TRADE_ALLOWED · clear", html)
+        self.assertIn("tail max 500 verified 4", html)
+        self.assertIn("2/2 · orderable markets 1", html)
+        self.assertIn("yes · universe bitcoin", html)
+
+    def test_dashboard_treats_btc_alias_as_btc_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            (data_dir / "ticks.jsonl").write_text(
+                (
+                    '{"tick_id":"fresh","ts":"2026-06-14T03:30:00+00:00","mode":"paper_apply",'
+                    '"loop_interval_sec":15,'
+                    '"market_source":{"source":"polymarket_market_recorder_v0"},'
+                    '"data_quality_gate":{"decision":"TRADE_ALLOWED","reason_codes":[],"universe":"btc"},'
+                    '"scores":[]}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = path.read_text(encoding="utf-8")
+
+        self.assertIn("yes · universe btc", html)
+
 
 if __name__ == "__main__":
     unittest.main()

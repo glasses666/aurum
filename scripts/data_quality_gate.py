@@ -100,11 +100,32 @@ def _append_health_reasons(health: Any, reasons: List[str], stop_reasons: List[s
             reasons.append("book_coverage_invalid")
         elif requested <= 0 or ok_tokens < requested or orderable_tokens <= 0:
             reasons.append("book_coverage_incomplete")
+    orderable_count = _finite_integer(health.get("orderable_market_count"))
+    if orderable_count is None:
+        reasons.append("orderable_market_count_invalid")
+    elif orderable_count <= 0:
+        reasons.append("orderable_market_count_empty")
     manifest = health.get("manifest") if isinstance(health.get("manifest"), dict) else None
     if not isinstance(manifest, dict):
         reasons.append("missing_manifest_verification")
     elif manifest.get("ok") is not True:
         reasons.append("manifest_verification_failed")
+    else:
+        scope = manifest.get("verification_scope")
+        verified_rows = _finite_integer(manifest.get("verified_rows"))
+        latest_sequence = _finite_integer(manifest.get("latest_sequence"))
+        if scope not in {"full", "tail"}:
+            reasons.append("manifest_verification_scope_invalid")
+        elif verified_rows is None or verified_rows <= 0:
+            reasons.append("manifest_verification_empty")
+        elif latest_sequence is None or latest_sequence <= 0:
+            reasons.append("manifest_latest_sequence_invalid")
+        elif scope == "tail":
+            max_rows = _finite_integer(manifest.get("max_rows"))
+            if max_rows is None or max_rows <= 0:
+                reasons.append("manifest_tail_scope_invalid")
+        elif scope == "full" and manifest.get("max_rows") is not None:
+            reasons.append("manifest_full_scope_invalid")
     return health
 
 
@@ -163,6 +184,21 @@ def _append_latest_reasons(latest: Any, reasons: List[str], stop_reasons: List[s
         reasons.append("market_payload_incomplete")
     if not usable_markets:
         reasons.append("latest_markets_empty")
+    coverage = latest.get("book_coverage") if isinstance(latest.get("book_coverage"), dict) else None
+    if not isinstance(coverage, dict):
+        reasons.append("latest_missing_book_coverage")
+    else:
+        requested = _finite_integer(coverage.get("requested_tokens"))
+        ok_tokens = _finite_integer(coverage.get("ok_tokens"))
+        if requested is None or ok_tokens is None:
+            reasons.append("latest_book_coverage_invalid")
+        elif requested <= 0 or ok_tokens < requested:
+            reasons.append("latest_book_coverage_incomplete")
+    orderable_count = _finite_integer(latest.get("orderable_market_count"))
+    if orderable_count is None:
+        reasons.append("latest_orderable_market_count_invalid")
+    elif orderable_count <= 0:
+        reasons.append("latest_orderable_market_count_empty")
     return latest, usable_markets
 
 
@@ -215,8 +251,34 @@ def evaluate_data_quality_gate(
         reason_codes.append("recorder_ts_in_future")
     if any(age is not None and age > max_stale_seconds for age in (health_age, latest_age)):
         reason_codes.append("recorder_stale")
+    if isinstance(health, dict) and isinstance(latest, dict):
+        if str(health.get("ts") or "") != str(latest.get("ts") or ""):
+            reason_codes.append("recorder_artifact_ts_mismatch")
+        health_source_value = health.get("source") or health.get("recorder")
+        latest_source_value = latest.get("source")
+        if str(health_source_value or "") != str(latest_source_value or ""):
+            reason_codes.append("recorder_artifact_source_mismatch")
+        if health.get("book_coverage") != latest.get("book_coverage"):
+            reason_codes.append("recorder_artifact_book_coverage_mismatch")
+        if health.get("orderable_market_count") != latest.get("orderable_market_count"):
+            reason_codes.append("recorder_artifact_orderable_count_mismatch")
 
     all_reasons = stop_reasons + reason_codes
+    manifest_info: Dict[str, Any] = {}
+    book_coverage_info: Dict[str, Any] = {}
+    orderable_market_count: Optional[int] = None
+    health_source: Optional[str] = None
+    universe: Optional[str] = None
+    if isinstance(health, dict):
+        raw_manifest = health.get("manifest")
+        if isinstance(raw_manifest, dict):
+            manifest_info = raw_manifest
+        raw_coverage = health.get("book_coverage")
+        if isinstance(raw_coverage, dict):
+            book_coverage_info = raw_coverage
+        orderable_market_count = _finite_integer(health.get("orderable_market_count"))
+        health_source = health.get("source") or health.get("recorder")
+        universe = health.get("universe")
     if stop_reasons:
         decision = STOP_SERVICE
     elif reason_codes:
@@ -239,6 +301,15 @@ def evaluate_data_quality_gate(
         "max_stale_seconds": int(max_stale_seconds),
         "market_source": latest.get("source") if latest else None,
         "market_count": len(markets),
+        "health_source": health_source,
+        "universe": universe,
+        "book_coverage": book_coverage_info,
+        "orderable_market_count": orderable_market_count,
+        "manifest_verification_scope": manifest_info.get("verification_scope"),
+        "manifest_verification_frames": manifest_info.get("frames"),
+        "manifest_verification_max_rows": manifest_info.get("max_rows"),
+        "manifest_verification_verified_rows": manifest_info.get("verified_rows"),
+        "manifest_verification_latest_sequence": manifest_info.get("latest_sequence"),
     }
 
 

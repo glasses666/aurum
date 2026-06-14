@@ -77,6 +77,12 @@ class MarketRecorderTests(unittest.TestCase):
             self.assertEqual(manifest_lines[1]["prev_manifest_sha256"], manifest_lines[0]["manifest_sha256"])
             self.assertEqual(result["sources"]["clob_book"]["ok_frames"], 1)
             self.assertTrue(result["manifest"]["ok"])
+            self.assertEqual(result["manifest"]["verification_scope"], "tail")
+            self.assertEqual(result["manifest"]["max_rows"], 500)
+            self.assertEqual(result["manifest"]["frame_tail_rows"], 2000)
+            self.assertEqual(result["manifest"]["verified_rows"], 4)
+            self.assertEqual(result["manifest"]["latest_sequence"], 4)
+            self.assertEqual(result["source"], "polymarket_market_recorder_v0")
             self.assertEqual(result["book_coverage"]["coverage_ratio"], 1.0)
 
     def test_capture_once_writes_orderable_feed_and_full_book_coverage(self):
@@ -180,6 +186,126 @@ class MarketRecorderTests(unittest.TestCase):
         self.assertFalse(verified["ok"])
         self.assertIn("manifest_source_unexpected:1", verified["errors"])
 
+    def test_manifest_verifier_rejects_wrong_raw_path_for_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            market_recorder.capture_once(
+                data_dir,
+                fetcher=FakeFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=1,
+            )
+            manifest_path = data_dir / "raw" / "polymarket" / "2026-06-14" / "manifest.jsonl"
+            rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+            rows[0]["path"] = "raw/polymarket/2026-06-14/clob_markets.jsonl"
+            rows[0]["manifest_sha256"] = market_recorder.sha256_text(
+                market_recorder.canonical_json({k: v for k, v in rows[0].items() if k != "manifest_sha256"})
+            )
+            manifest_path.write_text("\n".join(market_recorder.canonical_json(row) for row in rows) + "\n", encoding="utf-8")
+
+            verified = market_recorder.verify_manifest(data_dir, ts="2026-06-14T03:30:00+00:00")
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("manifest_path_unexpected:1", verified["errors"])
+
+    def test_manifest_verifier_rejects_fractional_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            market_recorder.capture_once(
+                data_dir,
+                fetcher=FakeFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=1,
+            )
+            manifest_path = data_dir / "raw" / "polymarket" / "2026-06-14" / "manifest.jsonl"
+            rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+            rows[0]["sequence"] = 1.5
+            rows[0]["manifest_sha256"] = market_recorder.sha256_text(
+                market_recorder.canonical_json({k: v for k, v in rows[0].items() if k != "manifest_sha256"})
+            )
+            manifest_path.write_text("\n".join(market_recorder.canonical_json(row) for row in rows) + "\n", encoding="utf-8")
+
+            verified = market_recorder.verify_manifest(data_dir, ts="2026-06-14T03:30:00+00:00")
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("manifest_sequence_error:1", verified["errors"])
+
+    def test_manifest_tail_scope_reports_bounded_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            for minute in range(3):
+                market_recorder.capture_once(
+                    data_dir,
+                    fetcher=FakeFetcher(),
+                    now=lambda minute=minute: f"2026-06-14T03:3{minute}:00+00:00",
+                    max_books=1,
+                )
+
+            verified = market_recorder.verify_manifest(
+                data_dir,
+                ts="2026-06-14T03:32:00+00:00",
+                max_rows=4,
+                frame_tail_rows=8,
+            )
+
+        self.assertTrue(verified["ok"])
+        self.assertEqual(verified["verification_scope"], "tail")
+        self.assertEqual(verified["max_rows"], 4)
+        self.assertEqual(verified["frame_tail_rows"], 8)
+        self.assertEqual(verified["verified_rows"], 4)
+        self.assertEqual(verified["frames"], 4)
+        self.assertEqual(verified["latest_sequence"], 12)
+
+    def test_manifest_tail_scope_checks_previous_boundary_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            for minute in range(3):
+                market_recorder.capture_once(
+                    data_dir,
+                    fetcher=FakeFetcher(),
+                    now=lambda minute=minute: f"2026-06-14T03:3{minute}:00+00:00",
+                    max_books=1,
+                )
+            manifest_path = data_dir / "raw" / "polymarket" / "2026-06-14" / "manifest.jsonl"
+            rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+            rows[7]["payload_sha256"] = "tampered-boundary"
+            manifest_path.write_text("\n".join(market_recorder.canonical_json(row) for row in rows) + "\n", encoding="utf-8")
+
+            verified = market_recorder.verify_manifest(
+                data_dir,
+                ts="2026-06-14T03:32:00+00:00",
+                max_rows=4,
+                frame_tail_rows=8,
+            )
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("manifest_boundary_hash_error", verified["errors"])
+
+    def test_manifest_full_scope_ignores_tail_raw_cache_parameter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            for minute in range(2):
+                market_recorder.capture_once(
+                    data_dir,
+                    fetcher=FakeFetcher(),
+                    now=lambda minute=minute: f"2026-06-14T03:3{minute}:00+00:00",
+                    max_books=1,
+                )
+
+            verified = market_recorder.verify_manifest(
+                data_dir,
+                ts="2026-06-14T03:31:00+00:00",
+                max_rows=None,
+                frame_tail_rows=1,
+            )
+
+        self.assertTrue(verified["ok"])
+        self.assertEqual(verified["verification_scope"], "full")
+        self.assertIsNone(verified["max_rows"])
+        self.assertIsNone(verified["frame_tail_rows"])
+        self.assertEqual(verified["verified_rows"], 8)
+        self.assertEqual(verified["latest_sequence"], 8)
+
     def test_partial_book_fetch_keeps_requested_book_coverage_incomplete(self):
         class PartialBookFetcher(FakeFetcher):
             def __call__(self, url, timeout=12.0):
@@ -208,6 +334,34 @@ class MarketRecorderTests(unittest.TestCase):
         self.assertEqual(feed["coverage_ratio"], 0.5)
         self.assertEqual(latest["book_coverage"]["requested_tokens"], 2)
         self.assertEqual(latest["book_coverage"]["ok_tokens"], 1)
+
+    def test_complete_but_not_orderable_books_keep_capture_unhealthy(self):
+        class EmptyBookFetcher(FakeFetcher):
+            def __call__(self, url, timeout=12.0):
+                if "clob.polymarket.com/book" in url:
+                    return {"bids": [], "asks": []}
+                return super().__call__(url, timeout=timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            result = market_recorder.capture_once(
+                data_dir,
+                fetcher=EmptyBookFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=2,
+            )
+            health = market_recorder.recorder_health(
+                data_dir,
+                now=lambda: "2026-06-14T03:30:20+00:00",
+                max_stale_seconds=60,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["book_coverage"]["requested_tokens"], 2)
+        self.assertEqual(result["book_coverage"]["ok_tokens"], 2)
+        self.assertEqual(result["orderable_market_count"], 0)
+        self.assertFalse(health["ok"])
+        self.assertIn("orderable_market_count_invalid", health["errors"])
 
     def test_capture_once_records_orderbook_for_gamma_token_ids(self):
         fetcher = FakeFetcher()
@@ -246,6 +400,32 @@ class MarketRecorderTests(unittest.TestCase):
             fresh = market_recorder.recorder_health(data_dir, now=lambda: "2026-06-14T03:30:20+00:00", max_stale_seconds=60)
             self.assertTrue(fresh["ok"])
             self.assertEqual(fresh["last_capture"]["market_count"], 1)
+
+    def test_health_summary_rejects_boolean_manifest_counters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            market_recorder.capture_once(
+                data_dir,
+                fetcher=FakeFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=1,
+            )
+            health_path = data_dir / "reports" / "market_recorder_health.json"
+            payload = json.loads(health_path.read_text(encoding="utf-8"))
+            payload["manifest"]["verified_rows"] = True
+            payload["manifest"]["latest_sequence"] = True
+            payload["manifest"]["max_rows"] = True
+            health_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            health = market_recorder.recorder_health(
+                data_dir,
+                now=lambda: "2026-06-14T03:30:20+00:00",
+                max_stale_seconds=60,
+            )
+
+        self.assertFalse(health["ok"])
+        self.assertIn("manifest_verified_rows_invalid", health["errors"])
+
     def test_filters_to_bitcoin_markets_before_orderbooks(self):
         class MixedFetcher(FakeFetcher):
             def __call__(self, url, timeout=12.0):

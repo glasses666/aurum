@@ -154,6 +154,47 @@ def manifest_count(manifest_path: pathlib.Path) -> int:
         return sum(1 for line in f if line.strip())
 
 
+def manifest_sequence(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return int(stripped) if stripped.isdigit() else None
+    return None
+
+
+def strict_positive_int(value: Any) -> Optional[int]:
+    parsed = manifest_sequence(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def tail_text_lines(path: pathlib.Path, max_lines: Optional[int] = 200, chunk_size: int = 65536) -> List[str]:
+    if max_lines is None:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if max_lines <= 0:
+        return []
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        chunks: List[bytes] = []
+        newline_count = 0
+        while pos > 0 and newline_count <= max_lines:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            chunk = f.read(read_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    data = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+    return data.splitlines()[-max_lines:]
+
+
 def raw_file_stem(source: str) -> str:
     # Keep the source semantic singular while using a natural plural file for
     # a stream of many book frames.
@@ -199,23 +240,34 @@ def append_frame(
     return manifest
 
 
-def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[str, Any]:
+def verify_manifest(
+    data_dir: pathlib.Path,
+    ts: Optional[str] = None,
+    max_rows: Optional[int] = 500,
+    frame_tail_rows: Optional[int] = None,
+) -> Dict[str, Any]:
     data_dir = pathlib.Path(data_dir)
+    effective_frame_tail_rows = None if max_rows is None else (frame_tail_rows if frame_tail_rows is not None else max(2000, max_rows))
     day = parse_ts(ts).date().isoformat() if ts else dt.datetime.now(dt.timezone.utc).date().isoformat()
     manifest_path = data_dir / "raw" / "polymarket" / day / "manifest.jsonl"
     out: Dict[str, Any] = {
         "ok": True,
         "errors": [],
         "frames": 0,
+        "verified_rows": 0,
+        "latest_sequence": None,
         "manifest_path": str(manifest_path),
         "last_manifest_sha256": "",
+        "verification_scope": "full" if max_rows is None else "tail",
+        "max_rows": max_rows,
+        "frame_tail_rows": effective_frame_tail_rows,
     }
     if not manifest_path.exists():
         out["ok"] = False
         out["errors"].append("missing_manifest")
         return out
-    prev = ""
-    expected_sequence = 1
+    prev: Optional[str] = None
+    expected_sequence: Optional[int] = None
     frame_cache: Dict[pathlib.Path, Optional[Dict[str, str]]] = {}
 
     def frame_index(rel_path: pathlib.Path) -> Optional[Dict[str, str]]:
@@ -226,7 +278,7 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
             frame_cache[rel_path] = None
             return None
         index: Dict[str, str] = {}
-        for frame_line in frame_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for frame_line in tail_text_lines(frame_path, effective_frame_tail_rows):
             if not frame_line.strip():
                 continue
             line_hash_value = sha256_text(frame_line)
@@ -238,7 +290,27 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
         frame_cache[rel_path] = index
         return index
 
-    for line_no, line in enumerate(manifest_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+    manifest_lines = tail_text_lines(manifest_path, None if max_rows is None else max_rows + 1)
+    boundary_prev_hash: Optional[str] = None
+    boundary_prev_sequence: Optional[int] = None
+    if max_rows is not None and len(manifest_lines) > max_rows:
+        boundary_line = manifest_lines[0]
+        manifest_lines = manifest_lines[-max_rows:]
+        try:
+            boundary_row = json.loads(boundary_line)
+            boundary_hash = str(boundary_row.get("manifest_sha256") or "")
+            boundary_unsigned = {k: v for k, v in boundary_row.items() if k != "manifest_sha256"}
+            if boundary_hash != sha256_text(canonical_json(boundary_unsigned)):
+                out["errors"].append("manifest_boundary_hash_error")
+            else:
+                boundary_prev_hash = boundary_hash
+            boundary_prev_sequence = manifest_sequence(boundary_row.get("sequence"))
+            if boundary_prev_sequence is None:
+                out["errors"].append("manifest_boundary_sequence_error")
+        except Exception:
+            out["errors"].append("manifest_boundary_json_error")
+
+    for line_no, line in enumerate(manifest_lines, start=1):
         if not line.strip():
             continue
         try:
@@ -246,9 +318,17 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
         except Exception:
             out["errors"].append(f"manifest_json_error:{line_no}")
             continue
-        if row.get("sequence") != expected_sequence:
+        sequence_int = manifest_sequence(row.get("sequence"))
+        if expected_sequence is None:
+            if boundary_prev_sequence is not None:
+                expected_sequence = boundary_prev_sequence + 1
+                prev = boundary_prev_hash
+            else:
+                expected_sequence = 1
+                prev = ""
+        if sequence_int != expected_sequence:
             out["errors"].append(f"manifest_sequence_error:{line_no}")
-        if str(row.get("prev_manifest_sha256") or "") != prev:
+        if prev is not None and str(row.get("prev_manifest_sha256") or "") != prev:
             out["errors"].append(f"manifest_prev_hash_error:{line_no}")
         manifest_hash = str(row.get("manifest_sha256") or "")
         unsigned = {k: v for k, v in row.items() if k != "manifest_sha256"}
@@ -258,8 +338,10 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
         if source not in RAW_SOURCE_STEMS:
             out["errors"].append(f"manifest_source_unexpected:{line_no}")
             prev = manifest_hash
-            expected_sequence += 1
-            out["frames"] += 1
+            expected_sequence = (sequence_int + 1) if sequence_int is not None else ((expected_sequence or 0) + 1)
+            out["verified_rows"] += 1
+            out["frames"] = out["verified_rows"]
+            out["latest_sequence"] = sequence_int if sequence_int is not None else out["latest_sequence"]
             out["last_manifest_sha256"] = manifest_hash
             continue
         rel_raw = str(row.get("path") or "")
@@ -268,15 +350,19 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
         if rel_path.is_absolute() or ".." in rel_path.parts:
             out["errors"].append(f"manifest_path_unsafe:{line_no}")
             prev = manifest_hash
-            expected_sequence += 1
-            out["frames"] += 1
+            expected_sequence = (sequence_int + 1) if sequence_int is not None else ((expected_sequence or 0) + 1)
+            out["verified_rows"] += 1
+            out["frames"] = out["verified_rows"]
+            out["latest_sequence"] = sequence_int if sequence_int is not None else out["latest_sequence"]
             out["last_manifest_sha256"] = manifest_hash
             continue
         if rel_path != expected_rel:
             out["errors"].append(f"manifest_path_unexpected:{line_no}")
             prev = manifest_hash
-            expected_sequence += 1
-            out["frames"] += 1
+            expected_sequence = (sequence_int + 1) if sequence_int is not None else ((expected_sequence or 0) + 1)
+            out["verified_rows"] += 1
+            out["frames"] = out["verified_rows"]
+            out["latest_sequence"] = sequence_int if sequence_int is not None else out["latest_sequence"]
             out["last_manifest_sha256"] = manifest_hash
             continue
         line_hash = str(row.get("line_sha256") or "")
@@ -293,10 +379,12 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
             elif found_payload_hash != payload_hash:
                 out["errors"].append(f"manifest_payload_hash_mismatch:{line_no}")
         prev = manifest_hash
-        expected_sequence += 1
-        out["frames"] += 1
+        expected_sequence = (sequence_int + 1) if sequence_int is not None else ((expected_sequence or 0) + 1)
+        out["verified_rows"] += 1
+        out["frames"] = out["verified_rows"]
+        out["latest_sequence"] = sequence_int if sequence_int is not None else out["latest_sequence"]
         out["last_manifest_sha256"] = manifest_hash
-    out["ok"] = not out["errors"] and out["frames"] > 0
+    out["ok"] = not out["errors"] and out["verified_rows"] > 0
     return out
 
 
@@ -636,10 +724,12 @@ def capture_once(
     manifest_status = verify_manifest(data_dir, ts=ts)
     trades = trades_payload if isinstance(trades_payload, list) else market_items(trades_payload)
     book_coverage_ok = bool(orderable_feed["requested_tokens"] > 0 and orderable_feed["ok_tokens"] == orderable_feed["requested_tokens"])
-    summary_ok = bool(gamma_ok and clob_ok and trades_ok and markets and book_ok > 0 and book_coverage_ok and manifest_status.get("ok"))
+    orderable_market_count = sum(1 for row in orderable_feed["markets"] if row.get("orderable"))
+    summary_ok = bool(gamma_ok and clob_ok and trades_ok and markets and book_ok > 0 and book_coverage_ok and orderable_market_count > 0 and manifest_status.get("ok"))
     summary = {
         "ok": summary_ok,
         "ts": ts,
+        "source": "polymarket_market_recorder_v0",
         "recorder": "polymarket_market_recorder_v0",
         "universe": universe,
         "market_count": len(markets),
@@ -653,7 +743,7 @@ def capture_once(
             "coverage_ratio": orderable_feed["coverage_ratio"],
             "orderable_ratio": orderable_feed["orderable_ratio"],
         },
-        "orderable_market_count": sum(1 for row in orderable_feed["markets"] if row.get("orderable")),
+        "orderable_market_count": orderable_market_count,
         "manifest": manifest_status,
         "raw_day_dir": str(raw_day_dir(data_dir, ts)),
     }
@@ -726,13 +816,34 @@ def recorder_health(
                 out["errors"].append(f"source_not_ok:{source}")
         coverage = health.get("book_coverage") if isinstance(health.get("book_coverage"), dict) else {}
         if coverage:
-            if int(coverage.get("requested_tokens") or 0) <= 0 or int(coverage.get("ok_tokens") or 0) < int(coverage.get("requested_tokens") or 0):
+            requested_tokens = strict_positive_int(coverage.get("requested_tokens"))
+            ok_tokens = manifest_sequence(coverage.get("ok_tokens"))
+            if requested_tokens is None or ok_tokens is None or ok_tokens < requested_tokens:
                 out["errors"].append("book_coverage_incomplete")
         else:
             out["errors"].append("missing_book_coverage")
+        orderable_count = strict_positive_int(health.get("orderable_market_count"))
+        if orderable_count is None:
+            out["errors"].append("orderable_market_count_invalid")
         manifest = health.get("manifest") if isinstance(health.get("manifest"), dict) else {}
         if manifest.get("ok") is not True:
             out["errors"].append("manifest_verification_failed")
+        else:
+            scope = manifest.get("verification_scope")
+            verified_rows = strict_positive_int(manifest.get("verified_rows"))
+            latest_sequence = strict_positive_int(manifest.get("latest_sequence"))
+            if scope not in {"tail", "full"}:
+                out["errors"].append("manifest_scope_invalid")
+            elif verified_rows is None:
+                out["errors"].append("manifest_verified_rows_invalid")
+            elif latest_sequence is None:
+                out["errors"].append("manifest_latest_sequence_invalid")
+            elif scope == "tail":
+                max_rows = strict_positive_int(manifest.get("max_rows"))
+                if max_rows is None:
+                    out["errors"].append("manifest_tail_scope_invalid")
+            elif manifest.get("max_rows") is not None:
+                out["errors"].append("manifest_full_scope_invalid")
         out["ok"] = not out["errors"]
         return out
     except Exception as exc:

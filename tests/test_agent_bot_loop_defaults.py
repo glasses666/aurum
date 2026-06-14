@@ -24,6 +24,7 @@ class AgentBotLoopDefaultTests(unittest.TestCase):
                 {
                     "ok": True,
                     "ts": ts,
+                    "source": "polymarket_market_recorder_v0",
                     "sources": {
                         "gamma_markets": {"ok_frames": 1},
                         "clob_markets": {"ok_frames": 1},
@@ -31,7 +32,8 @@ class AgentBotLoopDefaultTests(unittest.TestCase):
                         "clob_book": {"ok_frames": 2, "requested_tokens": 2},
                     },
                     "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-                    "manifest": {"ok": True, "frames": 4},
+                    "orderable_market_count": 1,
+                    "manifest": {"ok": True, "frames": 4, "verified_rows": 4, "latest_sequence": 4, "verification_scope": "tail", "max_rows": 500, "frame_tail_rows": 2000},
                 }
             ),
             encoding="utf-8",
@@ -41,6 +43,8 @@ class AgentBotLoopDefaultTests(unittest.TestCase):
                 {
                     "ts": ts,
                     "source": "polymarket_market_recorder_v0",
+                    "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
+                    "orderable_market_count": 1,
                     "markets": [
                         {
                             "market_id": "btc",

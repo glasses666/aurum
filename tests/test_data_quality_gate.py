@@ -18,13 +18,22 @@ class DataQualityGateTests(unittest.TestCase):
         payload.setdefault("ts", ts)
         (root / "reports" / "market_recorder_health.json").write_text(json.dumps(payload), encoding="utf-8")
         (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
-            json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": markets}),
+            json.dumps(
+                {
+                    "ts": ts,
+                    "source": "polymarket_market_recorder_v0",
+                    "markets": markets,
+                    "book_coverage": payload.get("book_coverage"),
+                    "orderable_market_count": payload.get("orderable_market_count"),
+                }
+            ),
             encoding="utf-8",
         )
 
     def healthy_health(self) -> dict:
         return {
             "ok": True,
+            "source": "polymarket_market_recorder_v0",
             "sources": {
                 "gamma_markets": {"ok_frames": 1},
                 "clob_markets": {"ok_frames": 1},
@@ -32,7 +41,16 @@ class DataQualityGateTests(unittest.TestCase):
                 "clob_book": {"ok_frames": 2, "requested_tokens": 2},
             },
             "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-            "manifest": {"ok": True, "frames": 4},
+            "orderable_market_count": 1,
+            "manifest": {
+                "ok": True,
+                "frames": 4,
+                "verified_rows": 4,
+                "latest_sequence": 4,
+                "verification_scope": "tail",
+                "max_rows": 500,
+                "frame_tail_rows": 2000,
+            },
         }
 
     def test_trade_allowed_only_when_health_and_latest_markets_are_fresh_and_complete(self):
@@ -116,6 +134,132 @@ class DataQualityGateTests(unittest.TestCase):
 
         self.assertEqual(decision["decision"], "HOLD_ONLY")
         self.assertIn("manifest_verification_failed", decision["reason_codes"])
+
+    def test_manifest_tail_scope_must_be_explicit_and_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            health = self.healthy_health()
+            health["manifest"] = {"ok": True, "frames": 4, "verified_rows": 4, "latest_sequence": 4, "verification_scope": "tail"}
+            self.write_artifacts(
+                root,
+                health=health,
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("manifest_tail_scope_invalid", decision["reason_codes"])
+        self.assertEqual(decision["manifest_verification_scope"], "tail")
+
+    def test_manifest_missing_verified_rows_is_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            health = self.healthy_health()
+            health["manifest"] = {"ok": True, "frames": 4, "verification_scope": "tail", "max_rows": 500}
+            self.write_artifacts(
+                root,
+                health=health,
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("manifest_verification_empty", decision["reason_codes"])
+
+    def test_full_manifest_requires_null_max_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            health = self.healthy_health()
+            health["manifest"] = {"ok": True, "frames": 4, "verified_rows": 4, "latest_sequence": 4, "verification_scope": "full", "max_rows": 500}
+            self.write_artifacts(
+                root,
+                health=health,
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("manifest_full_scope_invalid", decision["reason_codes"])
+
+    def test_missing_orderable_market_count_is_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            health = self.healthy_health()
+            health.pop("orderable_market_count")
+            self.write_artifacts(
+                root,
+                health=health,
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("orderable_market_count_invalid", decision["reason_codes"])
+        self.assertIn("latest_orderable_market_count_invalid", decision["reason_codes"])
+
+    def test_future_recorder_artifacts_are_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.write_artifacts(
+                root,
+                health=self.healthy_health(),
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:20:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("recorder_ts_in_future", decision["reason_codes"])
+
+    def test_mismatched_health_and_latest_capture_is_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.write_artifacts(
+                root,
+                health=self.healthy_health(),
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+            latest_path = root / "normalized" / "polymarket" / "latest_markets.json"
+            latest = json.loads(latest_path.read_text(encoding="utf-8"))
+            latest["ts"] = "2026-06-14T03:30:10+00:00"
+            latest["book_coverage"] = {"requested_tokens": 99, "ok_tokens": 99, "orderable_tokens": 99}
+            latest["orderable_market_count"] = 99
+            latest_path.write_text(json.dumps(latest), encoding="utf-8")
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("recorder_artifact_ts_mismatch", decision["reason_codes"])
+        self.assertIn("recorder_artifact_book_coverage_mismatch", decision["reason_codes"])
+        self.assertIn("recorder_artifact_orderable_count_mismatch", decision["reason_codes"])
 
     def test_stale_recorder_artifacts_are_hold_only(self):
         with tempfile.TemporaryDirectory() as tmp:
