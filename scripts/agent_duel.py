@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import strategy_rules
 
@@ -65,6 +65,16 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_json(value: Any) -> str:
+    import hashlib
+
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
 def ensure_data_dir(data_dir: pathlib.Path) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -81,10 +91,88 @@ def events_path(data_dir: pathlib.Path) -> pathlib.Path:
     return data_dir / "events.jsonl"
 
 
+def risk_ledger_path(data_dir: pathlib.Path) -> pathlib.Path:
+    return data_dir / "risk_ledger.jsonl"
+
+
 def append_jsonl(path: pathlib.Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def append_risk_ledger(data_dir: pathlib.Path, record: Dict[str, Any]) -> None:
+    append_jsonl(risk_ledger_path(data_dir), record)
+
+
+def account_digest(account: Dict[str, Any]) -> Dict[str, Any]:
+    positions = account.get("positions", {}) if isinstance(account.get("positions"), dict) else {}
+    trades = account.get("trades", []) if isinstance(account.get("trades"), list) else []
+    risk_events = account.get("risk_events", []) if isinstance(account.get("risk_events"), list) else []
+    return {
+        "cash": round(float(account.get("cash", 0.0) or 0.0), 5),
+        "positions": len(positions),
+        "trades": len(trades),
+        "risk_events": len(risk_events),
+        "state_hash": sha256_json(
+            {
+                "cash": round(float(account.get("cash", 0.0) or 0.0), 8),
+                "positions": positions,
+                "trades": trades,
+                "risk_events": risk_events,
+            }
+        ),
+    }
+
+
+def risk_ledger_context(execution_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(execution_context, dict):
+        return {}
+    recorder_public = execution_context.get("recorder_public")
+    if not recorder_public and isinstance(execution_context.get("recorder"), dict):
+        recorder = execution_context["recorder"]
+        recorder_public = {
+            "source": recorder.get("source"),
+            "capture_id": recorder.get("capture_id"),
+            "ts": recorder.get("ts"),
+            "manifest": recorder.get("manifest"),
+            "orderable_feed_sha256": recorder.get("orderable_feed_sha256"),
+            "book_coverage": recorder.get("book_coverage"),
+            "orderable_market_count": recorder.get("orderable_market_count"),
+            "source_refs": recorder.get("source_refs"),
+        }
+    return {
+        "source": execution_context.get("source"),
+        "recorder": recorder_public or {},
+        "bot_script_hash": execution_context.get("bot_script_hash"),
+        "bot_script_status": execution_context.get("bot_script_status"),
+    }
+
+
+def recorded_book_walk(
+    execution_context: Optional[Dict[str, Any]],
+    *,
+    market: Dict[str, Any],
+    outcome_name: str,
+    side: str,
+    limit_price: float,
+    notional: float = 0.0,
+    shares: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(execution_context, dict) or not isinstance(execution_context.get("recorder"), dict):
+        return None
+    # Imported lazily to keep agent_duel importable by recorder_replay.
+    import recorder_replay
+
+    return recorder_replay.book_walk_fill(
+        market=market,
+        outcome_name=outcome_name,
+        side=side,
+        limit_price=limit_price,
+        notional=notional,
+        shares=shares,
+        context=execution_context["recorder"],
+    )
 
 
 def state_runtime_risk() -> Dict[str, Any]:
@@ -103,7 +191,8 @@ def state_runtime_risk() -> Dict[str, Any]:
     }
 
 
-def new_account(agent_id: str) -> Dict[str, Any]:
+def new_account(agent_id: str, *, now_fn: Callable[[], str] = utc_now) -> Dict[str, Any]:
+    now = now_fn()
     return {
         "agent_id": agent_id,
         "mode": "paper",
@@ -114,27 +203,28 @@ def new_account(agent_id: str) -> Dict[str, Any]:
         "positions": {},
         "trades": [],
         "risk_events": [],
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
+        "created_at": now,
+        "updated_at": now,
     }
 
 
-def init_state(data_dir: pathlib.Path, reset: bool = False) -> Dict[str, Any]:
+def init_state(data_dir: pathlib.Path, reset: bool = False, *, now_fn: Callable[[], str] = utc_now) -> Dict[str, Any]:
     ensure_data_dir(data_dir)
     strategy_rules.ensure_default_rules(data_dir)
     p = state_path(data_dir)
     if p.exists() and not reset:
         return load_state(data_dir)
+    now = now_fn()
     state = {
         "version": 1,
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
+        "created_at": now,
+        "updated_at": now,
         "risk": state_runtime_risk(),
-        "accounts": {agent: new_account(agent) for agent in AGENTS},
+        "accounts": {agent: new_account(agent, now_fn=now_fn) for agent in AGENTS},
         "last_markets": [],
     }
-    save_state(data_dir, state)
-    append_jsonl(events_path(data_dir), {"ts": utc_now(), "event": "init", "reset": reset})
+    save_state(data_dir, state, now_fn=now_fn)
+    append_jsonl(events_path(data_dir), {"ts": now_fn(), "event": "init", "reset": reset})
     return state
 
 
@@ -147,8 +237,8 @@ def load_state(data_dir: pathlib.Path) -> Dict[str, Any]:
     return state
 
 
-def save_state(data_dir: pathlib.Path, state: Dict[str, Any]) -> None:
-    state["updated_at"] = utc_now()
+def save_state(data_dir: pathlib.Path, state: Dict[str, Any], *, now_fn: Callable[[], str] = utc_now) -> None:
+    state["updated_at"] = now_fn()
     tmp = state_path(data_dir).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(state_path(data_dir))
@@ -808,6 +898,8 @@ def validate_and_apply(
     apply: bool,
     max_orders: int,
     max_notional_per_order: float,
+    execution_context: Optional[Dict[str, Any]] = None,
+    now_fn: Callable[[], str] = utc_now,
 ) -> Dict[str, Any]:
     if agent_id not in state["accounts"]:
         raise DuelError(f"unknown agent: {agent_id}")
@@ -815,11 +907,14 @@ def validate_and_apply(
     market_by_id = {m["market_id"]: m for m in markets}
     fills = []
     rejections = []
+    decision_id = sha256_json({"agent_id": agent_id, "decision": decision})
     decision_record = {
-        "ts": utc_now(),
+        "ts": now_fn(),
         "agent_id": agent_id,
+        "decision_id": decision_id,
         "decision": decision,
         "applied": bool(apply),
+        "execution_context": risk_ledger_context(execution_context),
         "controls": {
             "max_orders": max_orders,
             "max_notional_per_order": round(max_notional_per_order, 4),
@@ -831,13 +926,31 @@ def validate_and_apply(
     if not isinstance(orders, list):
         orders = []
     for idx, order in enumerate(orders):
+        order_id = f"{decision_id}:{idx}"
+        account_before = account_digest(account)
         if idx >= max_orders:
-            rejections.append({
-                "ts": utc_now(),
+            rejection = {
+                "ts": now_fn(),
                 "agent_id": agent_id,
                 "order": order,
                 "reason": f"order count exceeds configured max_orders={max_orders}",
-            })
+            }
+            rejections.append(rejection)
+            append_risk_ledger(
+                data_dir,
+                {
+                    "ts": now_fn(),
+                    "event": "order_rejected",
+                    "agent_id": agent_id,
+                    "decision_id": decision_id,
+                    "order_id": order_id,
+                    "applied": bool(apply),
+                    "execution_context": risk_ledger_context(execution_context),
+                    "order": order,
+                    "rejection_reason": rejection["reason"],
+                    "account_delta": {"before": account_before, "after": account_digest(account)},
+                },
+            )
             continue
         try:
             market_id = str(order.get("market_id", ""))
@@ -868,10 +981,28 @@ def validate_and_apply(
                 notional = requested_notional
                 if notional < MIN_PAPER_ORDER_USDC:
                     raise DuelError(f"notional must be at least Polymarket paper minimum {MIN_PAPER_ORDER_USDC:.2f} USDC")
-                fill_price = min(0.99, observed_price + SLIPPAGE_BPS / 10000.0)
+                book_walk = recorded_book_walk(
+                    execution_context,
+                    market=market,
+                    outcome_name=outcome_name,
+                    side="buy",
+                    limit_price=limit_price,
+                    notional=notional,
+                )
+                if book_walk is not None:
+                    if not book_walk.get("ok"):
+                        raise DuelError(str(book_walk.get("reason") or "recorded_book_walk_rejected"))
+                    fill_price = float(book_walk["fill_price"])
+                    shares = float(book_walk["shares"])
+                    notional = float(book_walk["notional"])
+                    fill_source = "recorded_orderbook_depth"
+                else:
+                    book_walk = {}
+                    fill_price = min(0.99, observed_price + SLIPPAGE_BPS / 10000.0)
+                    shares = notional / fill_price
+                    fill_source = "legacy_top_price_slippage"
                 if fill_price > limit_price:
                     raise DuelError(f"fill_price {fill_price:.4f} exceeds limit_price {limit_price:.4f}")
-                shares = notional / fill_price
                 fee, fee_rate, fee_category = estimate_taker_fee(shares, fill_price, market)
                 gross_cost = notional + fee
                 if float(account.get("cash", 0.0)) - gross_cost < RESERVE_CASH:
@@ -881,8 +1012,10 @@ def validate_and_apply(
                 if market_exposure(account, market_id) + gross_cost > STARTING_EQUITY * MAX_MARKET_FRACTION:
                     raise DuelError("per-market exposure cap would be breached after Polymarket taker fee")
                 fill = {
-                    "ts": utc_now(),
+                    "ts": now_fn(),
                     "agent_id": agent_id,
+                    "decision_id": decision_id,
+                    "order_id": order_id,
                     "market_id": market_id,
                     "question": market["question"],
                     "outcome": outcome["name"],
@@ -895,7 +1028,9 @@ def validate_and_apply(
                     "fee_rate": fee_rate,
                     "fee_category": fee_category,
                     "gross_cost": round(gross_cost, 5),
-                    "paper_execution_role": "taker",
+                    "paper_execution_role": "recorded_taker_book_walk" if fill_source == "recorded_orderbook_depth" else "taker",
+                    "fill_source": fill_source,
+                    "book_walk": book_walk,
                     "fee_formula": "shares * fee_rate * price * (1 - price)",
                     "rationale": str(order.get("rationale", ""))[:500],
                 }
@@ -914,7 +1049,7 @@ def validate_and_apply(
                                 "avg_price": new_cost / new_shares if new_shares else fill_price,
                                 "last_price": observed_price,
                                 "fees_paid": round(float(existing.get("fees_paid", 0.0)) + fee, FEE_PRECISION_PLACES),
-                                "updated_at": utc_now(),
+                                "updated_at": now_fn(),
                             }
                         )
                     else:
@@ -928,12 +1063,28 @@ def validate_and_apply(
                             "last_price": observed_price,
                             "fees_paid": fee,
                             "fee_category": fee_category,
-                            "created_at": utc_now(),
-                            "updated_at": utc_now(),
+                            "created_at": now_fn(),
+                            "updated_at": now_fn(),
                         }
                     account["cash"] = float(account.get("cash", 0.0)) - gross_cost
                     account.setdefault("trades", []).append(fill)
-                    account["updated_at"] = utc_now()
+                    account["updated_at"] = now_fn()
+                append_risk_ledger(
+                    data_dir,
+                    {
+                        "ts": now_fn(),
+                        "event": "order_filled",
+                        "agent_id": agent_id,
+                        "decision_id": decision_id,
+                        "order_id": order_id,
+                        "applied": bool(apply),
+                        "execution_context": risk_ledger_context(execution_context),
+                        "order": order,
+                        "order_simulation": fill,
+                        "fee_assumptions": {"fee_rate": fee_rate, "fee_category": fee_category, "fee_formula": fill["fee_formula"]},
+                        "account_delta": {"before": account_before, "after": account_digest(account)},
+                    },
+                )
             else:
                 existing = account["positions"].get(pos_key)
                 if not existing:
@@ -946,7 +1097,24 @@ def validate_and_apply(
                 shares = min(held_shares, requested_shares)
                 if shares <= 0:
                     raise DuelError("sell order requires positive shares or notional")
-                fill_price = max(0.01, observed_price - SLIPPAGE_BPS / 10000.0)
+                book_walk = recorded_book_walk(
+                    execution_context,
+                    market=market,
+                    outcome_name=outcome_name,
+                    side="sell",
+                    limit_price=limit_price,
+                    shares=shares,
+                )
+                if book_walk is not None:
+                    if not book_walk.get("ok"):
+                        raise DuelError(str(book_walk.get("reason") or "recorded_book_walk_rejected"))
+                    fill_price = float(book_walk["fill_price"])
+                    shares = float(book_walk["shares"])
+                    fill_source = "recorded_orderbook_depth"
+                else:
+                    book_walk = {}
+                    fill_price = max(0.01, observed_price - SLIPPAGE_BPS / 10000.0)
+                    fill_source = "legacy_top_price_slippage"
                 if fill_price < limit_price:
                     raise DuelError(f"fill_price {fill_price:.4f} is below limit_price {limit_price:.4f}")
                 fee, fee_rate, fee_category = estimate_taker_fee(shares, fill_price, market)
@@ -955,8 +1123,10 @@ def validate_and_apply(
                 if net_proceeds <= 0:
                     raise DuelError("sell proceeds would be non-positive after fee")
                 fill = {
-                    "ts": utc_now(),
+                    "ts": now_fn(),
                     "agent_id": agent_id,
+                    "decision_id": decision_id,
+                    "order_id": order_id,
                     "market_id": market_id,
                     "question": market["question"],
                     "outcome": outcome["name"],
@@ -970,7 +1140,9 @@ def validate_and_apply(
                     "fee_category": fee_category,
                     "gross_proceeds": round(gross_proceeds, 5),
                     "net_proceeds": round(net_proceeds, 5),
-                    "paper_execution_role": "taker",
+                    "paper_execution_role": "recorded_taker_book_walk" if fill_source == "recorded_orderbook_depth" else "taker",
+                    "fill_source": fill_source,
+                    "book_walk": book_walk,
                     "fee_formula": "shares * fee_rate * price * (1 - price)",
                     "rationale": str(order.get("rationale", ""))[:500],
                 }
@@ -990,21 +1162,52 @@ def validate_and_apply(
                                 "avg_price": (new_cost / remaining_shares) if remaining_shares else fill_price,
                                 "last_price": observed_price,
                                 "fees_paid": round(float(existing.get("fees_paid", 0.0)) + fee, FEE_PRECISION_PLACES),
-                                "updated_at": utc_now(),
+                                "updated_at": now_fn(),
                             }
                         )
                     account["cash"] = float(account.get("cash", 0.0)) + net_proceeds
                     account.setdefault("trades", []).append(fill)
-                    account["updated_at"] = utc_now()
+                    account["updated_at"] = now_fn()
+                append_risk_ledger(
+                    data_dir,
+                    {
+                        "ts": now_fn(),
+                        "event": "order_filled",
+                        "agent_id": agent_id,
+                        "decision_id": decision_id,
+                        "order_id": order_id,
+                        "applied": bool(apply),
+                        "execution_context": risk_ledger_context(execution_context),
+                        "order": order,
+                        "order_simulation": fill,
+                        "fee_assumptions": {"fee_rate": fee_rate, "fee_category": fee_category, "fee_formula": fill["fee_formula"]},
+                        "account_delta": {"before": account_before, "after": account_digest(account)},
+                    },
+                )
         except Exception as exc:
-            rejection = {"ts": utc_now(), "agent_id": agent_id, "order": order, "reason": str(exc)}
+            rejection = {"ts": now_fn(), "agent_id": agent_id, "order": order, "reason": str(exc)}
             rejections.append(rejection)
             if apply:
                 account.setdefault("risk_events", []).append(rejection)
+            append_risk_ledger(
+                data_dir,
+                {
+                    "ts": now_fn(),
+                    "event": "order_rejected",
+                    "agent_id": agent_id,
+                    "decision_id": decision_id,
+                    "order_id": order_id,
+                    "applied": bool(apply),
+                    "execution_context": risk_ledger_context(execution_context),
+                    "order": order,
+                    "rejection_reason": str(exc),
+                    "account_delta": {"before": account_before, "after": account_digest(account)},
+                },
+            )
     state["last_markets"] = markets
     if apply:
-        save_state(data_dir, state)
-    event = {"ts": utc_now(), "event": "decision_result", "agent_id": agent_id, "fills": fills, "rejections": rejections, "applied": bool(apply)}
+        save_state(data_dir, state, now_fn=now_fn)
+    event = {"ts": now_fn(), "event": "decision_result", "agent_id": agent_id, "decision_id": decision_id, "fills": fills, "rejections": rejections, "applied": bool(apply)}
     append_jsonl(events_path(data_dir), event)
     return event
 

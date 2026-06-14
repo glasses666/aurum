@@ -22,6 +22,7 @@ import bot_scripts
 import generate_dashboard
 import data_quality_gate
 import market_recorder
+import recorder_replay
 import strategy_rules
 
 _STOP = False
@@ -125,6 +126,28 @@ def load_markets_for_tick(data_dir: pathlib.Path, args: argparse.Namespace) -> t
         return [], source
 
     recorded = market_recorder.load_latest_markets(root, max_stale_seconds=max_stale)
+    try:
+        recorder_context = recorder_replay.build_recorder_context(
+            root,
+            ts=str(recorded.get("ts") or ""),
+            verify_scope="tail",
+            max_rows=500,
+        )
+    except Exception as exc:
+        return [], {
+            "source": "data_quality_gate",
+            "decision": data_quality_gate.HOLD_ONLY,
+            "trade_allowed": False,
+            "hold_only": True,
+            "stop_service": False,
+            "reason_codes": ["recorder_context_unavailable:" + type(exc).__name__],
+            "market_source": recorded.get("source", "market_recorder"),
+            "ts": recorded.get("ts"),
+            "max_stale_seconds": max_stale,
+            "health_ok": True,
+            "market_count": 0,
+            "data_quality_gate": gate,
+        }
     markets = filter_recorded_markets_for_tick(recorded["markets"], args)
     if not markets:
         return [], {
@@ -146,6 +169,8 @@ def load_markets_for_tick(data_dir: pathlib.Path, args: argparse.Namespace) -> t
         "max_stale_seconds": max_stale,
         "health_ok": True,
         "data_quality_gate": gate,
+        "recorder_context": recorder_replay.public_context(recorder_context),
+        "_recorder_execution_context": recorder_context,
     }
 
 
@@ -179,6 +204,9 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
 
     snapshot_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
     markets, market_source = load_markets_for_tick(data_dir, args)
+    recorder_execution_context = None
+    if "_recorder_execution_context" in market_source:
+        recorder_execution_context = market_source.pop("_recorder_execution_context")
     gate = market_source if market_source.get("source") == "data_quality_gate" else market_source.get("data_quality_gate")
     if gate and gate.get("decision") == data_quality_gate.STOP_SERVICE:
         raise duel.DuelError("data quality gate STOP_SERVICE: " + ",".join(str(reason) for reason in gate.get("reason_codes", [])))
@@ -246,6 +274,17 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
             apply=effective_apply,
             max_orders=int(script.get("max_orders_per_tick", args.max_orders)),
             max_notional_per_order=duel.STARTING_EQUITY * duel.MAX_TRADE_FRACTION,
+            execution_context={
+                "source": "resident_mechanical_bot_loop",
+                "recorder": recorder_execution_context,
+                "recorder_public": recorder_replay.public_context(recorder_execution_context),
+                "bot_script_hash": bot_scripts.sha256_json(script),
+                "bot_script_status": script.get("status"),
+            } if recorder_execution_context else {
+                "source": str(market_source.get("source") or "unknown"),
+                "bot_script_hash": bot_scripts.sha256_json(script),
+                "bot_script_status": script.get("status"),
+            },
         )
         agent_records[agent_id] = {"script": script, "decision": decision, "result": result}
 

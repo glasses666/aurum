@@ -12,50 +12,41 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import agent_bot_loop
 import agent_duel
+import market_recorder
+
+
+class HealthyRecorderFetcher:
+    def __call__(self, url, timeout=12.0):
+        if "gamma-api.polymarket.com" in url:
+            return [
+                {
+                    "id": "btc",
+                    "question": "Will Bitcoin close above 100k?",
+                    "slug": "btc-100k",
+                    "category": "Crypto",
+                    "outcomes": '["Yes", "No"]',
+                    "outcomePrices": '["0.42", "0.58"]',
+                    "clobTokenIds": '["tok_yes", "tok_no"]',
+                    "volume": "5000",
+                    "liquidity": "1000",
+                }
+            ]
+        if "clob.polymarket.com/markets" in url:
+            return {"markets": []}
+        if "data-api.polymarket.com/trades" in url:
+            return []
+        if "clob.polymarket.com/book" in url:
+            return {"bids": [["0.41", "100"]], "asks": [["0.43", "80"]]}
+        raise AssertionError(url)
 
 
 class AgentBotLoopDefaultTests(unittest.TestCase):
     def write_healthy_recorder(self, root: pathlib.Path) -> None:
-        (root / "reports").mkdir(parents=True, exist_ok=True)
-        (root / "normalized" / "polymarket").mkdir(parents=True, exist_ok=True)
-        ts = "2026-06-14T03:30:00+00:00"
-        (root / "reports" / "market_recorder_health.json").write_text(
-            json.dumps(
-                {
-                    "ok": True,
-                    "ts": ts,
-                    "source": "polymarket_market_recorder_v0",
-                    "sources": {
-                        "gamma_markets": {"ok_frames": 1},
-                        "clob_markets": {"ok_frames": 1},
-                        "data_trades": {"ok_frames": 1},
-                        "clob_book": {"ok_frames": 2, "requested_tokens": 2},
-                    },
-                    "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-                    "orderable_market_count": 1,
-                    "manifest": {"ok": True, "frames": 4, "verified_rows": 4, "latest_sequence": 4, "verification_scope": "tail", "max_rows": 500, "frame_tail_rows": 2000},
-                }
-            ),
-            encoding="utf-8",
-        )
-        (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
-            json.dumps(
-                {
-                    "ts": ts,
-                    "source": "polymarket_market_recorder_v0",
-                    "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-                    "orderable_market_count": 1,
-                    "markets": [
-                        {
-                            "market_id": "btc",
-                            "question": "Will Bitcoin close above 100k?",
-                            "volume": 5000,
-                            "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
+        market_recorder.capture_once(
+            root,
+            fetcher=HealthyRecorderFetcher(),
+            now=lambda: "2026-06-14T03:30:00+00:00",
+            max_books=2,
         )
 
     def args(self, root: pathlib.Path, *, mode=None):

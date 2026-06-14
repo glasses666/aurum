@@ -540,51 +540,38 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertEqual(decision["orders"], [])
 
     def test_bot_loop_consumes_only_healthy_recorder_markets_with_tick_filters(self):
+        class MultiMarketFetcher:
+            def __call__(self, url, timeout=12.0):
+                if "gamma" in url:
+                    return [
+                        {"id": "low", "question": "Will Bitcoin stay quiet?", "volume": "10", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.4", "0.6"]', "clobTokenIds": '["low_yes", "low_no"]'},
+                        {"id": "high", "question": "Will Bitcoin hit 100k?", "volume": "5000", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.42", "0.58"]', "clobTokenIds": '["high_yes", "high_no"]'},
+                        {"id": "second", "question": "Will Bitcoin hit 120k?", "volume": "7000", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.35", "0.65"]', "clobTokenIds": '["second_yes", "second_no"]'},
+                    ]
+                if "clob.polymarket.com/markets" in url:
+                    return {"markets": []}
+                if "data-api.polymarket.com/trades" in url:
+                    return []
+                if "clob.polymarket.com/book" in url:
+                    return {"bids": [["0.34", "100"]], "asks": [["0.36", "100"]]}
+                raise AssertionError(url)
+
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            (root / "normalized" / "polymarket").mkdir(parents=True)
-            (root / "reports").mkdir(parents=True)
-            ts = "2026-06-14T03:30:00+00:00"
-            markets = [
-                {"market_id": "low", "question": "Will Bitcoin stay quiet?", "volume": 10, "outcomes": [{"name": "Yes", "price": 0.4}, {"name": "No", "price": 0.6}]},
-                {"market_id": "high", "question": "Will Bitcoin hit 100k?", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]},
-                {"market_id": "second", "question": "Will Bitcoin hit 120k?", "volume": 7000, "outcomes": [{"name": "Yes", "price": 0.35}, {"name": "No", "price": 0.65}]},
-            ]
-            (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
-                json.dumps(
-                    {
-                        "ts": ts,
-                        "source": "polymarket_market_recorder_v0",
-                        "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-                        "orderable_market_count": 1,
-                        "markets": markets,
-                    }
-                )
-            )
-            (root / "reports" / "market_recorder_health.json").write_text(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "ts": ts,
-                        "source": "polymarket_market_recorder_v0",
-                        "sources": {
-                            "gamma_markets": {"ok_frames": 1},
-                            "clob_markets": {"ok_frames": 1},
-                            "data_trades": {"ok_frames": 1},
-                            "clob_book": {"ok_frames": 2, "requested_tokens": 2},
-                        },
-                        "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
-                        "orderable_market_count": 1,
-                        "manifest": {"ok": True, "frames": 4, "verified_rows": 4, "latest_sequence": 4, "verification_scope": "tail", "max_rows": 500, "frame_tail_rows": 2000},
-                    }
-                )
+            market_recorder.capture_once(
+                root,
+                fetcher=MultiMarketFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=2,
             )
             args = types.SimpleNamespace(limit=1, min_volume=1000, mock_markets="", allow_proxy=False)
             with mock.patch.dict(os.environ, {"AURUM_RECORDER_MAX_STALE_SECONDS": "999999999"}, clear=False):
                 loaded, source = agent_bot_loop.load_markets_for_tick(root / "paper_duel", args)
 
         self.assertEqual(source["source"], "polymarket_market_recorder_v0")
-        self.assertEqual([market["market_id"] for market in loaded], ["high"])
+        self.assertEqual([market["market_id"] for market in loaded], ["second"])
+        self.assertIn("recorder_context", source)
+        self.assertIn("capture_id", source["recorder_context"])
 
     def test_bot_loop_holds_when_recorder_health_is_bad_even_if_latest_markets_exists(self):
         class BrokenBookFetcher:
