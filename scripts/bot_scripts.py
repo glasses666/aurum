@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import pathlib
 from typing import Any, Dict, List, Optional
 
@@ -44,11 +45,13 @@ def script_path(data_dir: pathlib.Path, agent_id: str) -> pathlib.Path:
 def default_bot_script(agent_id: str) -> Dict[str, Any]:
     base_rules = dict(strategy_rules.DEFAULT_SUPERWING_RULES)
     max_notional = 30.0 if agent_id == "superwing" else 10.0
-    return {
+    script = {
         "version": SCRIPT_VERSION,
         "agent_id": agent_id,
         "execution_mode": "mechanical_script",
         "generated_by": "default_agent_layer",
+        "status": "active_baseline",
+        "hold_only": False,
         "updated_at": utc_now(),
         "interval_sec": DEFAULT_INTERVAL_SEC,
         "min_interval_sec": HARD_MIN_INTERVAL_SEC,
@@ -63,6 +66,7 @@ def default_bot_script(agent_id: str) -> Dict[str, Any]:
             "limit_buffer": base_rules["limit_buffer"],
             "skip_if_market_exposure_usdc_at_least": duel.STARTING_EQUITY * duel.MAX_MARKET_FRACTION,
             "market_cooldown_seconds": 300,
+            "enabled": True,
         },
         "sell_when": {
             "take_profit_pct": 0.12,
@@ -70,6 +74,7 @@ def default_bot_script(agent_id: str) -> Dict[str, Any]:
             "max_hold_seconds": 0,
             "exit_fraction": 1.0,
             "limit_buffer": 0.015,
+            "enabled": True,
         },
         "hold_when": {
             "reserve_cash": duel.RESERVE_CASH,
@@ -77,6 +82,18 @@ def default_bot_script(agent_id: str) -> Dict[str, Any]:
             "no_trade_if_no_matching_rule": True,
         },
     }
+    if agent_id == "deepseek":
+        script.update(
+            {
+                "status": "awaiting_validated_strategy",
+                "hold_only": True,
+                "max_orders_per_tick": 0,
+                "allowed_sides": [],
+            }
+        )
+        script["buy_when"] = {**script["buy_when"], "enabled": False, "max_notional": 0.0, "selection": "Hold until DeepSeek has a validated independent strategy."}
+        script["sell_when"] = {**script["sell_when"], "enabled": False}
+    return script
 
 
 def ensure_default_bot_scripts(data_dir: pathlib.Path) -> None:
@@ -88,15 +105,110 @@ def ensure_default_bot_scripts(data_dir: pathlib.Path) -> None:
             path.write_text(json.dumps(default_bot_script(agent_id), ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def hold_only_safe_script(agent_id: str, reason: str) -> Dict[str, Any]:
+    script = default_bot_script(agent_id)
+    script.update(
+        {
+            "status": "script_invalid",
+            "hold_only": True,
+            "risk_reason": reason,
+            "allowed_sides": [],
+            "max_orders_per_tick": 0,
+        }
+    )
+    script["buy_when"] = {**(script.get("buy_when", {}) or {}), "enabled": False, "max_notional": 0.0}
+    script["sell_when"] = {**(script.get("sell_when", {}) or {}), "enabled": False}
+    return script
+
+
+def _schema_number(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        parsed = float(value)
+        return math.isfinite(parsed)
+    except Exception:
+        return False
+
+
+def _schema_integer(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        parsed = float(value)
+    except Exception:
+        return False
+    return math.isfinite(parsed) and parsed.is_integer()
+
+
+def _nested_rule_schema_error(field: str, value: Dict[str, Any]) -> Optional[str]:
+    numeric_fields = {
+        "buy_when": (
+            "price_min",
+            "price_max",
+            "min_volume",
+            "max_notional",
+            "limit_buffer",
+            "skip_if_market_exposure_usdc_at_least",
+            "market_cooldown_seconds",
+        ),
+        "sell_when": ("take_profit_pct", "stop_loss_pct", "max_hold_seconds", "exit_fraction", "limit_buffer"),
+        "hold_when": ("reserve_cash",),
+    }
+    boolean_fields = {
+        "buy_when": ("enabled",),
+        "sell_when": ("enabled",),
+        "hold_when": ("respect_runner_risk_caps", "no_trade_if_no_matching_rule"),
+    }
+    for nested in numeric_fields.get(field, ()):  # explicit malformed numbers must not reach float()
+        if nested in value and not _schema_number(value.get(nested)):
+            return f"schema_{field}_{nested}_not_number"
+    for nested in boolean_fields.get(field, ()):
+        if nested in value and not isinstance(value.get(nested), bool):
+            return f"schema_{field}_{nested}_not_bool"
+    return None
+
+
+def bot_script_schema_error(raw: Dict[str, Any]) -> Optional[str]:
+    if "allowed_sides" in raw:
+        sides = raw.get("allowed_sides")
+        if not isinstance(sides, list):
+            return "schema_allowed_sides_not_list"
+        invalid_sides = [side for side in sides if side not in {"buy", "sell"}]
+        if invalid_sides:
+            return "schema_allowed_sides_invalid"
+        if not sides and raw.get("hold_only") is not True:
+            return "schema_allowed_sides_empty_without_hold_only"
+    for field in ("buy_when", "sell_when", "hold_when"):
+        if field in raw and not isinstance(raw.get(field), dict):
+            return f"schema_{field}_not_object"
+        if field in raw:
+            nested_error = _nested_rule_schema_error(field, raw.get(field) or {})
+            if nested_error:
+                return nested_error
+    for field in ("interval_sec", "min_interval_sec", "max_orders_per_tick"):
+        if field in raw and not _schema_integer(raw.get(field)):
+            return f"schema_{field}_not_integer"
+    if "hold_only" in raw and not isinstance(raw.get("hold_only"), bool):
+        return "schema_hold_only_not_bool"
+    return None
+
+
 def normalize_bot_script(raw: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
+    schema_error = bot_script_schema_error(raw)
+    if schema_error:
+        return hold_only_safe_script(agent_id, "script_invalid:schema:" + schema_error)
     script = default_bot_script(agent_id)
     script.update({k: v for k, v in raw.items() if k in script})
     script["agent_id"] = agent_id
     script["execution_mode"] = "mechanical_script"
-    script["allowed_sides"] = [side for side in script.get("allowed_sides", []) if side in {"buy", "sell"}] or ["buy", "sell"]
+    script["hold_only"] = bool(script.get("hold_only", False))
+    script["status"] = str(script.get("status") or ("hold_only" if script["hold_only"] else "active_baseline"))[:80]
+    allowed = [side for side in script.get("allowed_sides", []) if side in {"buy", "sell"}]
+    script["allowed_sides"] = [] if script["hold_only"] else (allowed or ["buy", "sell"])
     script["interval_sec"] = int(max(HARD_MIN_INTERVAL_SEC, min(3600, int(script.get("interval_sec", DEFAULT_INTERVAL_SEC)))))
     script["min_interval_sec"] = int(max(1, min(HARD_MIN_INTERVAL_SEC, int(script.get("min_interval_sec", HARD_MIN_INTERVAL_SEC)))))
-    script["max_orders_per_tick"] = int(max(0, min(8, int(script.get("max_orders_per_tick", 2)))))
+    script["max_orders_per_tick"] = 0 if script["hold_only"] else int(max(0, min(8, int(script.get("max_orders_per_tick", 2)))))
     return script
 
 
@@ -107,9 +219,9 @@ def load_bot_script(data_dir: pathlib.Path, agent_id: str) -> Dict[str, Any]:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             return normalize_bot_script(raw, agent_id)
-    except Exception:
-        pass
-    return default_bot_script(agent_id)
+        return hold_only_safe_script(agent_id, "script_invalid:not_object")
+    except Exception as exc:
+        return hold_only_safe_script(agent_id, "script_invalid:" + type(exc).__name__)
 
 
 def write_bot_script(data_dir: pathlib.Path, agent_id: str, script: Dict[str, Any], source: str) -> pathlib.Path:
@@ -288,6 +400,15 @@ def _buy_orders(account: Dict[str, Any], markets: List[Dict[str, Any]], script: 
 
 
 def mechanical_decision_for_agent(account: Dict[str, Any], markets: List[Dict[str, Any]], script: Dict[str, Any]) -> Dict[str, Any]:
+    if script.get("hold_only"):
+        return {
+            "agent_id": str(script.get("agent_id") or account.get("agent_id")),
+            "source": "mechanical_script",
+            "script_version": script.get("version"),
+            "script_updated_at": script.get("updated_at"),
+            "orders": [],
+            "notes": "hold-only script: " + str(script.get("status") or "hold_only"),
+        }
     max_orders = int(script.get("max_orders_per_tick", 2))
     sell_orders = _sell_orders(account, markets, script)[:max_orders]
     if sell_orders:

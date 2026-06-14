@@ -4,7 +4,8 @@ Aurum's corrected hot path is a **resident mechanical bot loop** on the VPS, not
 
 ## Current target stage
 
-- Mode: `paper_apply` for pre-contest paper stability trading.
+- Default mode: `review_only` for local/runtime safety.
+- `paper_apply` is a deliberate pre-contest paper stability mode and must be set explicitly with the DeepSeek paper-apply authorization gates.
 - Execution host: Aurum VPS.
 - Runtime user: `aurum`.
 - App path: `/opt/aurum/app`.
@@ -69,17 +70,19 @@ Resident loop wrapper:
 /opt/aurum/app/scripts/run_bot_loop.sh
 ```
 
-One local smoke tick without starting a daemon:
+One local smoke tick without mutating paper-wallet state:
 
 ```bash
 cd /opt/aurum/app
 runuser -u aurum -- python3 scripts/agent_bot_loop.py \
   --env-file /opt/aurum/.env \
   --data-dir /opt/aurum/data/paper_duel \
-  --mode paper_apply \
+  --mode review_only \
   --limit 12 \
   --once
 ```
+
+Paper-apply smoke requires explicit local env gates; do not rely on defaults.
 
 Systemd:
 

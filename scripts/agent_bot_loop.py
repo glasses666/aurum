@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import agent_duel as duel
 import bot_scripts
 import generate_dashboard
+import data_quality_gate
 import market_recorder
 import strategy_rules
 
@@ -103,56 +104,105 @@ def filter_recorded_markets_for_tick(markets: List[Dict[str, Any]], args: argpar
 
 def load_markets_for_tick(data_dir: pathlib.Path, args: argparse.Namespace) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     max_stale = int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180"))
-    try:
-        root = recorder_data_root(data_dir)
-        health = market_recorder.recorder_health(root, max_stale_seconds=max_stale)
-        if not health.get("ok"):
-            raise RuntimeError("recorder health not ok: " + ",".join(health.get("errors", [])))
-        recorded = market_recorder.load_latest_markets(root, max_stale_seconds=max_stale)
-        markets = filter_recorded_markets_for_tick(recorded["markets"], args)
-        if not markets:
-            raise RuntimeError("recorder latest_markets empty after tick filters")
-        return markets, {
-            "source": recorded.get("source", "market_recorder"),
+    root = recorder_data_root(data_dir)
+    allow_fallback = duel.env_bool("AURUM_ALLOW_UNAUDITED_FALLBACK", False)
+    gate = data_quality_gate.evaluate_data_quality_gate(
+        root,
+        max_stale_seconds=max_stale,
+        allow_unaudited_fallback=allow_fallback,
+    )
+    if gate["decision"] != data_quality_gate.TRADE_ALLOWED:
+        if gate.get("fallback_allowed"):
+            markets = duel.fetch_markets(args.limit, args.min_volume, args.mock_markets, args.allow_proxy)
+            return markets, {
+                "source": "unaudited_direct_fetch_fallback",
+                "reason": "explicit_AURUM_ALLOW_UNAUDITED_FALLBACK",
+                "data_quality_gate": gate,
+                "market_count": len(markets),
+            }
+        source = dict(gate)
+        source["source"] = "data_quality_gate"
+        return [], source
+
+    recorded = market_recorder.load_latest_markets(root, max_stale_seconds=max_stale)
+    markets = filter_recorded_markets_for_tick(recorded["markets"], args)
+    if not markets:
+        return [], {
+            "source": "data_quality_gate",
+            "decision": data_quality_gate.HOLD_ONLY,
+            "trade_allowed": False,
+            "hold_only": True,
+            "stop_service": False,
+            "reason_codes": ["recorder latest_markets empty after tick filters"],
+            "market_source": recorded.get("source", "market_recorder"),
             "ts": recorded.get("ts"),
             "max_stale_seconds": max_stale,
             "health_ok": True,
+            "market_count": 0,
         }
-    except Exception as exc:
-        markets = duel.fetch_markets(args.limit, args.min_volume, args.mock_markets, args.allow_proxy)
-        return markets, {"source": "direct_fetch_fallback", "reason": type(exc).__name__}
+    return markets, {
+        "source": recorded.get("source", "market_recorder"),
+        "ts": recorded.get("ts"),
+        "max_stale_seconds": max_stale,
+        "health_ok": True,
+        "data_quality_gate": gate,
+    }
+
+
+def hold_only_decision_for_agent(agent_id: str, script: Dict[str, Any], gate: Dict[str, Any]) -> Dict[str, Any]:
+    reasons = gate.get("reason_codes", []) or []
+    return {
+        "agent_id": agent_id,
+        "source": "data_quality_gate_hold",
+        "script_version": script.get("version"),
+        "script_updated_at": script.get("updated_at"),
+        "orders": [],
+        "notes": "hold-only; market data quality gate blocked trading: " + ",".join(str(reason) for reason in reasons),
+    }
 
 
 def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
     data_dir = pathlib.Path(args.data_dir)
-    duel.ensure_data_dir(data_dir)
     duel.load_env_file(pathlib.Path(args.env_file) if args.env_file else None)
-    bot_scripts.ensure_default_bot_scripts(data_dir)
 
     blocked = forbidden_live_env_present()
     if blocked:
         raise duel.DuelError("live-trading/wallet-like env vars are present; refusing mechanical bot tick: " + ", ".join(blocked))
 
-    mode = (args.mode or os.environ.get("AURUM_DUEL_MODE", "paper_apply")).strip().lower()
+    raw_mode = args.mode if args.mode is not None else os.environ.get("AURUM_DUEL_MODE")
+    mode = (str(raw_mode or "review_only").strip().lower() or "review_only")
     if mode not in {"review_only", "paper_apply"}:
         raise duel.DuelError(f"unsupported mode={mode!r}")
     apply_paper = mode == "paper_apply"
 
     snapshot_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
-    state = duel.init_state(data_dir, reset=False)
     markets, market_source = load_markets_for_tick(data_dir, args)
-    if not markets:
+    gate = market_source if market_source.get("source") == "data_quality_gate" else market_source.get("data_quality_gate")
+    if gate and gate.get("decision") == data_quality_gate.STOP_SERVICE:
+        raise duel.DuelError("data quality gate STOP_SERVICE: " + ",".join(str(reason) for reason in gate.get("reason_codes", [])))
+    hold_only = bool(gate and gate.get("decision") == data_quality_gate.HOLD_ONLY)
+    if not markets and not hold_only:
         raise duel.DuelError("no eligible markets returned for mechanical bot tick")
+    effective_apply = apply_paper and not hold_only
+    if effective_apply:
+        controls = duel.deepseek_controls(args.max_orders)
+        duel.require_deepseek_apply_authorized(controls)
+
+    duel.ensure_data_dir(data_dir)
+    bot_scripts.ensure_default_bot_scripts(data_dir)
+    state = duel.init_state(data_dir, reset=False)
 
     snapshot_record = {
         "snapshot_id": snapshot_id,
         "ts": duel.utc_now(),
         "mode": mode,
+        "effective_mode": "hold_only" if hold_only else mode,
         "runner": "resident_mechanical_bot_loop",
         "limit": args.limit,
         "min_volume": args.min_volume,
         "market_count": len(markets),
         "market_source": market_source,
+        "data_quality_gate": gate,
         "markets": markets,
     }
     snapshot_file = snapshots_dir(data_dir) / f"{snapshot_id}.json"
@@ -161,19 +211,19 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
 
     agent_records: Dict[str, Any] = {}
     for agent_id in duel.AGENTS:
-        if apply_paper and agent_id == "deepseek":
-            controls = duel.deepseek_controls(args.max_orders)
-            duel.require_deepseek_apply_authorized(controls)
         state = duel.load_state(data_dir)
         script = bot_scripts.load_bot_script(data_dir, agent_id)
-        decision = bot_scripts.mechanical_decision_for_agent(state["accounts"][agent_id], markets, script)
+        if hold_only:
+            decision = hold_only_decision_for_agent(agent_id, script, gate or {})
+        else:
+            decision = bot_scripts.mechanical_decision_for_agent(state["accounts"][agent_id], markets, script)
         result = duel.validate_and_apply(
             data_dir,
             state,
             agent_id,
             decision,
             markets,
-            apply=apply_paper,
+            apply=effective_apply,
             max_orders=int(script.get("max_orders_per_tick", args.max_orders)),
             max_notional_per_order=duel.STARTING_EQUITY * duel.MAX_TRADE_FRACTION,
         )
@@ -189,12 +239,14 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
         "tick_id": snapshot_id,
         "ts": duel.utc_now(),
         "mode": mode,
-        "applied": apply_paper,
+        "effective_mode": "hold_only" if hold_only else mode,
+        "applied": effective_apply,
         "runner": "resident_mechanical_bot_loop",
         "loop_interval_sec": loop_interval(data_dir),
         "snapshot_file": str(snapshot_file),
         "market_count": len(markets),
         "market_source": market_source,
+        "data_quality_gate": gate,
         "shared_snapshot": True,
         "agents": agent_records,
         "scores": scores,

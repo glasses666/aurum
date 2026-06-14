@@ -34,6 +34,234 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertIn("take_profit_pct", script["sell_when"])
         self.assertIn("stop_loss_pct", script["sell_when"])
 
+    def test_deepseek_default_bot_script_is_hold_only_until_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            superwing_script = bot_scripts.load_bot_script(data_dir, "superwing")
+            deepseek_script = bot_scripts.load_bot_script(data_dir, "deepseek")
+            state = agent_duel.init_state(data_dir, reset=True)
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "liquidity": 1000,
+                    "outcomes": [
+                        {"name": "Yes", "price": 0.42},
+                        {"name": "No", "price": 0.58},
+                    ],
+                }
+            ]
+            superwing_decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["superwing"], markets, superwing_script)
+            deepseek_decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["deepseek"], markets, deepseek_script)
+
+        self.assertEqual(superwing_decision["orders"][0]["side"], "buy")
+        self.assertTrue(deepseek_script["hold_only"])
+        self.assertEqual(deepseek_script["status"], "awaiting_validated_strategy")
+        self.assertEqual(deepseek_script["allowed_sides"], [])
+        self.assertEqual(deepseek_script["max_orders_per_tick"], 0)
+        self.assertEqual(deepseek_decision["orders"], [])
+        self.assertNotEqual(
+            json.dumps(superwing_script, sort_keys=True),
+            json.dumps(deepseek_script, sort_keys=True),
+        )
+
+    def test_invalid_bot_script_fails_closed_to_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text("{half-json", encoding="utf-8")
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            state = agent_duel.init_state(data_dir, reset=True)
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
+                }
+            ]
+            decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["superwing"], markets, script)
+
+        self.assertTrue(script["hold_only"])
+        self.assertEqual(script["status"], "script_invalid")
+        self.assertIn("script_invalid", script["risk_reason"])
+        self.assertEqual(script["allowed_sides"], [])
+        self.assertEqual(decision["orders"], [])
+        self.assertIn("script_invalid", decision["notes"])
+
+    def test_malformed_bot_script_schema_fails_closed_to_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text(
+                json.dumps({"allowed_sides": "buy", "buy_when": "not-a-rule-object"}),
+                encoding="utf-8",
+            )
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            state = agent_duel.init_state(data_dir, reset=True)
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
+                }
+            ]
+            decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["superwing"], markets, script)
+
+        self.assertTrue(script["hold_only"])
+        self.assertEqual(script["status"], "script_invalid")
+        self.assertIn("schema", script["risk_reason"])
+        self.assertEqual(decision["orders"], [])
+
+    def test_invalid_allowed_sides_list_fails_closed_instead_of_defaulting_to_trade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text(
+                json.dumps({"allowed_sides": ["not-a-side"]}),
+                encoding="utf-8",
+            )
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            state = agent_duel.init_state(data_dir, reset=True)
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
+                }
+            ]
+            decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["superwing"], markets, script)
+
+        self.assertTrue(script["hold_only"])
+        self.assertEqual(script["status"], "script_invalid")
+        self.assertIn("allowed_sides", script["risk_reason"])
+        self.assertEqual(decision["orders"], [])
+
+    def test_malformed_nested_buy_rule_fails_closed_instead_of_runtime_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text(
+                json.dumps({"buy_when": {"price_min": "low"}}),
+                encoding="utf-8",
+            )
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            state = agent_duel.init_state(data_dir, reset=True)
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
+                }
+            ]
+            decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["superwing"], markets, script)
+
+        self.assertTrue(script["hold_only"])
+        self.assertEqual(script["status"], "script_invalid")
+        self.assertIn("buy_when", script["risk_reason"])
+        self.assertEqual(decision["orders"], [])
+
+    def test_non_finite_numeric_rule_fails_closed_to_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text(
+                json.dumps({"buy_when": {"max_notional": "NaN"}}),
+                encoding="utf-8",
+            )
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            state = agent_duel.init_state(data_dir, reset=True)
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
+                }
+            ]
+            decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["superwing"], markets, script)
+
+        self.assertTrue(script["hold_only"])
+        self.assertEqual(script["status"], "script_invalid")
+        self.assertIn("max_notional", script["risk_reason"])
+        self.assertEqual(decision["orders"], [])
+
+    def test_fractional_integer_script_field_fails_closed_to_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text(
+                json.dumps({"max_orders_per_tick": 1.5}),
+                encoding="utf-8",
+            )
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            state = agent_duel.init_state(data_dir, reset=True)
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
+                }
+            ]
+            decision = bot_scripts.mechanical_decision_for_agent(state["accounts"]["superwing"], markets, script)
+
+        self.assertTrue(script["hold_only"])
+        self.assertEqual(script["status"], "script_invalid")
+        self.assertIn("max_orders_per_tick", script["risk_reason"])
+        self.assertEqual(decision["orders"], [])
+
+    def test_tick_exposes_invalid_script_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "reports").mkdir(parents=True)
+            (root / "normalized" / "polymarket").mkdir(parents=True)
+            ts = "2026-06-14T03:30:00+00:00"
+            (root / "reports" / "market_recorder_health.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "ts": ts,
+                        "sources": {
+                            "gamma_markets": {"ok_frames": 1},
+                            "clob_markets": {"ok_frames": 1},
+                            "data_trades": {"ok_frames": 1},
+                            "clob_book": {"ok_frames": 1},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
+                json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": [{"market_id": "btc", "question": "Will BTC?", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}]}),
+                encoding="utf-8",
+            )
+            data_dir = root / "paper_duel"
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text("{half-json", encoding="utf-8")
+            args = types.SimpleNamespace(
+                data_dir=str(data_dir),
+                env_file="",
+                mode="review_only",
+                limit=1,
+                min_volume=0,
+                max_orders=2,
+                mock_markets="",
+                allow_proxy=False,
+                dashboard_dir="",
+            )
+            with mock.patch.dict(os.environ, {"AURUM_RECORDER_MAX_STALE_SECONDS": "999999999"}, clear=False):
+                tick = agent_bot_loop.run_mechanical_tick(args)
+
+        self.assertEqual(tick["agents"]["superwing"]["script"]["status"], "script_invalid")
+        self.assertEqual(tick["agents"]["superwing"]["decision"]["orders"], [])
+        self.assertIn("script_invalid", tick["agents"]["superwing"]["decision"]["notes"])
+
     def test_agent_layer_can_write_mechanical_script_for_bot_layer(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = pathlib.Path(tmp)
@@ -127,7 +355,7 @@ class MechanicalBotScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = pathlib.Path(tmp)
             state = agent_duel.init_state(data_dir, reset=True)
-            account = state["accounts"]["deepseek"]
+            account = state["accounts"]["superwing"]
             account["positions"]["btc-1::Yes"] = {
                 "market_id": "btc-1",
                 "question": "Will Bitcoin close above 100k?",
@@ -140,7 +368,7 @@ class MechanicalBotScriptTests(unittest.TestCase):
                 "created_at": agent_duel.utc_now(),
                 "updated_at": agent_duel.utc_now(),
             }
-            script = bot_scripts.load_bot_script(data_dir, "deepseek")
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
             markets = [
                 {
                     "market_id": "btc-1",
@@ -272,7 +500,7 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertEqual(source["source"], "polymarket_market_recorder_v0")
         self.assertEqual([market["market_id"] for market in loaded], ["high"])
 
-    def test_bot_loop_falls_back_when_recorder_health_is_bad_even_if_latest_markets_exists(self):
+    def test_bot_loop_holds_when_recorder_health_is_bad_even_if_latest_markets_exists(self):
         class BrokenBookFetcher:
             def __call__(self, url, timeout=12.0):
                 if "gamma" in url:
@@ -297,14 +525,85 @@ class MechanicalBotScriptTests(unittest.TestCase):
             root = pathlib.Path(tmp)
             market_recorder.capture_once(root, fetcher=BrokenBookFetcher(), now=lambda: "2026-06-14T03:30:00+00:00", max_books=1)
             self.assertFalse(json.loads((root / "reports" / "market_recorder_health.json").read_text())["ok"])
-            fallback_markets = [{"market_id": "fallback", "question": "Will Bitcoin recover?", "volume": 1, "outcomes": [{"name": "Yes", "price": 0.4}, {"name": "No", "price": 0.6}]}]
             args = types.SimpleNamespace(limit=1, min_volume=0, mock_markets="", allow_proxy=False)
-            with mock.patch.object(agent_duel, "fetch_markets", return_value=fallback_markets) as fetch_markets:
+            with mock.patch.object(agent_duel, "fetch_markets", side_effect=AssertionError("direct fallback forbidden")) as fetch_markets:
                 loaded, source = agent_bot_loop.load_markets_for_tick(root / "paper_duel", args)
 
+        fetch_markets.assert_not_called()
+        self.assertEqual(loaded, [])
+        self.assertEqual(source["source"], "data_quality_gate")
+        self.assertEqual(source["decision"], "HOLD_ONLY")
+        self.assertIn("last_capture_not_ok", source["reason_codes"])
+
+    def test_dev_mode_can_direct_fetch_when_explicitly_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "reports").mkdir(parents=True)
+            (root / "normalized" / "polymarket").mkdir(parents=True)
+            ts = "2026-06-14T03:30:00+00:00"
+            (root / "reports" / "market_recorder_health.json").write_text(
+                json.dumps({"ok": False, "ts": ts, "sources": {"clob_book": {"ok_frames": 0}}})
+            )
+            (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
+                json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": []})
+            )
+            fallback_markets = [{"market_id": "fallback", "question": "Dev smoke fallback", "volume": 1, "outcomes": [{"name": "Yes", "price": 0.4}, {"name": "No", "price": 0.6}]}]
+            args = types.SimpleNamespace(limit=1, min_volume=0, mock_markets="", allow_proxy=False)
+            with mock.patch.dict(os.environ, {"AURUM_ALLOW_UNAUDITED_FALLBACK": "true"}, clear=False):
+                with mock.patch.object(agent_duel, "fetch_markets", return_value=fallback_markets) as fetch_markets:
+                    loaded, source = agent_bot_loop.load_markets_for_tick(root / "paper_duel", args)
+
         fetch_markets.assert_called_once_with(1, 0, "", False)
-        self.assertEqual(source["source"], "direct_fetch_fallback")
         self.assertEqual(loaded, fallback_markets)
+        self.assertEqual(source["source"], "unaudited_direct_fetch_fallback")
+        self.assertEqual(source["data_quality_gate"]["decision"], "HOLD_ONLY")
+
+    def test_mechanical_tick_records_hold_only_when_data_gate_blocks_paper_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "reports").mkdir(parents=True)
+            (root / "normalized" / "polymarket").mkdir(parents=True)
+            ts = "2026-06-14T03:30:00+00:00"
+            (root / "reports" / "market_recorder_health.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "ts": ts,
+                        "sources": {
+                            "gamma_markets": {"ok_frames": 1},
+                            "clob_markets": {"ok_frames": 1},
+                            "data_trades": {"ok_frames": 1},
+                            "clob_book": {"ok_frames": 0},
+                        },
+                    }
+                )
+            )
+            (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
+                json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": [{"market_id": "btc", "question": "Will BTC?", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}]})
+            )
+            args = types.SimpleNamespace(
+                data_dir=str(root / "paper_duel"),
+                env_file="",
+                mode="paper_apply",
+                limit=1,
+                min_volume=0,
+                max_orders=2,
+                mock_markets="",
+                allow_proxy=False,
+                dashboard_dir="",
+            )
+            with mock.patch.dict(os.environ, {"AURUM_RECORDER_MAX_STALE_SECONDS": "999999999"}, clear=False):
+                with mock.patch.object(agent_duel, "fetch_markets", side_effect=AssertionError("direct fallback forbidden")):
+                    tick = agent_bot_loop.run_mechanical_tick(args)
+
+        self.assertTrue(tick["ok"])
+        self.assertFalse(tick["applied"])
+        self.assertEqual(tick["market_count"], 0)
+        self.assertEqual(tick["market_source"]["source"], "data_quality_gate")
+        self.assertEqual(tick["data_quality_gate"]["decision"], "HOLD_ONLY")
+        for agent in agent_duel.AGENTS:
+            self.assertEqual(tick["agents"][agent]["decision"]["orders"], [])
+            self.assertEqual(tick["agents"][agent]["result"]["fills"], [])
 
     def test_superwing_rules_do_not_accept_schema_echo_placeholders(self):
         rules = strategy_rules.normalize_superwing_rules(

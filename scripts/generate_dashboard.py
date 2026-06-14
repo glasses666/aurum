@@ -16,6 +16,7 @@ import pathlib
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import agent_duel as duel
+import bot_scripts
 import market_recorder
 import strategy_rules
 
@@ -94,6 +95,10 @@ a { color: inherit; }
 .rail-title { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; margin-bottom: 12px; }
 .big-number { font-size: 34px; line-height: 1; letter-spacing: -.06em; font-weight: 680; }
 .caption { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.quality-banner { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 12px 22px; border-bottom: 1px solid var(--line); background: #070707; }
+.quality-banner.warning { border-bottom-color: rgba(243,201,105,.45); }
+.quality-item { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.quality-item b { display: block; margin-top: 4px; color: var(--text); font-size: 13px; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-row, .rank-row, .log-row, .position-row {
   display: grid;
   gap: 6px;
@@ -285,6 +290,7 @@ def env_public(env_file: Optional[pathlib.Path]) -> Dict[str, str]:
         "AURUM_DUEL_UNIVERSE",
         "AURUM_DUEL_SEARCH_QUERY",
         "AURUM_BOT_MIN_INTERVAL_SEC",
+        "AURUM_BOT_DEFAULT_INTERVAL_SEC",
         "AURUM_FIRST_CONTEST_DAYS",
         "AURUM_DEEPSEEK_ALLOW_PAPER_APPLY",
         "AURUM_DEEPSEEK_MAX_ORDERS",
@@ -423,6 +429,72 @@ def roi_series(ticks: List[Dict[str, Any]], state: Dict[str, Any], scores: List[
     return series
 
 
+def seconds_since(value: Any, *, now_value: Optional[str] = None) -> Optional[float]:
+    ts = parse_ts(value)
+    now_dt = parse_ts(now_value or utc_now())
+    if not ts or not now_dt:
+        return None
+    return max(0.0, (now_dt - ts).total_seconds())
+
+
+def fallback_ticks_last_hour(ticks: List[Dict[str, Any]], latest_tick: Dict[str, Any]) -> int:
+    now_value = latest_tick.get("ts") or utc_now()
+    count = 0
+    for tick in ticks:
+        source = ((tick.get("market_source") or {}) if isinstance(tick.get("market_source"), dict) else {}).get("source", "")
+        if "fallback" not in str(source):
+            continue
+        age = seconds_since(tick.get("ts"), now_value=now_value)
+        if age is None or age <= 3600:
+            count += 1
+    return count
+
+
+def data_quality_banner(latest_tick: Dict[str, Any], ticks: List[Dict[str, Any]], env: Dict[str, str]) -> str:
+    market_source = latest_tick.get("market_source") if isinstance(latest_tick.get("market_source"), dict) else {}
+    gate = latest_tick.get("data_quality_gate") if isinstance(latest_tick.get("data_quality_gate"), dict) else None
+    gate_missing = gate is None
+    if gate is None:
+        gate = market_source.get("data_quality_gate") if isinstance(market_source.get("data_quality_gate"), dict) else None
+        gate_missing = gate is None
+    if not isinstance(gate, dict):
+        gate = {}
+    source = str(market_source.get("source") or "none")
+    decision = str(gate.get("decision") or "UNKNOWN")
+    reasons = gate.get("reason_codes", []) if isinstance(gate.get("reason_codes"), list) else []
+    reason_text = ",".join(str(reason) for reason in reasons) or "none"
+    recorder_age = gate.get("recorder_age_seconds") or market_source.get("recorder_age_seconds")
+    latest_age = seconds_since(latest_tick.get("ts")) if latest_tick else None
+    actual_interval = latest_tick.get("loop_interval_sec")
+    configured_interval = env.get("AURUM_BOT_DEFAULT_INTERVAL_SEC") or env.get("AURUM_BOT_MIN_INTERVAL_SEC") or "unknown"
+    mismatch = False
+    try:
+        mismatch = actual_interval is not None and int(float(actual_interval)) != int(float(configured_interval))
+    except Exception:
+        mismatch = False
+    warnings = []
+    if gate_missing:
+        warnings.append("no gate")
+    if "fallback" in source:
+        warnings.append("unaudited fallback")
+    if decision not in {"TRADE_ALLOWED", "UNKNOWN"}:
+        warnings.append(decision.lower())
+    if mismatch:
+        warnings.append("interval mismatch")
+    warning_text = "; ".join(warnings) or "clear"
+    css = "quality-banner warning" if warnings else "quality-banner"
+    return f"""
+      <div class=\"{css}\" aria-label=\"Data quality\">
+        <div class=\"quality-item\">Data quality<b>{esc(decision)} · {esc(warning_text)}</b></div>
+        <div class=\"quality-item\">Source<b>{esc(source)} · fallback ticks last 1h {fallback_ticks_last_hour(ticks, latest_tick)}</b></div>
+        <div class=\"quality-item\">Recorder age<b>{esc('n/a' if recorder_age is None else str(recorder_age) + 's')} · latest tick age {esc('n/a' if latest_age is None else str(round(latest_age, 1)) + 's')}</b></div>
+        <div class=\"quality-item\">Interval<b>actual {esc(actual_interval if actual_interval is not None else 'unknown')}s · configured {esc(configured_interval)}s</b></div>
+        <div class=\"quality-item\">Reasons<b>{esc(reason_text)}</b></div>
+        <div class=\"quality-item\">Tick<b>{esc(latest_tick.get('tick_id', 'none') if latest_tick else 'none')}</b></div>
+      </div>
+    """
+
+
 def read_reviews(data_dir: pathlib.Path) -> List[Dict[str, Any]]:
     root = data_dir / "strategy_reviews"
     if not root.exists():
@@ -514,17 +586,26 @@ def extract_trade_events(ticks: List[Dict[str, Any]], decisions: List[Dict[str, 
     return rows[:limit]
 
 
-def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env: Dict[str, str]) -> str:
+def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env: Dict[str, str], data_dir: Optional[pathlib.Path] = None) -> str:
     score_by_agent = {row.get("agent_id"): row for row in scores if isinstance(row, dict)}
     ranked = sorted(scores, key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
     rank_by_agent = {row.get("agent_id"): idx + 1 for idx, row in enumerate(ranked)}
+    scripts: Dict[str, Dict[str, Any]] = {}
+    if data_dir is not None:
+        for agent in duel.AGENTS:
+            try:
+                scripts[agent] = bot_scripts.load_bot_script(data_dir, agent)
+            except Exception:
+                scripts[agent] = {}
     parts: List[str] = []
     for agent in duel.AGENTS:
         row = score_by_agent.get(agent, {})
         account = state.get("accounts", {}).get(agent, {}) if isinstance(state, dict) else {}
+        script = scripts.get(agent, {})
         model = "fixed baseline"
         if agent == "deepseek":
             model = env.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        status = script.get("status") or ("hold_only" if script.get("hold_only") else "active")
         color = AGENT_COLORS[agent]
         parts.append(f"""
         <div class="agent-row">
@@ -532,7 +613,7 @@ def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env:
             <span class="agent-name" style="color:{color}"><span class="dot"></span>{esc(AGENT_LABELS[agent])}</span>
             <span class="pill">rank #{esc(rank_by_agent.get(agent, '—'))}</span>
           </div>
-          <div class="agent-sub">{esc(model)} · {esc(env.get('AURUM_DUEL_MODE', account.get('mode', 'paper')))}</div>
+          <div class="agent-sub">{esc(model)} · {esc(env.get('AURUM_DUEL_MODE', account.get('mode', 'paper')))} · {esc(status)}</div>
           <div class="agent-stats">
             <span>equity<b>{fmt_money(row.get('portfolio_value', account.get('cash', 1500)))}</b></span>
             <span>ROI<b>{fmt_pct(row.get('roi', 0))}</b></span>
@@ -792,7 +873,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
       </section>
       <section class="rail-section">
         <div class="rail-title"><span>Agents</span><span>{esc(mode)}</span></div>
-        {agent_status_panel(scores, state, env)}
+        {agent_status_panel(scores, state, env, data_dir)}
       </section>
       <section class="rail-section">
         <div class="rail-title"><span>Positions</span><span>paper</span></div>
@@ -814,6 +895,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         <div class="brand"><h1>Aurum Trading Terminal</h1><span>paper-only · no wallet · no live order</span></div>
         <div class="meta"><span>generated {esc(updated_at)}</span><span>ticks {len(ticks)}</span><span>btc frames {len(btc)}</span></div>
       </div>
+      {data_quality_banner(latest_tick, ticks, env)}
       <div class="chart-wrap">
         <div class="chart-title">
           <div>
