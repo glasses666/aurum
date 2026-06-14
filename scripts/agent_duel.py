@@ -925,6 +925,20 @@ def validate_and_apply(
     orders = decision.get("orders", []) or []
     if not isinstance(orders, list):
         orders = []
+    decision_account = account_digest(account)
+    append_risk_ledger(
+        data_dir,
+        {
+            "ts": now_fn(),
+            "event": "decision_recorded",
+            "agent_id": agent_id,
+            "decision_id": decision_id,
+            "applied": bool(apply),
+            "execution_context": risk_ledger_context(execution_context),
+            "order_count": len(orders),
+            "account_delta": {"before": decision_account, "after": decision_account},
+        },
+    )
     for idx, order in enumerate(orders):
         order_id = f"{decision_id}:{idx}"
         account_before = account_digest(account)

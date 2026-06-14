@@ -107,6 +107,30 @@ class RecorderReplayTests(unittest.TestCase):
         self.assertEqual(ledger[-1]["event"], "order_rejected")
         self.assertEqual(ledger[-1]["rejection_reason"], "insufficient_recorded_ask_depth")
 
+    def test_no_order_decision_still_writes_risk_ledger_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            state = agent_duel.init_state(data_dir, reset=True)
+
+            result = agent_duel.validate_and_apply(
+                data_dir,
+                state,
+                "superwing",
+                {"agent_id": "superwing", "orders": []},
+                [],
+                apply=True,
+                max_orders=2,
+                max_notional_per_order=45.0,
+                execution_context={"source": "test", "recorder_public": {"capture_id": "cap-1"}, "bot_script_hash": "script-hash"},
+                now_fn=lambda: "2026-06-14T03:30:00+00:00",
+            )
+            ledger = [json.loads(line) for line in (data_dir / "risk_ledger.jsonl").read_text().splitlines()]
+
+        self.assertEqual(result["fills"], [])
+        self.assertEqual(ledger[0]["event"], "decision_recorded")
+        self.assertEqual(ledger[0]["order_count"], 0)
+        self.assertEqual(ledger[0]["execution_context"]["recorder"]["capture_id"], "cap-1")
+
     def test_tail_replay_frame_lookup_does_not_materialize_large_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
