@@ -62,6 +62,7 @@ def default_bot_script(agent_id: str) -> Dict[str, Any]:
             "max_notional": max_notional,
             "limit_buffer": base_rules["limit_buffer"],
             "skip_if_market_exposure_usdc_at_least": duel.STARTING_EQUITY * duel.MAX_MARKET_FRACTION,
+            "market_cooldown_seconds": 300,
         },
         "sell_when": {
             "take_profit_pct": 0.12,
@@ -210,6 +211,27 @@ def _sell_orders(account: Dict[str, Any], markets: List[Dict[str, Any]], script:
     return orders
 
 
+def _recent_market_trade_age_seconds(account: Dict[str, Any], market_id: str) -> Optional[float]:
+    newest: Optional[dt.datetime] = None
+    for trade in account.get("trades", []) or []:
+        if str(trade.get("market_id")) != str(market_id):
+            continue
+        raw = str(trade.get("ts") or "")
+        if not raw:
+            continue
+        try:
+            parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        if newest is None or parsed > newest:
+            newest = parsed
+    if newest is None:
+        return None
+    return max(0.0, (dt.datetime.now(dt.timezone.utc) - newest).total_seconds())
+
+
 def _buy_orders(account: Dict[str, Any], markets: List[Dict[str, Any]], script: Dict[str, Any], remaining_slots: int) -> List[Dict[str, Any]]:
     if remaining_slots <= 0 or "buy" not in script.get("allowed_sides", []):
         return []
@@ -220,10 +242,15 @@ def _buy_orders(account: Dict[str, Any], markets: List[Dict[str, Any]], script: 
     max_notional = min(float(buy_rules.get("max_notional", 10.0)), duel.STARTING_EQUITY * duel.MAX_TRADE_FRACTION)
     limit_buffer = float(buy_rules.get("limit_buffer", 0.015))
     exposure_skip = float(buy_rules.get("skip_if_market_exposure_usdc_at_least", duel.STARTING_EQUITY * duel.MAX_MARKET_FRACTION))
+    market_cooldown_seconds = max(0.0, float(buy_rules.get("market_cooldown_seconds", 300)))
     orders: List[Dict[str, Any]] = []
     for market in markets:
         market_id = str(market.get("market_id"))
-        if duel.market_exposure(account, market_id) >= exposure_skip:
+        recent_age = _recent_market_trade_age_seconds(account, market_id)
+        if recent_age is not None and recent_age < market_cooldown_seconds:
+            continue
+        current_exposure = duel.market_exposure(account, market_id)
+        if current_exposure >= exposure_skip:
             continue
         if float(market.get("volume", 0.0) or 0.0) < min_volume:
             continue
@@ -237,6 +264,12 @@ def _buy_orders(account: Dict[str, Any], markets: List[Dict[str, Any]], script: 
         if not chosen:
             continue
         price = float(chosen.get("price", 0.0))
+        expected_fill_price = min(0.99, price + duel.SLIPPAGE_BPS / 10000.0)
+        expected_shares = max_notional / expected_fill_price if expected_fill_price else 0.0
+        expected_fee, _, _ = duel.estimate_taker_fee(expected_shares, expected_fill_price, market)
+        expected_gross_cost = max_notional + expected_fee
+        if current_exposure + expected_gross_cost > exposure_skip:
+            continue
         orders.append(
             {
                 "market_id": market_id,
@@ -257,8 +290,10 @@ def _buy_orders(account: Dict[str, Any], markets: List[Dict[str, Any]], script: 
 def mechanical_decision_for_agent(account: Dict[str, Any], markets: List[Dict[str, Any]], script: Dict[str, Any]) -> Dict[str, Any]:
     max_orders = int(script.get("max_orders_per_tick", 2))
     sell_orders = _sell_orders(account, markets, script)[:max_orders]
-    buy_orders = _buy_orders(account, markets, script, max_orders - len(sell_orders))
-    orders = sell_orders + buy_orders
+    if sell_orders:
+        orders = sell_orders
+    else:
+        orders = _buy_orders(account, markets, script, max_orders)
     return {
         "agent_id": str(script.get("agent_id") or account.get("agent_id")),
         "source": "mechanical_script",

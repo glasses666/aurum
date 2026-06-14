@@ -119,6 +119,120 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertEqual(decision["orders"][0]["side"], "sell")
         self.assertEqual(decision["orders"][0]["reason"], "take_profit")
 
+    def test_mechanical_decision_does_not_buy_again_in_same_tick_after_sell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            state = agent_duel.init_state(data_dir, reset=True)
+            account = state["accounts"]["deepseek"]
+            account["positions"]["btc-1::Yes"] = {
+                "market_id": "btc-1",
+                "question": "Will Bitcoin close above 100k?",
+                "outcome": "Yes",
+                "shares": 10.0,
+                "cost_basis": 4.0,
+                "avg_price": 0.4,
+                "last_price": 0.4,
+                "fees_paid": 0.0,
+                "created_at": agent_duel.utc_now(),
+                "updated_at": agent_duel.utc_now(),
+            }
+            script = bot_scripts.load_bot_script(data_dir, "deepseek")
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "volume": 10000,
+                    "liquidity": 1000,
+                    "outcomes": [
+                        {"name": "Yes", "price": 0.5},
+                        {"name": "No", "price": 0.5},
+                    ],
+                },
+                {
+                    "market_id": "btc-2",
+                    "question": "Will Bitcoin close above 110k?",
+                    "volume": 10000,
+                    "liquidity": 1000,
+                    "outcomes": [
+                        {"name": "Yes", "price": 0.42},
+                        {"name": "No", "price": 0.58},
+                    ],
+                },
+            ]
+
+            decision = bot_scripts.mechanical_decision_for_agent(account, markets, script)
+
+        self.assertEqual([order["side"] for order in decision["orders"]], ["sell"])
+
+    def test_mechanical_buy_skips_when_new_order_would_breach_market_cap_with_fee(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            state = agent_duel.init_state(data_dir, reset=True)
+            account = state["accounts"]["superwing"]
+            account["positions"]["btc-1::Yes"] = {
+                "market_id": "btc-1",
+                "question": "Will Bitcoin close above 100k?",
+                "outcome": "Yes",
+                "shares": 400.0,
+                "cost_basis": 115.0,
+                "avg_price": 0.2875,
+                "last_price": 0.28,
+                "fees_paid": 0.0,
+                "created_at": agent_duel.utc_now(),
+                "updated_at": agent_duel.utc_now(),
+            }
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "category": "Crypto",
+                    "volume": 10000,
+                    "liquidity": 1000,
+                    "outcomes": [
+                        {"name": "Yes", "price": 0.28},
+                        {"name": "No", "price": 0.72},
+                    ],
+                }
+            ]
+
+            decision = bot_scripts.mechanical_decision_for_agent(account, markets, script)
+
+        self.assertEqual(decision["orders"], [])
+
+    def test_mechanical_buy_skips_recently_traded_market(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            state = agent_duel.init_state(data_dir, reset=True)
+            account = state["accounts"]["deepseek"]
+            account["trades"].append(
+                {
+                    "ts": agent_duel.utc_now(),
+                    "market_id": "btc-1",
+                    "outcome": "Yes",
+                    "side": "buy",
+                    "notional": 10.0,
+                }
+            )
+            script = bot_scripts.load_bot_script(data_dir, "deepseek")
+            markets = [
+                {
+                    "market_id": "btc-1",
+                    "question": "Will Bitcoin close above 100k?",
+                    "category": "Crypto",
+                    "volume": 10000,
+                    "liquidity": 1000,
+                    "outcomes": [
+                        {"name": "Yes", "price": 0.28},
+                        {"name": "No", "price": 0.72},
+                    ],
+                }
+            ]
+
+            decision = bot_scripts.mechanical_decision_for_agent(account, markets, script)
+
+        self.assertEqual(decision["orders"], [])
+
     def test_superwing_rules_do_not_accept_schema_echo_placeholders(self):
         rules = strategy_rules.normalize_superwing_rules(
             {
