@@ -216,6 +216,28 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
         return out
     prev = ""
     expected_sequence = 1
+    frame_cache: Dict[pathlib.Path, Optional[Dict[str, str]]] = {}
+
+    def frame_index(rel_path: pathlib.Path) -> Optional[Dict[str, str]]:
+        if rel_path in frame_cache:
+            return frame_cache[rel_path]
+        frame_path = data_dir / rel_path
+        if not frame_path.exists():
+            frame_cache[rel_path] = None
+            return None
+        index: Dict[str, str] = {}
+        for frame_line in frame_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not frame_line.strip():
+                continue
+            line_hash_value = sha256_text(frame_line)
+            try:
+                frame = json.loads(frame_line)
+                index[line_hash_value] = str(frame.get("payload_sha256") or "")
+            except Exception:
+                index[line_hash_value] = "__FRAME_JSON_ERROR__"
+        frame_cache[rel_path] = index
+        return index
+
     for line_no, line in enumerate(manifest_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
         if not line.strip():
             continue
@@ -257,26 +279,19 @@ def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[st
             out["frames"] += 1
             out["last_manifest_sha256"] = manifest_hash
             continue
-        frame_path = data_dir / rel_path
         line_hash = str(row.get("line_sha256") or "")
         payload_hash = str(row.get("payload_sha256") or "")
-        if not frame_path.exists() or not line_hash:
+        index = frame_index(rel_path)
+        if index is None or not line_hash:
             out["errors"].append(f"manifest_frame_missing:{line_no}")
         else:
-            matched = False
-            for frame_line in frame_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if sha256_text(frame_line) != line_hash:
-                    continue
-                matched = True
-                try:
-                    frame = json.loads(frame_line)
-                    if str(frame.get("payload_sha256") or "") != payload_hash:
-                        out["errors"].append(f"manifest_payload_hash_mismatch:{line_no}")
-                except Exception:
-                    out["errors"].append(f"manifest_frame_json_error:{line_no}")
-                break
-            if not matched:
+            found_payload_hash = index.get(line_hash)
+            if found_payload_hash is None:
                 out["errors"].append(f"manifest_frame_line_missing:{line_no}")
+            elif found_payload_hash == "__FRAME_JSON_ERROR__":
+                out["errors"].append(f"manifest_frame_json_error:{line_no}")
+            elif found_payload_hash != payload_hash:
+                out["errors"].append(f"manifest_payload_hash_mismatch:{line_no}")
         prev = manifest_hash
         expected_sequence += 1
         out["frames"] += 1
