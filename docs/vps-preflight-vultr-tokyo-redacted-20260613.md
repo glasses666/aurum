@@ -1,4 +1,4 @@
-# Aurum VPS Preflight Report — Vultr Tokyo 198.13.45.59
+# Aurum VPS Preflight Report — Vultr Tokyo [REDACTED_IP]
 
 Timestamp: 2026-06-13 22:27 CST / 2026-06-13 14:27 UTC
 
@@ -21,7 +21,7 @@ Read-only access and network checks only:
 
 ## Host snapshot
 
-- IP: `198.13.45.59`
+- IP: `[REDACTED_IP]`
 - User: `root`
 - Hostname: `aurum-tokyo-01`
 - Kernel: `Linux aurum-tokyo-01 6.8.0-124-generic #124-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 13:00:45 UTC 2026 x86_64`
@@ -32,7 +32,7 @@ Read-only access and network checks only:
 
 ## SSH result
 
-- TCP `198.13.45.59:22`: reachable
+- TCP `[REDACTED_IP]:22`: reachable
 - SSH key login: successful
 - Local key used: `/Users/dracoglasser/.ssh/aurum_vultr_20260613_ed25519`
 

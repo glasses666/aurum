@@ -27,12 +27,12 @@ Read-only checks only:
 - Disk `/`: `40G`, `32G` used, `5.3G` free, `86%` used
 - Memory: `1.8Gi` total, about `1.1Gi` available
 - DNS config: NetworkManager-generated `/etc/resolv.conf`
-  - `100.100.2.136`
-  - `100.100.2.138`
+  - `[REDACTED_IP]`
+  - `[REDACTED_IP]`
 
 ## Preflight result
 
-Running `/tmp/aurum-vps-preflight.py --dns-server 223.5.5.5 --timeout 12 --json` on the server returned:
+Running `/tmp/aurum-vps-preflight.py --dns-server [REDACTED_IP] --timeout 12 --json` on the server returned:
 
 - verdict: `fail`
 - OK: `0/4`
@@ -60,14 +60,14 @@ Endpoint results:
 
 The configured resolvers did not answer direct DNS UDP checks:
 
-- `100.100.2.136`: DNS query timeout
-- `100.100.2.138`: DNS query timeout
+- `[REDACTED_IP]`: DNS query timeout
+- `[REDACTED_IP]`: DNS query timeout
 
 This caused normal system resolution to fail with `Name or service not known`.
 
 ### External DNS can resolve, but Polymarket direct connectivity still fails
 
-Manual DNS queries through `223.5.5.5` returned A records, but direct TCP to the returned Polymarket endpoint IPs failed:
+Manual DNS queries through `[REDACTED_IP]` returned A records, but direct TCP to the returned Polymarket endpoint IPs failed:
 
 - `gamma-api.polymarket.com` resolved, but `443` timed out
 - `clob.polymarket.com` resolved, but `443` timed out
@@ -76,7 +76,7 @@ Manual DNS queries through `223.5.5.5` returned A records, but direct TCP to the
 
 ### Generic outbound IP connectivity is not completely dead
 
-The host could open TCP connections to unrelated numeric IPs on port `443`, and could reach `223.5.5.5:53` quickly. So this is not simply “no internet.” It is a combination of broken default DNS plus poor/blocked route to Polymarket endpoints from this Guangzhou ECS.
+The host could open TCP connections to unrelated numeric IPs on port `443`, and could reach `[REDACTED_IP]:53` quickly. So this is not simply “no internet.” It is a combination of broken default DNS plus poor/blocked route to Polymarket endpoints from this Guangzhou ECS.
 
 ## Interpretation
 
