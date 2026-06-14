@@ -60,7 +60,30 @@ def manifest_rows_for_ts(data_dir: pathlib.Path, ts: str, *, max_lines: Optional
     return rows
 
 
-def frame_for_manifest_row(data_dir: pathlib.Path, row: Dict[str, Any], *, max_frame_lines: Optional[int] = None) -> Optional[Dict[str, Any]]:
+def manifest_row_error(row: Dict[str, Any], day: str) -> Optional[str]:
+    manifest_hash = str(row.get("manifest_sha256") or "")
+    unsigned = {k: v for k, v in row.items() if k != "manifest_sha256"}
+    if manifest_hash != market_recorder.sha256_text(market_recorder.canonical_json(unsigned)):
+        return "manifest_hash_mismatch"
+    source = str(row.get("source") or "")
+    if source not in market_recorder.RAW_SOURCE_STEMS:
+        return "manifest_source_unexpected"
+    rel = pathlib.PurePosixPath(str(row.get("path") or ""))
+    expected = pathlib.PurePosixPath("raw") / "polymarket" / day / f"{market_recorder.RAW_SOURCE_STEMS[source]}.jsonl"
+    if rel.is_absolute() or ".." in rel.parts:
+        return "manifest_path_unsafe"
+    if rel != expected:
+        return "manifest_path_unexpected"
+    return None
+
+
+def frame_for_manifest_row(
+    data_dir: pathlib.Path,
+    row: Dict[str, Any],
+    *,
+    max_frame_lines: Optional[int] = None,
+    parse_frame: bool = True,
+) -> Optional[Dict[str, Any]]:
     rel = pathlib.PurePosixPath(str(row.get("path") or ""))
     if rel.is_absolute() or ".." in rel.parts:
         return None
@@ -74,10 +97,17 @@ def frame_for_manifest_row(data_dir: pathlib.Path, row: Dict[str, Any], *, max_f
             continue
         if market_recorder.sha256_text(line) != expected_line_sha:
             continue
-        try:
-            frame = json.loads(line)
-        except Exception:
-            return None
+        frame: Optional[Dict[str, Any]] = None
+        if parse_frame:
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                return None
+            if not isinstance(parsed, dict):
+                return None
+            if str(parsed.get("payload_sha256") or "") != str(row.get("payload_sha256") or ""):
+                return None
+            frame = parsed
         return {
             "line_number": line_number,
             "frame": frame,
@@ -89,6 +119,92 @@ def frame_for_manifest_row(data_dir: pathlib.Path, row: Dict[str, Any], *, max_f
             "source": row.get("source"),
         }
     return None
+
+
+def latest_tail_manifest_proof(root: pathlib.Path, capture_ts: str) -> Dict[str, Any]:
+    health = read_json(root / "reports" / "market_recorder_health.json")
+    if str(health.get("ts") or "") != str(capture_ts):
+        raise RuntimeError("recorder health does not match requested capture")
+    manifest = health.get("manifest")
+    if not isinstance(manifest, dict) or manifest.get("ok") is not True:
+        raise RuntimeError("recorder health manifest is not ok")
+    if manifest.get("verification_scope") != "tail":
+        raise RuntimeError("recorder health manifest is not tail verified")
+    if not market_recorder.strict_positive_int(manifest.get("verified_rows")):
+        raise RuntimeError("recorder health manifest has no verified rows")
+    return manifest
+
+
+def verify_manifest_tail_chain(
+    root: pathlib.Path,
+    capture_ts: str,
+    proof: Dict[str, Any],
+    *,
+    max_rows: Optional[int],
+) -> Dict[str, Any]:
+    if max_rows is None:
+        raise ValueError("tail chain verification requires max_rows")
+    day = market_recorder.parse_ts(capture_ts).date().isoformat()
+    manifest_path = manifest_path_for_ts(root, capture_ts)
+    manifest_lines = market_recorder.tail_text_lines(manifest_path, max_rows + 1)
+    if not manifest_lines:
+        raise RuntimeError("missing recorder manifest tail")
+    prev_hash = ""
+    expected_sequence = 1
+    if len(manifest_lines) > max_rows:
+        boundary_line = manifest_lines[0]
+        manifest_lines = manifest_lines[-max_rows:]
+        try:
+            boundary = json.loads(boundary_line)
+        except Exception as exc:
+            raise RuntimeError("manifest boundary json error") from exc
+        boundary_error = manifest_row_error(boundary, day)
+        if boundary_error:
+            raise RuntimeError("manifest boundary " + boundary_error)
+        boundary_sequence = market_recorder.manifest_sequence(boundary.get("sequence"))
+        if boundary_sequence is None:
+            raise RuntimeError("manifest boundary sequence invalid")
+        prev_hash = str(boundary.get("manifest_sha256") or "")
+        expected_sequence = boundary_sequence + 1
+
+    verified_rows = 0
+    latest_sequence: Optional[int] = None
+    last_hash = ""
+    for line in manifest_lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception as exc:
+            raise RuntimeError("manifest tail json error") from exc
+        row_error = manifest_row_error(row, day)
+        if row_error:
+            raise RuntimeError(row_error)
+        sequence = market_recorder.manifest_sequence(row.get("sequence"))
+        if sequence != expected_sequence:
+            raise RuntimeError("manifest_sequence_error")
+        if str(row.get("prev_manifest_sha256") or "") != prev_hash:
+            raise RuntimeError("manifest_prev_hash_error")
+        last_hash = str(row.get("manifest_sha256") or "")
+        prev_hash = last_hash
+        latest_sequence = sequence
+        expected_sequence += 1
+        verified_rows += 1
+
+    proof_sequence = market_recorder.strict_positive_int(proof.get("latest_sequence"))
+    if proof_sequence is not None and latest_sequence != proof_sequence:
+        raise RuntimeError("manifest_latest_sequence_mismatch")
+    proof_hash = str(proof.get("last_manifest_sha256") or "")
+    if proof_hash and last_hash != proof_hash:
+        raise RuntimeError("manifest_latest_hash_mismatch")
+    return {
+        "ok": True,
+        "verification_scope": "tail",
+        "max_rows": max_rows,
+        "verified_rows": verified_rows,
+        "latest_sequence": latest_sequence,
+        "last_manifest_sha256": last_hash,
+    }
 
 
 def _public_frame_ref(frame_ref: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,7 +232,13 @@ def build_recorder_context(
     capture_ts = str(ts or latest_ts)
     if verify_scope not in {"tail", "full"}:
         raise ValueError("verify_scope must be tail or full")
-    verified = market_recorder.verify_manifest(root, ts=capture_ts, max_rows=None if verify_scope == "full" else max_rows)
+    use_latest_tail_proof = verify_scope == "tail" and capture_ts == latest_ts
+    if use_latest_tail_proof:
+        verified = latest_tail_manifest_proof(root, capture_ts)
+        tail_chain = verify_manifest_tail_chain(root, capture_ts, verified, max_rows=max_rows)
+        verified = {**verified, **tail_chain}
+    else:
+        verified = market_recorder.verify_manifest(root, ts=capture_ts, max_rows=None if verify_scope == "full" else max_rows)
     if not verified.get("ok"):
         raise RuntimeError("recorder manifest verification failed: " + ",".join(str(e) for e in verified.get("errors", [])))
 
@@ -126,6 +248,8 @@ def build_recorder_context(
     use_bounded_manifest_lookup = verify_scope == "tail" and capture_ts == latest_ts
     max_manifest_lines = max(50, int(max_rows or 500)) if use_bounded_manifest_lookup else None
     manifest_rows = manifest_rows_for_ts(root, capture_ts, max_lines=max_manifest_lines)
+    if not manifest_rows and use_bounded_manifest_lookup:
+        manifest_rows = manifest_rows_for_ts(root, capture_ts, max_lines=None)
     if not manifest_rows:
         raise RuntimeError("no manifest rows for recorder capture")
 
@@ -133,9 +257,13 @@ def build_recorder_context(
     books_by_token: Dict[str, Any] = {}
     book_refs_by_token: Dict[str, Dict[str, Any]] = {}
     max_frame_lines = 2000 if verify_scope == "tail" else None
+    capture_day = market_recorder.parse_ts(capture_ts).date().isoformat()
     for row in manifest_rows:
         source = str(row.get("source") or "")
-        frame_ref = frame_for_manifest_row(root, row, max_frame_lines=max_frame_lines)
+        row_error = manifest_row_error(row, capture_day)
+        if row_error:
+            raise RuntimeError(row_error)
+        frame_ref = frame_for_manifest_row(root, row, max_frame_lines=max_frame_lines, parse_frame=True)
         if not frame_ref:
             raise RuntimeError("missing recorder raw frame for manifest row")
         source_refs.setdefault(source, []).append(_public_frame_ref(frame_ref))

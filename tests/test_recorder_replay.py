@@ -132,6 +132,33 @@ class RecorderReplayTests(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 4)
         self.assertEqual(rows, sorted(rows, key=lambda row: row["sequence"]))
 
+    def test_latest_tail_context_uses_published_manifest_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.capture(root)
+
+            with mock.patch.object(market_recorder, "verify_manifest", side_effect=AssertionError("hot path full verifier")):
+                context = recorder_replay.build_recorder_context(root, verify_scope="tail", max_rows=500)
+
+        self.assertEqual(context["manifest"]["verification_scope"], "tail")
+        self.assertEqual(context["manifest"]["verified_rows"], 5)
+        self.assertIn("clob_book", context["source_refs"])
+
+    def test_latest_tail_context_rejects_manifest_sequence_tamper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.capture(root)
+            manifest_path = root / "raw" / "polymarket" / "2026-06-14" / "manifest.jsonl"
+            rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+            rows[-1]["sequence"] = 999
+            rows[-1]["manifest_sha256"] = market_recorder.sha256_text(
+                market_recorder.canonical_json({k: v for k, v in rows[-1].items() if k != "manifest_sha256"})
+            )
+            manifest_path.write_text("\n".join(market_recorder.canonical_json(row) for row in rows) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "manifest_sequence_error|manifest_latest_sequence_mismatch"):
+                recorder_replay.build_recorder_context(root, verify_scope="tail", max_rows=500)
+
     def test_tail_context_for_non_latest_timestamp_falls_back_to_full_manifest_lookup(self):
         first_ts = "2026-06-14T03:30:00+00:00"
         with tempfile.TemporaryDirectory() as tmp:
