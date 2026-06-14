@@ -12,7 +12,7 @@ Environment=APP_DIR=/opt/aurum/app
 Environment=AURUM_RECORDER_DATA_DIR=/opt/aurum/data
 Environment=AURUM_RECORDER_INTERVAL_SEC=30
 Environment=AURUM_RECORDER_MAX_BOOKS=20
-Environment=AURUM_RECORDER_MAX_STALE_SECONDS=180
+Environment=AURUM_RECORDER_MAX_STALE_SECONDS=420
 ExecStart=/opt/aurum/app/scripts/run_market_recorder.sh
 Restart=always
 RestartSec=10

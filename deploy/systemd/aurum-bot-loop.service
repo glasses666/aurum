@@ -14,6 +14,7 @@ Environment=AURUM_DATA_DIR=/opt/aurum/data/paper_duel
 Environment=AURUM_RUN_DIR=/opt/aurum/run
 Environment=AURUM_LOG_DIR=/opt/aurum/logs
 Environment=AURUM_PUBLIC_DASHBOARD_DIR=/opt/aurum/public/dashboard
+Environment=AURUM_RECORDER_MAX_STALE_SECONDS=420
 Environment=AURUM_BOT_MIN_INTERVAL_SEC=5
 Environment=AURUM_BOT_DEFAULT_INTERVAL_SEC=15
 ExecStart=/opt/aurum/app/scripts/run_bot_loop.sh
