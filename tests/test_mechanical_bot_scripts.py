@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import agent_duel
 import bot_scripts
 import agent_bot_loop
+import strategy_rules
 
 
 class MechanicalBotScriptTests(unittest.TestCase):
@@ -117,6 +118,34 @@ class MechanicalBotScriptTests(unittest.TestCase):
 
         self.assertEqual(decision["orders"][0]["side"], "sell")
         self.assertEqual(decision["orders"][0]["reason"], "take_profit")
+
+    def test_superwing_rules_do_not_accept_schema_echo_placeholders(self):
+        rules = strategy_rules.normalize_superwing_rules(
+            {
+                "name": "name: string",
+                "selection": "selection: string",
+                "notes": "notes: text",
+                "review_rationale": "why this rule change helps",
+                "price_min": 0.31,
+                "price_max": 0.49,
+            }
+        )
+
+        self.assertEqual(rules["name"], strategy_rules.DEFAULT_SUPERWING_RULES["name"])
+        self.assertEqual(rules["selection"], strategy_rules.DEFAULT_SUPERWING_RULES["selection"])
+        self.assertEqual(rules["notes"], strategy_rules.DEFAULT_SUPERWING_RULES["notes"])
+        self.assertNotIn("review_rationale", rules)
+        self.assertEqual(rules["price_min"], 0.31)
+
+    def test_deepseek_rules_reject_schema_echo_placeholder(self):
+        with self.assertRaises(ValueError):
+            strategy_rules.validate_deepseek_rules(
+                "markdown rules for DeepSeek, paper-only/buy-only/hold-if-no-edge"
+            )
+        with self.assertRaises(ValueError):
+            strategy_rules.validate_deepseek_rules(
+                "deepseek_rules_md: markdown rules for DeepSeek, paper-only/buy-only/hold-if-no-edge"
+            )
 
     def test_validate_and_apply_sell_reduces_position_and_increases_cash(self):
         with tempfile.TemporaryDirectory() as tmp:

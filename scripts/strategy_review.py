@@ -226,14 +226,28 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     proposed: Dict[str, Any] = {}
     promoted: Dict[str, Any] = {}
 
+    validation_errors = []
     sw_candidate = review.get("superwing_rules")
     sw_raw: Dict[str, Any] = sw_candidate if isinstance(sw_candidate, dict) else {}
+    placeholder_fields = [
+        key
+        for key in ("name", "selection", "notes", "review_rationale")
+        if strategy_rules.contains_placeholder_text(sw_raw.get(key))
+    ]
+    if strategy_rules.contains_placeholder_text(review.get("superwing_rationale")):
+        placeholder_fields.append("superwing_rationale")
+    if placeholder_fields:
+        validation_errors.append("superwing placeholder fields: " + ", ".join(sorted(set(placeholder_fields))))
     sw_rules = strategy_rules.normalize_superwing_rules(sw_raw)
     sw_proposal = strategy_rules.write_proposal(data_dir, review_id, "superwing", "_rules.json", json.dumps(sw_rules, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     proposed["superwing_rules"] = str(sw_proposal)
 
     ds_rules_text = review.get("deepseek_rules_md") or strategy_rules.load_deepseek_rules(data_dir)
-    ds_rules_text = strategy_rules.validate_deepseek_rules(str(ds_rules_text))
+    try:
+        ds_rules_text = strategy_rules.validate_deepseek_rules(str(ds_rules_text))
+    except ValueError as exc:
+        validation_errors.append("deepseek rules rejected: " + str(exc))
+        ds_rules_text = strategy_rules.load_deepseek_rules(data_dir)
     ds_proposal = strategy_rules.write_proposal(data_dir, review_id, "deepseek", "_rules.md", ds_rules_text)
     proposed["deepseek_rules"] = str(ds_proposal)
 
@@ -257,7 +271,7 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         )
         proposed[f"{agent_id}_bot_script"] = str(proposal_path)
 
-    promote = (not model_failed) and auto_promote_enabled(args)
+    promote = (not model_failed) and (not validation_errors) and auto_promote_enabled(args)
     if promote:
         promoted["superwing_rules"] = str(strategy_rules.promote_superwing_rules(data_dir, sw_rules, source=f"review:{review_id}", rationale=str(review.get("superwing_rationale", ""))))
         promoted["deepseek_rules"] = str(strategy_rules.promote_deepseek_rules(data_dir, ds_rules_text, source=f"review:{review_id}", rationale=str(review.get("deepseek_rationale", ""))))
@@ -269,8 +283,9 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         "review_id": review_id,
         "ts": duel.utc_now(),
         "review_model": review.get("review_model"),
-        "review_status": "fallback_no_promote" if model_failed else "model_ok",
+        "review_status": "fallback_no_promote" if model_failed else ("validation_no_promote" if validation_errors else "model_ok"),
         "review_model_error": model_error if model_failed else "",
+        "validation_errors": validation_errors,
         "structured_retry_used": bool(review.get("structured_retry_used")),
         "auto_promote": promote,
         "summary": review.get("summary", ""),

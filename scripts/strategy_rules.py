@@ -48,6 +48,51 @@ FORBIDDEN_RULE_TERMS = re.compile(
     r"(deposit.{0,20}usdc)|(bypass.{0,20}geoblock)|(live\s*trading\s*(=|:)?\s*(true|on|enabled)))"
 )
 
+SCHEMA_PLACEHOLDER_TEXT = {
+    "string",
+    "text",
+    "short observation",
+    "one short paragraph",
+    "why this rule change helps",
+    "why this prompt change helps",
+    "markdown rules for deepseek, paper-only/buy/sell/hold-if-no-edge",
+    "markdown rules for deepseek, paper-only/buy-only/hold-if-no-edge",
+}
+SCHEMA_PLACEHOLDER_RE = re.compile(
+    r"(?i)^\s*(?:[a-z_][a-z0-9_ -]{0,40}\s*[:=-]\s*)?"
+    r"(string|text|markdown rules for deepseek|why this (rule|prompt) change helps)"
+    r"(\s*[:=-]\s*string)?\s*$"
+)
+
+
+def is_placeholder_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", " ", text).lower()
+    if compact in SCHEMA_PLACEHOLDER_TEXT or bool(SCHEMA_PLACEHOLDER_RE.match(compact)):
+        return True
+    for sep in (":", "=", "-"):
+        if sep in compact:
+            rhs = compact.split(sep, 1)[1].strip()
+            if rhs in SCHEMA_PLACEHOLDER_TEXT or bool(SCHEMA_PLACEHOLDER_RE.match(rhs)):
+                return True
+    return False
+
+
+def contains_placeholder_text(value: Any) -> bool:
+    text = str(value or "")
+    if is_placeholder_text(text):
+        return True
+    compact = re.sub(r"\s+", " ", text).lower()
+    if "rationale=why this prompt change helps" in compact or "rationale=why this rule change helps" in compact:
+        return True
+    for line in text.splitlines():
+        stripped = line.strip().strip("#*-_ `>")
+        if is_placeholder_text(stripped):
+            return True
+    return False
+
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -118,7 +163,11 @@ def load_superwing_rules(data_dir: pathlib.Path) -> Dict[str, Any]:
 
 def load_deepseek_rules(data_dir: pathlib.Path) -> str:
     ensure_default_rules(data_dir)
-    return deepseek_rules_path(data_dir).read_text(encoding="utf-8")
+    raw = deepseek_rules_path(data_dir).read_text(encoding="utf-8")
+    try:
+        return validate_deepseek_rules(raw)
+    except ValueError:
+        return DEFAULT_DEEPSEEK_RULES
 
 
 def normalize_superwing_rules(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -132,6 +181,21 @@ def normalize_superwing_rules(raw: Dict[str, Any]) -> Dict[str, Any]:
             value = default
         return round(max(low, min(high, value)), 4)
 
+    def clean_text(name: str, default: str, max_len: int) -> str:
+        value = str(rules.get(name) or "").strip()
+        if not value or contains_placeholder_text(value) or FORBIDDEN_RULE_TERMS.search(value):
+            return default
+        return value[:max_len]
+
+    rules["name"] = clean_text("name", DEFAULT_SUPERWING_RULES["name"], 80)
+    rules["selection"] = clean_text("selection", DEFAULT_SUPERWING_RULES["selection"], 600)
+    rules["notes"] = clean_text("notes", DEFAULT_SUPERWING_RULES["notes"], 600)
+    if "review_rationale" in rules:
+        rationale = str(rules.get("review_rationale") or "").strip()
+        if contains_placeholder_text(rationale) or FORBIDDEN_RULE_TERMS.search(rationale):
+            rules.pop("review_rationale", None)
+        else:
+            rules["review_rationale"] = rationale[:1000]
     rules["price_min"] = f("price_min", DEFAULT_SUPERWING_RULES["price_min"], 0.05, 0.85)
     rules["price_max"] = f("price_max", DEFAULT_SUPERWING_RULES["price_max"], rules["price_min"] + 0.01, 0.95)
     rules["max_notional"] = f("max_notional", DEFAULT_SUPERWING_RULES["max_notional"], 1.0, 45.0)
@@ -147,6 +211,8 @@ def validate_deepseek_rules(text: str) -> str:
     text = (text or "").strip()
     if not text:
         raise ValueError("deepseek rules are empty")
+    if contains_placeholder_text(text):
+        raise ValueError("deepseek rules look like an output-schema placeholder")
     if len(text) > 5000:
         raise ValueError("deepseek rules exceed 5000 characters")
     if FORBIDDEN_RULE_TERMS.search(text):
