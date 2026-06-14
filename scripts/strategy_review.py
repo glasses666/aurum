@@ -256,11 +256,15 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     for agent_id in duel.AGENTS:
         current_script = bot_scripts.load_bot_script(data_dir, agent_id)
         candidate = raw_bot_scripts.get(agent_id) if isinstance(raw_bot_scripts, dict) else None
-        if not isinstance(candidate, dict):
+        if isinstance(candidate, dict):
+            candidate = bot_scripts.merge_script_update(current_script, candidate)
+        else:
             candidate = current_script
         if agent_id == "superwing":
             candidate = bot_scripts.script_from_superwing_rules(candidate, sw_rules)
         normalized = bot_scripts.normalize_bot_script(candidate, agent_id)
+        if normalized.get("status") == "script_invalid":
+            validation_errors.append(f"{agent_id} bot script rejected: {normalized.get('risk_reason', 'script_invalid')}")
         bot_script_candidates[agent_id] = normalized
         proposal_path = strategy_rules.write_proposal(
             data_dir,

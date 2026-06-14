@@ -40,14 +40,28 @@ class market_recorder_test_fetcher:
 
 
 class MechanicalBotScriptTests(unittest.TestCase):
+    def promoted_script(self, agent_id="superwing"):
+        script = bot_scripts.default_bot_script(agent_id)
+        script["updated_at"] = "2026-06-14T03:30:00+00:00"
+        script["generated_by"] = "test"
+        script["review"] = {
+            "status": "promoted",
+            "reviewed_by": "test",
+            "reviewed_at": "2026-06-14T03:30:00+00:00",
+            "promotion_id": "test-promotion",
+        }
+        return script
+
     def test_default_bot_script_is_mechanical_and_has_buy_sell_rules(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = pathlib.Path(tmp)
             bot_scripts.ensure_default_bot_scripts(data_dir)
             script = bot_scripts.load_bot_script(data_dir, "superwing")
+            registry = bot_scripts.bot_script_registry(data_dir)
 
         self.assertEqual(script["agent_id"], "superwing")
         self.assertEqual(script["execution_mode"], "mechanical_script")
+        self.assertEqual(script["review"]["status"], "promoted")
         self.assertEqual(script["interval_sec"], 15)
         self.assertEqual(script["min_interval_sec"], 5)
         self.assertEqual(script["allowed_sides"], ["buy", "sell"])
@@ -55,6 +69,12 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertIn("sell_when", script)
         self.assertIn("take_profit_pct", script["sell_when"])
         self.assertIn("stop_loss_pct", script["sell_when"])
+        self.assertEqual(registry["schema_version"], bot_scripts.REGISTRY_SCHEMA_VERSION)
+        self.assertEqual(registry["agents"]["superwing"]["review_status"], "promoted")
+        self.assertTrue(registry["agents"]["superwing"]["tradable"])
+        self.assertFalse(registry["agents"]["deepseek"]["tradable"])
+        self.assertIn("registry_sha256", registry)
+        self.assertIn("script_body_sha256", registry["agents"]["superwing"])
 
     def test_bot_registry_manifest_detects_script_tamper(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,6 +298,191 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertIn("max_orders_per_tick", script["risk_reason"])
         self.assertEqual(decision["orders"], [])
 
+    def test_unknown_top_level_script_field_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            script = self.promoted_script("superwing")
+            script["unreviewed_magic"] = True
+            bot_scripts.script_path(data_dir, "superwing").write_text(json.dumps(script), encoding="utf-8")
+
+            loaded = bot_scripts.load_bot_script(data_dir, "superwing")
+
+        self.assertTrue(loaded["hold_only"])
+        self.assertEqual(loaded["status"], "script_invalid")
+        self.assertIn("schema_unknown_field", loaded["risk_reason"])
+
+    def test_unknown_nested_rule_field_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            script = self.promoted_script("superwing")
+            script["buy_when"]["private_threshold"] = 0.25
+            bot_scripts.script_path(data_dir, "superwing").write_text(json.dumps(script), encoding="utf-8")
+
+            loaded = bot_scripts.load_bot_script(data_dir, "superwing")
+
+        self.assertTrue(loaded["hold_only"])
+        self.assertEqual(loaded["status"], "script_invalid")
+        self.assertIn("schema_buy_when_unknown_field", loaded["risk_reason"])
+
+    def test_partial_script_body_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.script_path(data_dir, "superwing").write_text(
+                json.dumps({"version": bot_scripts.SCRIPT_VERSION, "agent_id": "superwing"}),
+                encoding="utf-8",
+            )
+
+            loaded = bot_scripts.load_bot_script(data_dir, "superwing")
+
+        self.assertTrue(loaded["hold_only"])
+        self.assertEqual(loaded["status"], "script_invalid")
+        self.assertIn("schema_missing_field", loaded["risk_reason"])
+
+    def test_bool_as_number_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            script = self.promoted_script("superwing")
+            script["max_orders_per_tick"] = True
+            bot_scripts.script_path(data_dir, "superwing").write_text(json.dumps(script), encoding="utf-8")
+
+            loaded = bot_scripts.load_bot_script(data_dir, "superwing")
+
+        self.assertTrue(loaded["hold_only"])
+        self.assertEqual(loaded["status"], "script_invalid")
+        self.assertIn("max_orders_per_tick", loaded["risk_reason"])
+
+    def test_json_infinity_numeric_rule_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            script = self.promoted_script("superwing")
+            script["buy_when"]["max_notional"] = float("inf")
+            bot_scripts.script_path(data_dir, "superwing").write_text(json.dumps(script), encoding="utf-8")
+
+            loaded = bot_scripts.load_bot_script(data_dir, "superwing")
+
+        self.assertTrue(loaded["hold_only"])
+        self.assertEqual(loaded["status"], "script_invalid")
+        self.assertIn("max_notional", loaded["risk_reason"])
+
+    def test_unreviewed_active_script_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            script = self.promoted_script("superwing")
+            script["review"] = {
+                "status": "draft",
+                "reviewed_by": "",
+                "reviewed_at": "",
+                "promotion_id": "",
+            }
+            bot_scripts.script_path(data_dir, "superwing").write_text(json.dumps(script), encoding="utf-8")
+            loaded = bot_scripts.load_bot_script(data_dir, "superwing")
+            state = agent_duel.init_state(data_dir, reset=True)
+            decision = bot_scripts.mechanical_decision_for_agent(
+                state["accounts"]["superwing"],
+                [{"market_id": "btc", "volume": 10000, "outcomes": [{"name": "Yes", "price": 0.42}]}],
+                loaded,
+            )
+
+        self.assertTrue(loaded["hold_only"])
+        self.assertEqual(loaded["status"], "script_invalid")
+        self.assertIn("review_status_not_promoted", loaded["risk_reason"])
+        self.assertEqual(decision["orders"], [])
+
+    def test_script_account_agent_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            state = agent_duel.init_state(data_dir, reset=True)
+            script = bot_scripts.load_bot_script(data_dir, "superwing")
+            decision = bot_scripts.mechanical_decision_for_agent(
+                state["accounts"]["deepseek"],
+                [{"market_id": "btc", "volume": 10000, "outcomes": [{"name": "Yes", "price": 0.42}]}],
+                script,
+            )
+
+        self.assertEqual(decision["orders"], [])
+        self.assertIn("agent mismatch", decision["notes"])
+
+    def test_copied_script_file_cannot_activate_wrong_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            superwing = json.loads(bot_scripts.script_path(data_dir, "superwing").read_text())
+            bot_scripts.script_path(data_dir, "deepseek").write_text(json.dumps(superwing), encoding="utf-8")
+
+            verified = bot_scripts.verify_bot_registry_manifest(data_dir)
+
+        self.assertFalse(verified["ok"])
+        self.assertTrue(any("script_invalid:deepseek" in err for err in verified["errors"]))
+
+    def test_registry_manifest_hash_tamper_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            manifest = json.loads(bot_scripts.manifest_path(data_dir).read_text())
+            manifest["registry_sha256"] = "0" * 64
+            bot_scripts.manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
+
+            verified = bot_scripts.verify_bot_registry_manifest(data_dir)
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("bot_registry_hash_mismatch", verified["errors"])
+
+    def test_bot_loop_holds_when_registry_manifest_file_is_tampered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            market_recorder.capture_once(root, fetcher=market_recorder_test_fetcher(), now=lambda: "2026-06-14T03:30:00+00:00", max_books=2)
+            data_dir = root / "paper_duel"
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            manifest = json.loads(bot_scripts.manifest_path(data_dir).read_text())
+            manifest["registry_sha256"] = "0" * 64
+            bot_scripts.manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
+            args = types.SimpleNamespace(
+                data_dir=str(data_dir),
+                env_file="",
+                mode="paper_apply",
+                limit=1,
+                min_volume=0,
+                max_orders=2,
+                mock_markets="",
+                allow_proxy=False,
+                dashboard_dir="",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AURUM_RECORDER_MAX_STALE_SECONDS": "999999999",
+                    "AURUM_DEEPSEEK_ALLOW_PAPER_APPLY": "true",
+                    "AURUM_DEEPSEEK_OPERATOR_CONFIRM": "ALLOW_DEEPSEEK_PAPER_APPLY",
+                },
+                clear=False,
+            ):
+                tick = agent_bot_loop.run_mechanical_tick(args)
+
+        self.assertTrue(tick["ok"])
+        self.assertFalse(tick["applied"])
+        self.assertEqual(tick["effective_mode"], "hold_only")
+        self.assertIn("bot_registry_hash_mismatch", tick["bot_script_manifest"]["errors"])
+        self.assertIn("bot_script_manifest:bot_registry_hash_mismatch", tick["data_quality_gate"]["reason_codes"])
+
+    def test_script_body_hash_ignores_volatile_metadata(self):
+        script_a = self.promoted_script("superwing")
+        script_b = json.loads(json.dumps(script_a))
+        script_b["updated_at"] = "2026-06-14T04:30:00+00:00"
+        script_b["generated_by"] = "different-review-job"
+        script_b["review"]["reviewed_at"] = "2026-06-14T04:30:00+00:00"
+        script_b["review"]["promotion_id"] = "different-promotion"
+
+        self.assertEqual(
+            bot_scripts.sha256_json(bot_scripts.script_body_hash_payload(script_a)),
+            bot_scripts.sha256_json(bot_scripts.script_body_hash_payload(script_b)),
+        )
+
     def test_tick_exposes_invalid_script_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -343,20 +548,33 @@ class MechanicalBotScriptTests(unittest.TestCase):
                 data_dir,
                 "deepseek",
                 {
-                    "interval_sec": 1,
-                    "buy_when": {"price_min": 0.2, "price_max": 0.4, "max_notional": 7},
-                    "sell_when": {"take_profit_pct": 0.05, "stop_loss_pct": 0.03},
+                    "hold_only": False,
+                    "interval_sec": 5,
+                    "max_orders_per_tick": 1,
+                    "allowed_sides": ["buy", "sell"],
+                    "buy_when": {
+                        "enabled": True,
+                        "price_min": 0.2,
+                        "price_max": 0.4,
+                        "max_notional": 7.0,
+                    },
+                    "sell_when": {"enabled": True, "take_profit_pct": 0.05, "stop_loss_pct": 0.03},
                 },
                 source="review:test",
             )
             script = bot_scripts.load_bot_script(data_dir, "deepseek")
+            registry = bot_scripts.verify_bot_registry_manifest(data_dir)
             self.assertTrue(path.exists())
 
         self.assertEqual(script["generated_by"], "review:test")
         self.assertEqual(script["execution_mode"], "mechanical_script")
+        self.assertFalse(script["hold_only"])
+        self.assertEqual(script["review"]["status"], "promoted")
         self.assertEqual(script["interval_sec"], 5)
-        self.assertEqual(script["buy_when"]["max_notional"], 7)
+        self.assertEqual(script["buy_when"]["max_notional"], 7.0)
         self.assertEqual(script["sell_when"]["take_profit_pct"], 0.05)
+        self.assertTrue(registry["ok"])
+        self.assertTrue(registry["current"]["agents"]["deepseek"]["tradable"])
 
     def test_resident_loop_interval_is_clamped_to_hard_minimum(self):
         self.assertEqual(agent_bot_loop.effective_interval({"interval_sec": 1, "min_interval_sec": 5}), 5)

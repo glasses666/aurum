@@ -223,19 +223,18 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
     bot_registry = bot_scripts.verify_bot_registry_manifest(data_dir)
     if not bot_registry.get("ok"):
         registry_reasons = ["bot_script_manifest:" + str(reason) for reason in bot_registry.get("errors", [])]
-        if apply_paper:
-            hold_only = True
-            gate = dict(gate or {})
-            gate.update(
-                {
-                    "decision": data_quality_gate.HOLD_ONLY,
-                    "trade_allowed": False,
-                    "hold_only": True,
-                    "stop_service": False,
-                    "reason_codes": list(gate.get("reason_codes", []) or []) + registry_reasons,
-                }
-            )
-            effective_apply = apply_paper and not hold_only
+        hold_only = True
+        gate = dict(gate or {})
+        gate.update(
+            {
+                "decision": data_quality_gate.HOLD_ONLY,
+                "trade_allowed": False,
+                "hold_only": True,
+                "stop_service": False,
+                "reason_codes": list(gate.get("reason_codes", []) or []) + registry_reasons,
+            }
+        )
+        effective_apply = apply_paper and not hold_only
         market_source = {**market_source, "data_quality_gate": gate, "bot_script_manifest": bot_registry}
     state = duel.init_state(data_dir, reset=False)
 

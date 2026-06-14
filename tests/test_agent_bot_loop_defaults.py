@@ -70,8 +70,9 @@ class AgentBotLoopDefaultTests(unittest.TestCase):
                 tick = agent_bot_loop.run_mechanical_tick(self.args(root))
 
         self.assertEqual(tick["mode"], "review_only")
-        self.assertEqual(tick["effective_mode"], "review_only")
+        self.assertEqual(tick["effective_mode"], "hold_only")
         self.assertFalse(tick["applied"])
+        self.assertIn("missing_bot_registry_manifest", tick["bot_script_manifest"]["errors"])
 
     def test_blank_env_mode_defaults_to_review_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,8 +82,9 @@ class AgentBotLoopDefaultTests(unittest.TestCase):
                 tick = agent_bot_loop.run_mechanical_tick(self.args(root))
 
         self.assertEqual(tick["mode"], "review_only")
-        self.assertEqual(tick["effective_mode"], "review_only")
+        self.assertEqual(tick["effective_mode"], "hold_only")
         self.assertFalse(tick["applied"])
+        self.assertIn("missing_bot_registry_manifest", tick["bot_script_manifest"]["errors"])
 
     def test_paper_apply_requires_explicit_mode_and_deepseek_authorization(self):
         with tempfile.TemporaryDirectory() as tmp:
