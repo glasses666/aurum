@@ -170,6 +170,9 @@ def verify_manifest_tail_chain(
     verified_rows = 0
     latest_sequence: Optional[int] = None
     last_hash = ""
+    proof_sequence = market_recorder.strict_positive_int(proof.get("latest_sequence"))
+    proof_hash = str(proof.get("last_manifest_sha256") or "")
+    proof_matched = False
     for line in manifest_lines:
         if not line.strip():
             continue
@@ -186,24 +189,25 @@ def verify_manifest_tail_chain(
         if str(row.get("prev_manifest_sha256") or "") != prev_hash:
             raise RuntimeError("manifest_prev_hash_error")
         last_hash = str(row.get("manifest_sha256") or "")
+        if proof_sequence is not None and sequence == proof_sequence:
+            if proof_hash and last_hash != proof_hash:
+                raise RuntimeError("manifest_latest_hash_mismatch")
+            proof_matched = True
         prev_hash = last_hash
         latest_sequence = sequence
         expected_sequence += 1
         verified_rows += 1
 
-    proof_sequence = market_recorder.strict_positive_int(proof.get("latest_sequence"))
-    if proof_sequence is not None and latest_sequence != proof_sequence:
+    if proof_sequence is not None and not proof_matched:
         raise RuntimeError("manifest_latest_sequence_mismatch")
-    proof_hash = str(proof.get("last_manifest_sha256") or "")
-    if proof_hash and last_hash != proof_hash:
+    if proof_sequence is None and proof_hash and last_hash != proof_hash:
         raise RuntimeError("manifest_latest_hash_mismatch")
     return {
         "ok": True,
         "verification_scope": "tail",
         "max_rows": max_rows,
-        "verified_rows": verified_rows,
-        "latest_sequence": latest_sequence,
-        "last_manifest_sha256": last_hash,
+        "tail_chain_verified_rows": verified_rows,
+        "tail_chain_latest_sequence": latest_sequence,
     }
 
 
