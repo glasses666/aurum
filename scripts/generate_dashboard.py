@@ -259,9 +259,11 @@ def short_time(value: Any) -> str:
 def read_jsonl(path: pathlib.Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    if limit is not None:
-        lines = lines[-limit:]
+    lines = (
+        market_recorder.tail_text_lines(path, limit)
+        if limit is not None
+        else path.read_text(encoding="utf-8", errors="replace").splitlines()
+    )
     rows: List[Dict[str, Any]] = []
     for line in lines:
         if not line.strip():
@@ -757,9 +759,10 @@ def risk_ledger_status(data_dir: pathlib.Path) -> Dict[str, Any]:
     if not path.exists():
         return {"ok": None, "status": "missing", "rows": 0}
     rows = 0
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.strip():
-            rows += 1
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.strip():
+                rows += 1
     return {"ok": True, "status": "present", "rows": rows}
 
 

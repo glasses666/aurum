@@ -24,19 +24,7 @@ import strategy_rules
 
 
 def read_jsonl(path: pathlib.Path, limit: int) -> List[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]:
-        if not line.strip():
-            continue
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict):
-                rows.append(obj)
-        except Exception:
-            continue
-    return rows
+    return generate_dashboard.read_jsonl(path, limit=limit)
 
 
 def compact_tick(tick: Dict[str, Any]) -> Dict[str, Any]:

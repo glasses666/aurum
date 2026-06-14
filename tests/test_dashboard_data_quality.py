@@ -4,6 +4,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -15,6 +16,19 @@ import generate_dashboard
 
 
 class DashboardDataQualityTests(unittest.TestCase):
+    def test_limited_jsonl_read_does_not_load_entire_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "ticks.jsonl"
+            path.write_text(
+                "\n".join(json.dumps({"idx": idx, "payload": "x" * 1024}) for idx in range(5)) + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(pathlib.Path, "read_text", side_effect=AssertionError("full file read")):
+                rows = generate_dashboard.read_jsonl(path, limit=2)
+
+        self.assertEqual([row["idx"] for row in rows], [3, 4])
+
     def test_dashboard_shows_deepseek_awaiting_validated_strategy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
