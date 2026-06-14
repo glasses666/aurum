@@ -17,6 +17,28 @@ import market_recorder
 import strategy_rules
 
 
+class market_recorder_test_fetcher:
+    def __call__(self, url, timeout=12.0):
+        if "gamma" in url:
+            return [
+                {
+                    "id": "btc",
+                    "question": "Will Bitcoin hit 100k?",
+                    "outcomes": '["Yes", "No"]',
+                    "outcomePrices": '["0.42", "0.58"]',
+                    "clobTokenIds": '["tok_yes", "tok_no"]',
+                    "volume": "5000",
+                }
+            ]
+        if "clob.polymarket.com/markets" in url:
+            return {"markets": []}
+        if "data-api.polymarket.com/trades" in url:
+            return []
+        if "clob.polymarket.com/book" in url:
+            return {"bids": [["0.41", "100"]], "asks": [["0.43", "80"]]}
+        raise AssertionError(url)
+
+
 class MechanicalBotScriptTests(unittest.TestCase):
     def test_default_bot_script_is_mechanical_and_has_buy_sell_rules(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -33,6 +55,46 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertIn("sell_when", script)
         self.assertIn("take_profit_pct", script["sell_when"])
         self.assertIn("stop_loss_pct", script["sell_when"])
+
+    def test_bot_registry_manifest_detects_script_tamper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            self.assertTrue(bot_scripts.verify_bot_registry_manifest(data_dir)["ok"])
+            path = bot_scripts.script_path(data_dir, "superwing")
+            script = json.loads(path.read_text())
+            script["status"] = "tampered_without_manifest_update"
+            path.write_text(json.dumps(script), encoding="utf-8")
+
+            verified = bot_scripts.verify_bot_registry_manifest(data_dir)
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("bot_script_manifest_hash_mismatch:superwing", verified["errors"])
+
+    def test_bot_loop_missing_manifest_does_not_recreate_and_trade_tampered_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            market_recorder.capture_once(root, fetcher=market_recorder_test_fetcher(), now=lambda: "2026-06-14T03:30:00+00:00", max_books=2)
+            data_dir = root / "paper_duel"
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            bot_scripts.manifest_path(data_dir).unlink()
+            path = bot_scripts.script_path(data_dir, "superwing")
+            script = json.loads(path.read_text())
+            script["status"] = "valid_but_unmanifested_tamper"
+            path.write_text(json.dumps(script), encoding="utf-8")
+            args = types.SimpleNamespace(data_dir=str(data_dir), env_file="", mode="paper_apply", limit=1, min_volume=0, max_orders=2, mock_markets="", allow_proxy=False, dashboard_dir="")
+            with mock.patch.dict(os.environ, {"AURUM_RECORDER_MAX_STALE_SECONDS": "999999999", "AURUM_DEEPSEEK_ALLOW_PAPER_APPLY": "true", "AURUM_DEEPSEEK_OPERATOR_CONFIRM": "ALLOW_DEEPSEEK_PAPER_APPLY"}, clear=False):
+                tick = agent_bot_loop.run_mechanical_tick(args)
+                second_tick = agent_bot_loop.run_mechanical_tick(args)
+            manifest_exists_after_ticks = bot_scripts.manifest_path(data_dir).exists()
+
+        self.assertFalse(tick["applied"])
+        self.assertEqual(tick["effective_mode"], "hold_only")
+        self.assertIn("missing_bot_registry_manifest", tick["bot_script_manifest"]["errors"])
+        self.assertFalse(second_tick["applied"])
+        self.assertEqual(second_tick["effective_mode"], "hold_only")
+        self.assertIn("missing_bot_registry_manifest", second_tick["bot_script_manifest"]["errors"])
+        self.assertFalse(manifest_exists_after_ticks)
 
     def test_deepseek_default_bot_script_is_hold_only_until_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,8 +293,10 @@ class MechanicalBotScriptTests(unittest.TestCase):
                             "gamma_markets": {"ok_frames": 1},
                             "clob_markets": {"ok_frames": 1},
                             "data_trades": {"ok_frames": 1},
-                            "clob_book": {"ok_frames": 1},
+                            "clob_book": {"ok_frames": 2, "requested_tokens": 2},
                         },
+                        "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
+                        "manifest": {"ok": True, "frames": 4},
                     }
                 ),
                 encoding="utf-8",
@@ -488,8 +552,10 @@ class MechanicalBotScriptTests(unittest.TestCase):
                             "gamma_markets": {"ok_frames": 1},
                             "clob_markets": {"ok_frames": 1},
                             "data_trades": {"ok_frames": 1},
-                            "clob_book": {"ok_frames": 1},
+                            "clob_book": {"ok_frames": 2, "requested_tokens": 2},
                         },
+                        "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
+                        "manifest": {"ok": True, "frames": 4},
                     }
                 )
             )

@@ -81,6 +81,30 @@ def _append_health_reasons(health: Any, reasons: List[str], stop_reasons: List[s
             continue
         if ok_frames <= 0:
             reasons.append(f"source_not_ok:{source}")
+        if source == "clob_book":
+            requested = _finite_integer(detail.get("requested_tokens"))
+            if requested is None:
+                reasons.append("source_invalid:clob_book_requested_tokens")
+            elif requested <= 0:
+                reasons.append("book_coverage_empty")
+            elif ok_frames < requested:
+                reasons.append("book_coverage_incomplete")
+    book_coverage = health.get("book_coverage") if isinstance(health.get("book_coverage"), dict) else None
+    if not isinstance(book_coverage, dict):
+        reasons.append("missing_book_coverage")
+    else:
+        requested = _finite_integer(book_coverage.get("requested_tokens"))
+        ok_tokens = _finite_integer(book_coverage.get("ok_tokens"))
+        orderable_tokens = _finite_integer(book_coverage.get("orderable_tokens"))
+        if requested is None or ok_tokens is None or orderable_tokens is None:
+            reasons.append("book_coverage_invalid")
+        elif requested <= 0 or ok_tokens < requested or orderable_tokens <= 0:
+            reasons.append("book_coverage_incomplete")
+    manifest = health.get("manifest") if isinstance(health.get("manifest"), dict) else None
+    if not isinstance(manifest, dict):
+        reasons.append("missing_manifest_verification")
+    elif manifest.get("ok") is not True:
+        reasons.append("manifest_verification_failed")
     return health
 
 

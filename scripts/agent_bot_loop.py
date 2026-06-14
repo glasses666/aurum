@@ -54,7 +54,7 @@ def effective_interval(script: Dict[str, Any]) -> int:
 
 
 def loop_interval(data_dir: pathlib.Path) -> int:
-    scripts = [bot_scripts.load_bot_script(data_dir, agent) for agent in duel.AGENTS]
+    scripts = [bot_scripts.load_bot_script(data_dir, agent, write_manifest=False) for agent in duel.AGENTS]
     return min(effective_interval(script) for script in scripts)
 
 
@@ -150,14 +150,16 @@ def load_markets_for_tick(data_dir: pathlib.Path, args: argparse.Namespace) -> t
 
 
 def hold_only_decision_for_agent(agent_id: str, script: Dict[str, Any], gate: Dict[str, Any]) -> Dict[str, Any]:
-    reasons = gate.get("reason_codes", []) or []
+    reasons = [str(reason) for reason in (gate.get("reason_codes", []) or [])]
+    if script.get("risk_reason"):
+        reasons.append(str(script.get("risk_reason")))
     return {
         "agent_id": agent_id,
         "source": "data_quality_gate_hold",
         "script_version": script.get("version"),
         "script_updated_at": script.get("updated_at"),
         "orders": [],
-        "notes": "hold-only; market data quality gate blocked trading: " + ",".join(str(reason) for reason in reasons),
+        "notes": "hold-only; market data quality gate blocked trading: " + ",".join(reasons),
     }
 
 
@@ -189,7 +191,24 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
         duel.require_deepseek_apply_authorized(controls)
 
     duel.ensure_data_dir(data_dir)
-    bot_scripts.ensure_default_bot_scripts(data_dir)
+    bot_scripts.ensure_default_bot_scripts(data_dir, write_manifest=False)
+    bot_registry = bot_scripts.verify_bot_registry_manifest(data_dir)
+    if not bot_registry.get("ok"):
+        registry_reasons = ["bot_script_manifest:" + str(reason) for reason in bot_registry.get("errors", [])]
+        if apply_paper:
+            hold_only = True
+            gate = dict(gate or {})
+            gate.update(
+                {
+                    "decision": data_quality_gate.HOLD_ONLY,
+                    "trade_allowed": False,
+                    "hold_only": True,
+                    "stop_service": False,
+                    "reason_codes": list(gate.get("reason_codes", []) or []) + registry_reasons,
+                }
+            )
+            effective_apply = apply_paper and not hold_only
+        market_source = {**market_source, "data_quality_gate": gate, "bot_script_manifest": bot_registry}
     state = duel.init_state(data_dir, reset=False)
 
     snapshot_record = {
@@ -203,6 +222,7 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
         "market_count": len(markets),
         "market_source": market_source,
         "data_quality_gate": gate,
+        "bot_script_manifest": bot_registry,
         "markets": markets,
     }
     snapshot_file = snapshots_dir(data_dir) / f"{snapshot_id}.json"
@@ -212,7 +232,7 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
     agent_records: Dict[str, Any] = {}
     for agent_id in duel.AGENTS:
         state = duel.load_state(data_dir)
-        script = bot_scripts.load_bot_script(data_dir, agent_id)
+        script = bot_scripts.load_bot_script(data_dir, agent_id, write_manifest=False)
         if hold_only:
             decision = hold_only_decision_for_agent(agent_id, script, gate or {})
         else:
@@ -247,6 +267,7 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
         "market_count": len(markets),
         "market_source": market_source,
         "data_quality_gate": gate,
+        "bot_script_manifest": bot_registry,
         "shared_snapshot": True,
         "agents": agent_records,
         "scores": scores,

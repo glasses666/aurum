@@ -76,6 +76,138 @@ class MarketRecorderTests(unittest.TestCase):
             self.assertTrue(all(row["manifest_sha256"] for row in manifest_lines))
             self.assertEqual(manifest_lines[1]["prev_manifest_sha256"], manifest_lines[0]["manifest_sha256"])
             self.assertEqual(result["sources"]["clob_book"]["ok_frames"], 1)
+            self.assertTrue(result["manifest"]["ok"])
+            self.assertEqual(result["book_coverage"]["coverage_ratio"], 1.0)
+
+    def test_capture_once_writes_orderable_feed_and_full_book_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            result = market_recorder.capture_once(
+                data_dir,
+                fetcher=FakeFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=2,
+            )
+            feed = json.loads((data_dir / "features" / "polymarket_orderable_feed.json").read_text())
+            latest = json.loads((data_dir / "normalized" / "polymarket" / "latest_markets.json").read_text())
+
+        self.assertEqual(feed["requested_tokens"], 2)
+        self.assertEqual(feed["ok_tokens"], 2)
+        self.assertEqual(feed["orderable_tokens"], 2)
+        self.assertEqual(feed["coverage_ratio"], 1.0)
+        self.assertTrue(all(row["orderable"] for row in feed["markets"]))
+        self.assertEqual(result["orderable_market_count"], 1)
+        self.assertEqual(latest["book_coverage"]["ok_tokens"], 2)
+        self.assertEqual(latest["orderable_market_count"], 1)
+
+    def test_manifest_verifier_detects_tampered_raw_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            market_recorder.capture_once(
+                data_dir,
+                fetcher=FakeFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=1,
+            )
+            raw_path = data_dir / "raw" / "polymarket" / "2026-06-14" / "gamma_markets.jsonl"
+            first_line = json.loads(raw_path.read_text().splitlines()[0])
+            first_line["payload"] = {"tampered": True}
+            raw_path.write_text(json.dumps(first_line, sort_keys=True) + "\n", encoding="utf-8")
+
+            verified = market_recorder.verify_manifest(data_dir, ts="2026-06-14T03:30:00+00:00")
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("manifest_frame_line_missing:1", verified["errors"])
+
+    def test_manifest_verifier_rejects_external_frame_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "data"
+            external = pathlib.Path(tmp) / "outside.jsonl"
+            frame = {"ts": "2026-06-14T03:30:00+00:00", "source": "gamma_markets", "url": "file://outside", "ok": True, "status": "ok", "elapsed_ms": 0, "payload_sha256": market_recorder.sha256_text(market_recorder.canonical_json({"outside": True})), "payload": {"outside": True}}
+            line = market_recorder.canonical_json(frame)
+            external.write_text(line + "\n", encoding="utf-8")
+            day_dir = data_dir / "raw" / "polymarket" / "2026-06-14"
+            day_dir.mkdir(parents=True)
+            manifest = {
+                "sequence": 1,
+                "ts": "2026-06-14T03:30:00+00:00",
+                "source": "gamma_markets",
+                "path": str(external),
+                "line_sha256": market_recorder.sha256_text(line),
+                "payload_sha256": frame["payload_sha256"],
+                "prev_manifest_sha256": "",
+            }
+            manifest["manifest_sha256"] = market_recorder.sha256_text(market_recorder.canonical_json(manifest))
+            (day_dir / "manifest.jsonl").write_text(market_recorder.canonical_json(manifest) + "\n", encoding="utf-8")
+
+            verified = market_recorder.verify_manifest(data_dir, ts="2026-06-14T03:30:00+00:00")
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("manifest_path_unsafe:1", verified["errors"])
+
+    def test_manifest_verifier_rejects_unexpected_source_even_inside_raw_day_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "data"
+            day_dir = data_dir / "raw" / "polymarket" / "2026-06-14"
+            day_dir.mkdir(parents=True)
+            payload = {"evil": True}
+            frame = {
+                "ts": "2026-06-14T03:30:00+00:00",
+                "source": "evil",
+                "url": "https://example.invalid/evil",
+                "ok": True,
+                "status": "ok",
+                "elapsed_ms": 0,
+                "payload_sha256": market_recorder.sha256_text(market_recorder.canonical_json(payload)),
+                "payload": payload,
+            }
+            line = market_recorder.canonical_json(frame)
+            (day_dir / "evil.jsonl").write_text(line + "\n", encoding="utf-8")
+            manifest = {
+                "sequence": 1,
+                "ts": "2026-06-14T03:30:00+00:00",
+                "source": "evil",
+                "path": "raw/polymarket/2026-06-14/evil.jsonl",
+                "line_sha256": market_recorder.sha256_text(line),
+                "payload_sha256": frame["payload_sha256"],
+                "prev_manifest_sha256": "",
+            }
+            manifest["manifest_sha256"] = market_recorder.sha256_text(market_recorder.canonical_json(manifest))
+            (day_dir / "manifest.jsonl").write_text(market_recorder.canonical_json(manifest) + "\n", encoding="utf-8")
+
+            verified = market_recorder.verify_manifest(data_dir, ts="2026-06-14T03:30:00+00:00")
+
+        self.assertFalse(verified["ok"])
+        self.assertIn("manifest_source_unexpected:1", verified["errors"])
+
+    def test_partial_book_fetch_keeps_requested_book_coverage_incomplete(self):
+        class PartialBookFetcher(FakeFetcher):
+            def __call__(self, url, timeout=12.0):
+                if "clob.polymarket.com/book" in url and "tok_no" in url:
+                    raise RuntimeError("book unavailable")
+                return super().__call__(url, timeout=timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            result = market_recorder.capture_once(
+                data_dir,
+                fetcher=PartialBookFetcher(),
+                now=lambda: "2026-06-14T03:30:00+00:00",
+                max_books=2,
+            )
+            feed = json.loads((data_dir / "features" / "polymarket_orderable_feed.json").read_text())
+            latest = json.loads((data_dir / "normalized" / "polymarket" / "latest_markets.json").read_text())
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["sources"]["clob_book"]["requested_tokens"], 2)
+        self.assertEqual(result["sources"]["clob_book"]["ok_frames"], 1)
+        self.assertEqual(result["book_coverage"]["requested_tokens"], 2)
+        self.assertEqual(result["book_coverage"]["ok_tokens"], 1)
+        self.assertEqual(feed["requested_tokens"], 2)
+        self.assertEqual(feed["ok_tokens"], 1)
+        self.assertEqual(feed["coverage_ratio"], 0.5)
+        self.assertEqual(latest["book_coverage"]["requested_tokens"], 2)
+        self.assertEqual(latest["book_coverage"]["ok_tokens"], 1)
 
     def test_capture_once_records_orderbook_for_gamma_token_ids(self):
         fetcher = FakeFetcher()

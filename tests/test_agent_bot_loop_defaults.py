@@ -28,8 +28,10 @@ class AgentBotLoopDefaultTests(unittest.TestCase):
                         "gamma_markets": {"ok_frames": 1},
                         "clob_markets": {"ok_frames": 1},
                         "data_trades": {"ok_frames": 1},
-                        "clob_book": {"ok_frames": 1},
+                        "clob_book": {"ok_frames": 2, "requested_tokens": 2},
                     },
+                    "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
+                    "manifest": {"ok": True, "frames": 4},
                 }
             ),
             encoding="utf-8",

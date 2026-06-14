@@ -29,8 +29,10 @@ class DataQualityGateTests(unittest.TestCase):
                 "gamma_markets": {"ok_frames": 1},
                 "clob_markets": {"ok_frames": 1},
                 "data_trades": {"ok_frames": 1},
-                "clob_book": {"ok_frames": 1},
+                "clob_book": {"ok_frames": 2, "requested_tokens": 2},
             },
+            "book_coverage": {"requested_tokens": 2, "ok_tokens": 2, "orderable_tokens": 2},
+            "manifest": {"ok": True, "frames": 4},
         }
 
     def test_trade_allowed_only_when_health_and_latest_markets_are_fresh_and_complete(self):
@@ -57,7 +59,7 @@ class DataQualityGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             health = self.healthy_health()
-            health["sources"]["clob_book"] = {"ok_frames": 0}
+            health["sources"]["clob_book"] = {"ok_frames": 0, "requested_tokens": 2}
             self.write_artifacts(
                 root,
                 health=health,
@@ -73,6 +75,47 @@ class DataQualityGateTests(unittest.TestCase):
         self.assertEqual(decision["decision"], "HOLD_ONLY")
         self.assertFalse(decision["trade_allowed"])
         self.assertIn("source_not_ok:clob_book", decision["reason_codes"])
+
+    def test_incomplete_book_coverage_is_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            health = self.healthy_health()
+            health["sources"]["clob_book"] = {"ok_frames": 1, "requested_tokens": 2}
+            health["book_coverage"] = {"requested_tokens": 2, "ok_tokens": 1, "orderable_tokens": 1}
+            self.write_artifacts(
+                root,
+                health=health,
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("book_coverage_incomplete", decision["reason_codes"])
+
+    def test_manifest_verification_failure_is_hold_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            health = self.healthy_health()
+            health["manifest"] = {"ok": False, "errors": ["manifest_hash_error:1"]}
+            self.write_artifacts(
+                root,
+                health=health,
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertIn("manifest_verification_failed", decision["reason_codes"])
 
     def test_stale_recorder_artifacts_are_hold_only(self):
         with tempfile.TemporaryDirectory() as tmp:

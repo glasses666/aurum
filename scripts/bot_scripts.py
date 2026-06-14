@@ -9,7 +9,9 @@ asking an LLM on every tick.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
+import os
 import math
 import pathlib
 from typing import Any, Dict, List, Optional
@@ -40,6 +42,29 @@ def history_dir(data_dir: pathlib.Path) -> pathlib.Path:
 
 def script_path(data_dir: pathlib.Path, agent_id: str) -> pathlib.Path:
     return current_dir(data_dir) / f"{agent_id}.json"
+
+
+def manifest_path(data_dir: pathlib.Path) -> pathlib.Path:
+    return scripts_root(data_dir) / "manifest.json"
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_json(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def atomic_write_text(path: pathlib.Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: pathlib.Path, payload: Any) -> None:
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
 def default_bot_script(agent_id: str) -> Dict[str, Any]:
@@ -96,13 +121,17 @@ def default_bot_script(agent_id: str) -> Dict[str, Any]:
     return script
 
 
-def ensure_default_bot_scripts(data_dir: pathlib.Path) -> None:
+def ensure_default_bot_scripts(data_dir: pathlib.Path, *, write_manifest: bool = True) -> None:
     current_dir(data_dir).mkdir(parents=True, exist_ok=True)
     history_dir(data_dir).mkdir(parents=True, exist_ok=True)
+    changed = False
     for agent_id in duel.AGENTS:
         path = script_path(data_dir, agent_id)
         if not path.exists():
-            path.write_text(json.dumps(default_bot_script(agent_id), ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            atomic_write_json(path, default_bot_script(agent_id))
+            changed = True
+    if write_manifest and (changed or not manifest_path(data_dir).exists()):
+        write_bot_registry_manifest(data_dir)
 
 
 def hold_only_safe_script(agent_id: str, reason: str) -> Dict[str, Any]:
@@ -212,8 +241,72 @@ def normalize_bot_script(raw: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     return script
 
 
-def load_bot_script(data_dir: pathlib.Path, agent_id: str) -> Dict[str, Any]:
-    ensure_default_bot_scripts(data_dir)
+def bot_script_registry(data_dir: pathlib.Path) -> Dict[str, Any]:
+    entries: Dict[str, Any] = {}
+    errors: List[str] = []
+    for agent_id in duel.AGENTS:
+        path = script_path(data_dir, agent_id)
+        if not path.exists():
+            entries[agent_id] = {"exists": False, "ok": False, "error": "missing_script"}
+            errors.append(f"missing_script:{agent_id}")
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("script_not_object")
+            normalized = normalize_bot_script(raw, agent_id)
+            script_hash = sha256_json(normalized)
+            ok = normalized.get("status") != "script_invalid"
+            if not ok:
+                errors.append(f"script_invalid:{agent_id}:{normalized.get('risk_reason')}")
+            entries[agent_id] = {
+                "exists": True,
+                "ok": bool(ok),
+                "agent_id": agent_id,
+                "status": normalized.get("status"),
+                "hold_only": normalized.get("hold_only"),
+                "version": normalized.get("version"),
+                "updated_at": normalized.get("updated_at"),
+                "sha256": script_hash,
+                "risk_reason": normalized.get("risk_reason", ""),
+            }
+        except Exception as exc:
+            entries[agent_id] = {"exists": True, "ok": False, "error": type(exc).__name__}
+            errors.append(f"script_parse:{agent_id}:{type(exc).__name__}")
+    return {"ok": not errors, "ts": utc_now(), "agents": entries, "errors": errors}
+
+
+def write_bot_registry_manifest(data_dir: pathlib.Path) -> pathlib.Path:
+    manifest = bot_script_registry(data_dir)
+    path = manifest_path(data_dir)
+    atomic_write_json(path, manifest)
+    return path
+
+
+def verify_bot_registry_manifest(data_dir: pathlib.Path) -> Dict[str, Any]:
+    path = manifest_path(data_dir)
+    if not path.exists():
+        return {"ok": False, "errors": ["missing_bot_registry_manifest"]}
+    try:
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "errors": ["bot_registry_parse:" + type(exc).__name__]}
+    current = bot_script_registry(data_dir)
+    errors: List[str] = []
+    if not recorded.get("ok"):
+        errors.append("recorded_manifest_not_ok")
+    if not current.get("ok"):
+        errors.extend(current.get("errors", []))
+    for agent_id in duel.AGENTS:
+        old_hash = ((recorded.get("agents") or {}).get(agent_id) or {}).get("sha256")
+        new_hash = ((current.get("agents") or {}).get(agent_id) or {}).get("sha256")
+        if not old_hash or not new_hash or old_hash != new_hash:
+            errors.append(f"bot_script_manifest_hash_mismatch:{agent_id}")
+    return {"ok": not errors, "errors": errors, "recorded": recorded, "current": current}
+
+
+def load_bot_script(data_dir: pathlib.Path, agent_id: str, *, write_manifest: bool = True) -> Dict[str, Any]:
+    ensure_default_bot_scripts(data_dir, write_manifest=write_manifest)
     path = script_path(data_dir, agent_id)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -230,8 +323,9 @@ def write_bot_script(data_dir: pathlib.Path, agent_id: str, script: Dict[str, An
     dest = script_path(data_dir, agent_id)
     if dest.exists():
         hist = history_dir(data_dir) / f"{utc_now().replace(':', '').replace('+00:00', 'Z')}_{agent_id}.json"
-        hist.write_text(dest.read_text(encoding="utf-8"), encoding="utf-8")
-    dest.write_text(json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        atomic_write_text(hist, dest.read_text(encoding="utf-8"))
+    atomic_write_json(dest, normalized)
+    write_bot_registry_manifest(data_dir)
     return dest
 
 

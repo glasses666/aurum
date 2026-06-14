@@ -26,6 +26,12 @@ DEFAULT_DATA_TRADES_URL = "https://data-api.polymarket.com/trades?limit=100"
 DEFAULT_CLOB_BOOK_URL = "https://clob.polymarket.com/book?token_id={token_id}"
 USER_AGENT = "aurum-market-recorder/0.1 (+public-read-only)"
 BITCOIN_TERMS = ("bitcoin", "btc", "satoshi")
+RAW_SOURCE_STEMS = {
+    "gamma_markets": "gamma_markets",
+    "clob_markets": "clob_markets",
+    "data_trades": "data_trades",
+    "clob_book": "clob_books",
+}
 
 _STOP = False
 
@@ -104,11 +110,24 @@ def raw_day_dir(data_dir: pathlib.Path, ts: str) -> pathlib.Path:
     return data_dir / "raw" / "polymarket" / day
 
 
+def atomic_write_text(path: pathlib.Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: pathlib.Path, payload: Any) -> None:
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
 def append_jsonl(path: pathlib.Path, record: Dict[str, Any]) -> Tuple[pathlib.Path, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = canonical_json(record)
     with path.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
     return path, sha256_text(line)
 
 
@@ -138,7 +157,7 @@ def manifest_count(manifest_path: pathlib.Path) -> int:
 def raw_file_stem(source: str) -> str:
     # Keep the source semantic singular while using a natural plural file for
     # a stream of many book frames.
-    return "clob_books" if source == "clob_book" else source
+    return RAW_SOURCE_STEMS.get(source, source)
 
 
 def append_frame(
@@ -178,6 +197,92 @@ def append_frame(
     manifest["manifest_sha256"] = sha256_text(canonical_json(manifest))
     append_jsonl(manifest_path, manifest)
     return manifest
+
+
+def verify_manifest(data_dir: pathlib.Path, ts: Optional[str] = None) -> Dict[str, Any]:
+    data_dir = pathlib.Path(data_dir)
+    day = parse_ts(ts).date().isoformat() if ts else dt.datetime.now(dt.timezone.utc).date().isoformat()
+    manifest_path = data_dir / "raw" / "polymarket" / day / "manifest.jsonl"
+    out: Dict[str, Any] = {
+        "ok": True,
+        "errors": [],
+        "frames": 0,
+        "manifest_path": str(manifest_path),
+        "last_manifest_sha256": "",
+    }
+    if not manifest_path.exists():
+        out["ok"] = False
+        out["errors"].append("missing_manifest")
+        return out
+    prev = ""
+    expected_sequence = 1
+    for line_no, line in enumerate(manifest_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            out["errors"].append(f"manifest_json_error:{line_no}")
+            continue
+        if row.get("sequence") != expected_sequence:
+            out["errors"].append(f"manifest_sequence_error:{line_no}")
+        if str(row.get("prev_manifest_sha256") or "") != prev:
+            out["errors"].append(f"manifest_prev_hash_error:{line_no}")
+        manifest_hash = str(row.get("manifest_sha256") or "")
+        unsigned = {k: v for k, v in row.items() if k != "manifest_sha256"}
+        if manifest_hash != sha256_text(canonical_json(unsigned)):
+            out["errors"].append(f"manifest_hash_error:{line_no}")
+        source = str(row.get("source") or "")
+        if source not in RAW_SOURCE_STEMS:
+            out["errors"].append(f"manifest_source_unexpected:{line_no}")
+            prev = manifest_hash
+            expected_sequence += 1
+            out["frames"] += 1
+            out["last_manifest_sha256"] = manifest_hash
+            continue
+        rel_raw = str(row.get("path") or "")
+        rel_path = pathlib.Path(rel_raw)
+        expected_rel = pathlib.Path("raw") / "polymarket" / day / f"{RAW_SOURCE_STEMS[source]}.jsonl"
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            out["errors"].append(f"manifest_path_unsafe:{line_no}")
+            prev = manifest_hash
+            expected_sequence += 1
+            out["frames"] += 1
+            out["last_manifest_sha256"] = manifest_hash
+            continue
+        if rel_path != expected_rel:
+            out["errors"].append(f"manifest_path_unexpected:{line_no}")
+            prev = manifest_hash
+            expected_sequence += 1
+            out["frames"] += 1
+            out["last_manifest_sha256"] = manifest_hash
+            continue
+        frame_path = data_dir / rel_path
+        line_hash = str(row.get("line_sha256") or "")
+        payload_hash = str(row.get("payload_sha256") or "")
+        if not frame_path.exists() or not line_hash:
+            out["errors"].append(f"manifest_frame_missing:{line_no}")
+        else:
+            matched = False
+            for frame_line in frame_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if sha256_text(frame_line) != line_hash:
+                    continue
+                matched = True
+                try:
+                    frame = json.loads(frame_line)
+                    if str(frame.get("payload_sha256") or "") != payload_hash:
+                        out["errors"].append(f"manifest_payload_hash_mismatch:{line_no}")
+                except Exception:
+                    out["errors"].append(f"manifest_frame_json_error:{line_no}")
+                break
+            if not matched:
+                out["errors"].append(f"manifest_frame_line_missing:{line_no}")
+        prev = manifest_hash
+        expected_sequence += 1
+        out["frames"] += 1
+        out["last_manifest_sha256"] = manifest_hash
+    out["ok"] = not out["errors"] and out["frames"] > 0
+    return out
 
 
 def safe_fetch(fetcher: JsonFetcher, url: str, timeout: float) -> Tuple[bool, Any, str, int]:
@@ -324,6 +429,124 @@ def extract_token_ids(*payloads: Any, limit: int) -> List[str]:
     return out
 
 
+def _book_levels(book: Any, side: str) -> List[Tuple[float, float]]:
+    payload = jsonish(book)
+    if isinstance(payload, dict) and "book" in payload:
+        payload = jsonish(payload.get("book"))
+    if not isinstance(payload, dict):
+        return []
+    raw_levels = payload.get(side) or []
+    levels: List[Tuple[float, float]] = []
+    if not isinstance(raw_levels, list):
+        return levels
+    for level in raw_levels:
+        price = size = None
+        if isinstance(level, dict):
+            price = level.get("price") or level.get("px")
+            size = level.get("size") or level.get("qty") or level.get("quantity")
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price, size = level[0], level[1]
+        try:
+            if price is None or size is None:
+                continue
+            p = float(price)
+            s = float(size)
+        except Exception:
+            continue
+        if 0.0 < p < 1.0 and s > 0:
+            levels.append((p, s))
+    return levels
+
+
+def best_bid_ask(book: Any) -> Dict[str, Any]:
+    bids = _book_levels(book, "bids")
+    asks = _book_levels(book, "asks")
+    best_bid = max((p for p, _s in bids), default=None)
+    best_ask = min((p for p, _s in asks), default=None)
+    spread = round(best_ask - best_bid, 6) if best_bid is not None and best_ask is not None else None
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": spread,
+        "bid_depth": round(sum(s for _p, s in bids), 6),
+        "ask_depth": round(sum(s for _p, s in asks), 6),
+        "orderable": best_bid is not None and best_ask is not None and best_bid < best_ask,
+    }
+
+
+def build_orderable_feed(
+    markets: List[Dict[str, Any]],
+    books_by_token: Dict[str, Any],
+    ts: str,
+    requested_token_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    requested_tokens = [str(token) for token in (requested_token_ids or []) if str(token)]
+    requested_set = set(requested_tokens)
+    rows: List[Dict[str, Any]] = []
+    market_summaries: List[Dict[str, Any]] = []
+    matched_requested: set[str] = set()
+    for market in markets:
+        market_requested = 0
+        ok_tokens = 0
+        orderable_tokens = 0
+        for outcome in market.get("outcomes", []) or []:
+            token_id = str((outcome or {}).get("token_id") or "")
+            if not token_id:
+                continue
+            if requested_set and token_id not in requested_set:
+                continue
+            matched_requested.add(token_id)
+            market_requested += 1
+            book_ok = token_id in books_by_token
+            quote = best_bid_ask(books_by_token.get(token_id)) if book_ok else {
+                "best_bid": None,
+                "best_ask": None,
+                "spread": None,
+                "bid_depth": 0.0,
+                "ask_depth": 0.0,
+                "orderable": False,
+            }
+            if book_ok:
+                ok_tokens += 1
+            if quote.get("orderable"):
+                orderable_tokens += 1
+            row = {
+                "market_id": market.get("market_id"),
+                "question": market.get("question"),
+                "outcome": (outcome or {}).get("name"),
+                "token_id": token_id,
+                "price": (outcome or {}).get("price"),
+                "book_ok": bool(book_ok),
+                **quote,
+            }
+            rows.append(row)
+        market_summaries.append(
+            {
+                "market_id": market.get("market_id"),
+                "requested_tokens": market_requested,
+                "ok_tokens": ok_tokens,
+                "orderable_tokens": orderable_tokens,
+                "orderable": market_requested > 0 and ok_tokens == market_requested and orderable_tokens == market_requested,
+            }
+        )
+    requested = len(requested_set) if requested_set else sum(row["requested_tokens"] for row in market_summaries)
+    ok_tokens = len([token for token in requested_set if token in books_by_token]) if requested_set else sum(row["ok_tokens"] for row in market_summaries)
+    orderable_tokens = sum(row["orderable_tokens"] for row in market_summaries)
+    unmatched_requested = sorted(requested_set - matched_requested)
+    return {
+        "ts": ts,
+        "source": "polymarket_market_recorder_v0",
+        "requested_tokens": requested,
+        "ok_tokens": ok_tokens,
+        "orderable_tokens": orderable_tokens,
+        "coverage_ratio": round(ok_tokens / requested, 6) if requested else 0.0,
+        "orderable_ratio": round(orderable_tokens / requested, 6) if requested else 0.0,
+        "unmatched_requested_tokens": unmatched_requested,
+        "markets": market_summaries,
+        "rows": rows,
+    }
+
+
 def capture_source(
     data_dir: pathlib.Path,
     ts: str,
@@ -381,18 +604,24 @@ def capture_once(
         token_ids = extract_token_ids(gamma_payload, clob_payload, limit=max(0, int(max_books)))
     book_ok = 0
     book_errors = 0
+    books_by_token: Dict[str, Any] = {}
     for token_id in token_ids:
         url = clob_book_url.format(token_id=urllib.parse.quote(str(token_id), safe=""))
         ok, payload, status, elapsed_ms = safe_fetch(fetcher, url, timeout)
         append_frame(data_dir, ts, "clob_book", url, {"token_id": token_id, "book": payload}, ok=ok, status=status, elapsed_ms=elapsed_ms)
         if ok:
+            books_by_token[str(token_id)] = payload
             book_ok += 1
         else:
             book_errors += 1
     sources["clob_book"] = {"ok_frames": book_ok, "errors": book_errors, "requested_tokens": len(token_ids)}
 
+    orderable_feed = build_orderable_feed(markets, books_by_token, ts, requested_token_ids=token_ids)
+    atomic_write_json(data_dir / "features" / "polymarket_orderable_feed.json", orderable_feed)
+    manifest_status = verify_manifest(data_dir, ts=ts)
     trades = trades_payload if isinstance(trades_payload, list) else market_items(trades_payload)
-    summary_ok = bool(gamma_ok and clob_ok and trades_ok and markets and book_ok > 0)
+    book_coverage_ok = bool(orderable_feed["requested_tokens"] > 0 and orderable_feed["ok_tokens"] == orderable_feed["requested_tokens"])
+    summary_ok = bool(gamma_ok and clob_ok and trades_ok and markets and book_ok > 0 and book_coverage_ok and manifest_status.get("ok"))
     summary = {
         "ok": summary_ok,
         "ts": ts,
@@ -402,21 +631,27 @@ def capture_once(
         "token_count": len(token_ids),
         "trade_count": len(trades) if isinstance(trades, list) else 0,
         "sources": sources,
+        "book_coverage": {
+            "requested_tokens": orderable_feed["requested_tokens"],
+            "ok_tokens": orderable_feed["ok_tokens"],
+            "orderable_tokens": orderable_feed["orderable_tokens"],
+            "coverage_ratio": orderable_feed["coverage_ratio"],
+            "orderable_ratio": orderable_feed["orderable_ratio"],
+        },
+        "orderable_market_count": sum(1 for row in orderable_feed["markets"] if row.get("orderable")),
+        "manifest": manifest_status,
         "raw_day_dir": str(raw_day_dir(data_dir, ts)),
     }
-    (data_dir / "normalized" / "polymarket" / "latest_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    latest_markets = {"ts": ts, "source": "polymarket_market_recorder_v0", "markets": markets}
-    (data_dir / "normalized" / "polymarket" / "latest_markets.json").write_text(
-        json.dumps(latest_markets, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (data_dir / "reports" / "market_recorder_health.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(data_dir / "normalized" / "polymarket" / "latest_summary.json", summary)
+    latest_markets = {
+        "ts": ts,
+        "source": "polymarket_market_recorder_v0",
+        "markets": markets,
+        "book_coverage": summary["book_coverage"],
+        "orderable_market_count": summary["orderable_market_count"],
+    }
+    atomic_write_json(data_dir / "normalized" / "polymarket" / "latest_markets.json", latest_markets)
+    atomic_write_json(data_dir / "reports" / "market_recorder_health.json", summary)
     return summary
 
 
@@ -466,8 +701,23 @@ def recorder_health(
             detail = sources.get(source)
             if not isinstance(detail, dict):
                 out["errors"].append(f"missing_source:{source}")
-            elif int(detail.get("ok_frames") or 0) <= 0:
+                continue
+            try:
+                ok_frames = int(detail.get("ok_frames") or 0)
+            except Exception:
+                out["errors"].append(f"source_invalid:{source}")
+                continue
+            if ok_frames <= 0:
                 out["errors"].append(f"source_not_ok:{source}")
+        coverage = health.get("book_coverage") if isinstance(health.get("book_coverage"), dict) else {}
+        if coverage:
+            if int(coverage.get("requested_tokens") or 0) <= 0 or int(coverage.get("ok_tokens") or 0) < int(coverage.get("requested_tokens") or 0):
+                out["errors"].append("book_coverage_incomplete")
+        else:
+            out["errors"].append("missing_book_coverage")
+        manifest = health.get("manifest") if isinstance(health.get("manifest"), dict) else {}
+        if manifest.get("ok") is not True:
+            out["errors"].append("manifest_verification_failed")
         out["ok"] = not out["errors"]
         return out
     except Exception as exc:
