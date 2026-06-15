@@ -32,7 +32,7 @@ Read-only checks only:
 
 ## Preflight result
 
-Running `/tmp/aurum-vps-preflight.py --dns-server [REDACTED_IP] --timeout 12 --json` on the server returned:
+Running `/tmp/[REDACTED_HOST].py --dns-server [REDACTED_IP] --timeout 12 --json` on the server returned:
 
 - verdict: `fail`
 - OK: `0/4`

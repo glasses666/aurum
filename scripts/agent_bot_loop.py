@@ -148,7 +148,10 @@ def load_markets_for_tick(data_dir: pathlib.Path, args: argparse.Namespace) -> t
             "market_count": 0,
             "data_quality_gate": gate,
         }
-    markets = filter_recorded_markets_for_tick(recorded["markets"], args)
+    markets = filter_recorded_markets_for_tick(
+        [market for market in recorder_context.get("markets", []) if isinstance(market, dict)],
+        args,
+    )
     if not markets:
         return [], {
             "source": "data_quality_gate",

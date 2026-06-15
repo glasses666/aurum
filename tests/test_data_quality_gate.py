@@ -1,4 +1,5 @@
 import json
+import hashlib
 import pathlib
 import sys
 import tempfile
@@ -11,24 +12,43 @@ import data_quality_gate
 
 
 class DataQualityGateTests(unittest.TestCase):
+    def canonical_hash(self, payload: dict) -> str:
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
     def write_artifacts(self, root: pathlib.Path, *, health: dict, markets: list, ts: str = "2026-06-14T03:30:00+00:00") -> None:
         (root / "reports").mkdir(parents=True, exist_ok=True)
         (root / "normalized" / "polymarket").mkdir(parents=True, exist_ok=True)
         payload = dict(health)
         payload.setdefault("ts", ts)
+        latest = {
+            "ts": ts,
+            "source": "polymarket_market_recorder_v0",
+            "markets": markets,
+            "book_coverage": payload.get("book_coverage"),
+            "orderable_market_count": payload.get("orderable_market_count"),
+        }
+        payload.setdefault("latest_markets_sha256", self.canonical_hash(latest))
+        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else None
+        if isinstance(manifest, dict) and manifest.get("ok") is True and manifest.get("verification_scope") == "tail" and manifest.get("latest_sequence"):
+            day = ts[:10]
+            row = {
+                "ts": ts,
+                "sequence": manifest.get("latest_sequence"),
+                "source": "gamma_markets",
+                "path": f"raw/polymarket/{day}/gamma_markets.jsonl",
+                "prev_manifest_sha256": "",
+                "line_sha256": "fixture-line-sha256",
+                "payload_sha256": "fixture-payload-sha256",
+            }
+            row["manifest_sha256"] = self.canonical_hash(row)
+            manifest.setdefault("last_manifest_sha256", row["manifest_sha256"])
+            manifest_path = root / "raw" / "polymarket" / day / "manifest.jsonl"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
         (root / "reports" / "market_recorder_health.json").write_text(json.dumps(payload), encoding="utf-8")
-        (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
-            json.dumps(
-                {
-                    "ts": ts,
-                    "source": "polymarket_market_recorder_v0",
-                    "markets": markets,
-                    "book_coverage": payload.get("book_coverage"),
-                    "orderable_market_count": payload.get("orderable_market_count"),
-                }
-            ),
-            encoding="utf-8",
-        )
+        (root / "normalized" / "polymarket" / "latest_markets.json").write_text(json.dumps(latest), encoding="utf-8")
 
     def healthy_health(self) -> dict:
         return {
@@ -115,6 +135,27 @@ class DataQualityGateTests(unittest.TestCase):
         self.assertEqual(decision["decision"], "HOLD_ONLY")
         self.assertIn("book_coverage_incomplete", decision["reason_codes"])
 
+    def test_degraded_recorder_data_disables_unaudited_fallback_even_when_operator_flag_is_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.write_artifacts(
+                root,
+                health=self.healthy_health(),
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+                ts="2026-06-14T03:00:00+00:00",
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+                allow_unaudited_fallback=True,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertFalse(decision["fallback_allowed"])
+        self.assertIn("recorder_stale", decision["reason_codes"])
+
     def test_manifest_verification_failure_is_hold_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -134,6 +175,44 @@ class DataQualityGateTests(unittest.TestCase):
 
         self.assertEqual(decision["decision"], "HOLD_ONLY")
         self.assertIn("manifest_verification_failed", decision["reason_codes"])
+
+    def test_manifest_verification_failure_disables_unaudited_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            health = self.healthy_health()
+            health["manifest"] = {"ok": False, "errors": ["manifest_hash_error:1"]}
+            self.write_artifacts(
+                root,
+                health=health,
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+                allow_unaudited_fallback=True,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertFalse(decision["fallback_allowed"])
+        self.assertIn("manifest_verification_failed", decision["reason_codes"])
+
+    def test_missing_core_recorder_artifacts_disable_unaudited_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+                allow_unaudited_fallback=True,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertFalse(decision["fallback_allowed"])
+        self.assertIn("missing_health_report", decision["reason_codes"])
+        self.assertIn("missing_latest_markets", decision["reason_codes"])
 
     def test_manifest_tail_scope_must_be_explicit_and_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,6 +339,54 @@ class DataQualityGateTests(unittest.TestCase):
         self.assertIn("recorder_artifact_ts_mismatch", decision["reason_codes"])
         self.assertIn("recorder_artifact_book_coverage_mismatch", decision["reason_codes"])
         self.assertIn("recorder_artifact_orderable_count_mismatch", decision["reason_codes"])
+
+    def test_latest_market_payload_tamper_is_hold_only_even_when_metadata_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.write_artifacts(
+                root,
+                health=self.healthy_health(),
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+            latest_path = root / "normalized" / "polymarket" / "latest_markets.json"
+            latest = json.loads(latest_path.read_text(encoding="utf-8"))
+            latest["markets"][0]["outcomes"][0]["price"] = 0.51
+            latest["markets"][0]["outcomes"][1]["price"] = 0.49
+            latest_path.write_text(json.dumps(latest), encoding="utf-8")
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertFalse(decision["trade_allowed"])
+        self.assertIn("latest_markets_hash_mismatch", decision["reason_codes"])
+
+    def test_latest_market_hash_mismatch_disables_unaudited_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.write_artifacts(
+                root,
+                health=self.healthy_health(),
+                markets=[{"market_id": "btc", "volume": 5000, "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}]}],
+            )
+            latest_path = root / "normalized" / "polymarket" / "latest_markets.json"
+            latest = json.loads(latest_path.read_text(encoding="utf-8"))
+            latest["markets"][0]["outcomes"][0]["price"] = 0.51
+            latest_path.write_text(json.dumps(latest), encoding="utf-8")
+
+            decision = data_quality_gate.evaluate_data_quality_gate(
+                root,
+                now=lambda: "2026-06-14T03:31:00+00:00",
+                max_stale_seconds=180,
+                allow_unaudited_fallback=True,
+            )
+
+        self.assertEqual(decision["decision"], "HOLD_ONLY")
+        self.assertFalse(decision["fallback_allowed"])
+        self.assertIn("latest_markets_hash_mismatch", decision["reason_codes"])
 
     def test_stale_recorder_artifacts_are_hold_only(self):
         with tempfile.TemporaryDirectory() as tmp:

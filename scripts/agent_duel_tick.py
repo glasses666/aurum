@@ -83,6 +83,12 @@ def run_tick(args: argparse.Namespace) -> Dict[str, Any]:
     mode = mode.strip().lower()
     if mode not in MODES:
         raise duel.DuelError(f"unsupported AURUM_DUEL_MODE={mode!r}; expected one of {MODES}")
+    if mode == "paper_apply" and not duel.env_bool("AURUM_ALLOW_LEGACY_DIRECT_FETCH_PAPER_APPLY", False):
+        raise duel.DuelError("legacy direct-fetch paper_apply disabled; use aurum-bot-loop recorder-gated runner or set AURUM_ALLOW_LEGACY_DIRECT_FETCH_PAPER_APPLY=true for explicit dev smoke")
+    prechecked_deepseek_controls = None
+    if mode == "paper_apply":
+        prechecked_deepseek_controls = duel.deepseek_controls(args.max_orders)
+        duel.require_deepseek_apply_authorized(prechecked_deepseek_controls)
 
     snapshot_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
     state = duel.init_state(data_dir, reset=False)
@@ -121,12 +127,19 @@ def run_tick(args: argparse.Namespace) -> Dict[str, Any]:
     if apply_paper:
         state = duel.load_state(data_dir)
 
-    deepseek_controls = duel.deepseek_controls(args.max_orders)
-    if apply_paper:
+    deepseek_controls = prechecked_deepseek_controls or duel.deepseek_controls(args.max_orders)
+    if apply_paper and prechecked_deepseek_controls is None:
         duel.require_deepseek_apply_authorized(deepseek_controls)
 
     try:
-        deepseek_decision = duel.deepseek_decision(state["accounts"]["deepseek"], markets, deepseek_controls, data_dir=data_dir)
+        deepseek_scoreboard = duel.scoreboard_context(state, duel.market_price_map(markets), viewer_agent_id="deepseek")
+        deepseek_decision = duel.deepseek_decision(
+            state["accounts"]["deepseek"],
+            markets,
+            deepseek_controls,
+            data_dir=data_dir,
+            scoreboard=deepseek_scoreboard,
+        )
     except Exception as exc:
         deepseek_decision = {
             "agent_id": "deepseek",

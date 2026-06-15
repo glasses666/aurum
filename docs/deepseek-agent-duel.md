@@ -47,15 +47,20 @@ Starting balance per account:
 
 ## Competition score
 
-Score is mark-to-market ROI:
+Score is mark-to-market ROI minus explicit anti-YOLO penalties:
 
 ```text
 portfolio_value = cash + sum(position_shares * latest_outcome_price)
 roi = (portfolio_value - starting_equity) / starting_equity
-score = roi * 100
+raw_roi_score = roi * 100
+score = raw_roi_score - fee_churn - drawdown - yolo_exposure penalties
 ```
 
-Rank by `score`; also report risk metrics:
+Rank by `score`, but victory is stricter than rank: a valid winner requires rank #1 **and** ROI `> 5%` after fees within the defined scoring window. If rank #1 has ROI `<= 5%`, the final report must say `no valid victory / no winner` even if that account leads the scoreboard.
+
+Scoreboard context exposes each agent's own ledger/fills/risk events to that agent, plus peer aggregate rank/score/ROI/drawdown/cash/exposure/order-count fields. It must not expose peer raw trades, prompts, or strategy internals on the per-agent hot path.
+
+Also report risk metrics:
 
 - open risk;
 - per-market exposure;

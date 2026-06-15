@@ -541,6 +541,140 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertEqual(tick["agents"]["superwing"]["decision"]["orders"], [])
         self.assertIn("script_invalid", tick["agents"]["superwing"]["decision"]["notes"])
 
+    def test_deepseek_prompt_includes_own_ledger_and_peer_aggregate_only(self):
+        own = agent_duel.new_account("deepseek", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        own["trades"] = [
+            {
+                "ts": "2026-06-14T03:35:00+00:00",
+                "market_id": "own-market",
+                "question": "Own trade question",
+                "outcome": "Yes",
+                "side": "buy",
+                "notional": 12.5,
+                "fill_price": 0.42,
+                "shares": 29.7619,
+                "fee": 0.021,
+                "rationale": "own rationale is allowed",
+            }
+        ]
+        own["risk_events"] = [
+            {
+                "ts": "2026-06-14T03:36:00+00:00",
+                "reason": "own rejected order",
+                "order": {"market_id": "own-market", "side": "buy", "outcome": "Yes"},
+            }
+        ]
+        peer = agent_duel.new_account("superwing", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        peer["trades"] = [
+            {
+                "ts": "2026-06-14T03:34:00+00:00",
+                "market_id": "peer-secret-market",
+                "question": "peer raw trade question should not leak",
+                "side": "buy",
+                "rationale": "peer raw rationale should not leak",
+                "fee": 0.02,
+            }
+        ]
+        scoreboard = agent_duel.scoreboard_context(
+            {"accounts": {"deepseek": own, "superwing": peer}},
+            prices={},
+            viewer_agent_id="deepseek",
+            now="2026-06-14T03:40:00+00:00",
+            competition_ends_at="2026-06-14T04:40:00+00:00",
+        )
+        controls = {"max_orders": 2, "max_notional_per_order": 45.0}
+
+        _, user = agent_duel.deepseek_prompt(own, [], controls, strategy_text="", scoreboard=scoreboard)
+        payload = json.loads(user)
+        user_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+        self.assertEqual(payload["own_account"]["recent_trades"][0]["market_id"], "own-market")
+        self.assertEqual(payload["own_account"]["recent_risk_events"][0]["reason"], "own rejected order")
+        self.assertEqual(payload["competition"]["objective"], "rank_1_within_stability_window")
+        self.assertIn("fee_churn", payload["competition"]["anti_yolo_acceptance"])
+        self.assertEqual(payload["peer_scoreboard"][0]["agent_id"], "superwing")
+        self.assertIn("rank", payload["peer_scoreboard"][0])
+        self.assertIn("trade_count", payload["peer_scoreboard"][0])
+        self.assertNotIn("recent_trades", payload["peer_scoreboard"][0])
+        self.assertNotIn("peer-secret-market", user_text)
+        self.assertNotIn("peer raw rationale should not leak", user_text)
+
+    def test_scoreboard_penalizes_fee_churn_and_exposes_time_remaining(self):
+        account = agent_duel.new_account("deepseek", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        account["trades"] = [{"fee": 18.0}, {"fee": 4.0}]
+        context = agent_duel.scoreboard_context(
+            {"accounts": {"deepseek": account}},
+            prices={},
+            viewer_agent_id="deepseek",
+            now="2026-06-14T03:40:00+00:00",
+            competition_ends_at="2026-06-14T04:40:00+00:00",
+        )
+
+        own_row = context["own_scoreboard"]
+        self.assertEqual(context["competition"]["time_remaining_seconds"], 3600)
+        self.assertGreater(own_row["penalties"]["fee_churn"], 0)
+        self.assertLess(own_row["score"], own_row["raw_roi_score"])
+
+    def test_scoreboard_penalizes_drawdown_and_yolo_exposure_before_ranking(self):
+        safe = agent_duel.new_account("superwing", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        safe["cash"] = 990.0
+        yolo = agent_duel.new_account("deepseek", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        yolo["cash"] = 640.0
+        yolo["positions"] = {
+            "btc:yes": {"market_id": "btc", "outcome": "Yes", "shares": 700.0, "avg_price": 0.5, "last_price": 0.5, "cost_basis": 350.0}
+        }
+
+        context = agent_duel.scoreboard_context({"accounts": {"superwing": safe, "deepseek": yolo}}, prices={})
+        yolo_row = next(row for row in context["scoreboard"] if row["agent_id"] == "deepseek")
+
+        self.assertGreater(yolo_row["penalties"]["drawdown"], 0)
+        self.assertGreater(yolo_row["penalties"]["yolo_exposure"], 0)
+        self.assertLess(yolo_row["score"], yolo_row["raw_roi_score"])
+
+    def test_model_response_parser_requires_exact_json_object(self):
+        data = {"choices": [{"message": {"content": '{"orders": [], "notes": "hold"}'}}]}
+        parsed = agent_duel.extract_deepseek_decision_from_response(data)
+
+        self.assertEqual(parsed["orders"], [])
+        with self.assertRaises(agent_duel.DuelError):
+            agent_duel.extract_deepseek_decision_from_response(
+                {"choices": [{"message": {"content": 'prose {"orders": []}'}}]}
+            )
+        with self.assertRaises(agent_duel.DuelError):
+            agent_duel.extract_deepseek_decision_from_response(
+                {"choices": [{"message": {"content": '{"orders": []}{"orders": []}'}}]}
+            )
+
+    def test_scoreboard_requires_rank_one_and_roi_above_five_percent_for_valid_victory(self):
+        leader_below_threshold = agent_duel.new_account("superwing", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        leader_below_threshold["cash"] = leader_below_threshold["starting_equity"] * 1.04
+        trailing_below_leader = agent_duel.new_account("deepseek", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        trailing_below_leader["cash"] = trailing_below_leader["starting_equity"] * 1.03
+
+        no_winner = agent_duel.scoreboard_context(
+            {"accounts": {"superwing": leader_below_threshold, "deepseek": trailing_below_leader}},
+            prices={},
+        )
+
+        self.assertEqual(no_winner["competition"]["victory_roi_threshold"], 0.05)
+        self.assertEqual(no_winner["competition"]["victory_requires"], "rank_1_and_roi_gt_5pct_after_fees")
+        self.assertFalse(no_winner["victory"]["valid_victory"])
+        self.assertEqual(no_winner["victory"]["reason"], "rank_1_roi_below_threshold")
+        self.assertEqual(no_winner["victory"]["leader_agent_id"], "superwing")
+
+        leader_above_threshold = agent_duel.new_account("superwing", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        leader_above_threshold["cash"] = leader_above_threshold["starting_equity"] * 1.061
+        peer = agent_duel.new_account("deepseek", now_fn=lambda: "2026-06-14T03:30:00+00:00")
+        peer["cash"] = peer["starting_equity"] * 1.01
+
+        valid = agent_duel.scoreboard_context(
+            {"accounts": {"superwing": leader_above_threshold, "deepseek": peer}},
+            prices={},
+        )
+
+        self.assertTrue(valid["victory"]["valid_victory"])
+        self.assertEqual(valid["victory"]["winner_agent_id"], "superwing")
+
     def test_agent_layer_can_write_mechanical_script_for_bot_layer(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = pathlib.Path(tmp)
@@ -832,15 +966,61 @@ class MechanicalBotScriptTests(unittest.TestCase):
             (root / "reports").mkdir(parents=True)
             (root / "normalized" / "polymarket").mkdir(parents=True)
             ts = "2026-06-14T03:30:00+00:00"
+            book_coverage = {"requested_tokens": 1, "ok_tokens": 1, "orderable_tokens": 1}
+            latest_markets = {
+                "ts": ts,
+                "source": "polymarket_market_recorder_v0",
+                "book_coverage": book_coverage,
+                "orderable_market_count": 1,
+                "markets": [],
+            }
+            manifest_row = {
+                "ts": ts,
+                "sequence": 1,
+                "source": "gamma_markets",
+                "path": "raw/polymarket/2026-06-14/gamma_markets.jsonl",
+                "prev_manifest_sha256": "",
+                "line_sha256": "fixture-line-sha256",
+                "payload_sha256": "fixture-payload-sha256",
+            }
+            manifest_row["manifest_sha256"] = market_recorder.sha256_text(market_recorder.canonical_json(manifest_row))
+            manifest_path = root / "raw" / "polymarket" / "2026-06-14" / "manifest.jsonl"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps(manifest_row, sort_keys=True) + "\n", encoding="utf-8")
             (root / "reports" / "market_recorder_health.json").write_text(
-                json.dumps({"ok": False, "ts": ts, "sources": {"clob_book": {"ok_frames": 0}}})
+                json.dumps(
+                    {
+                        "ok": False,
+                        "ts": ts,
+                        "source": "polymarket_market_recorder_v0",
+                        "latest_markets_sha256": market_recorder.sha256_text(market_recorder.canonical_json(latest_markets)),
+                        "sources": {
+                            "gamma_markets": {"ok_frames": 1},
+                            "clob_markets": {"ok_frames": 1},
+                            "data_trades": {"ok_frames": 1},
+                            "clob_book": {"ok_frames": 0, "requested_tokens": 1},
+                        },
+                        "book_coverage": book_coverage,
+                        "orderable_market_count": 1,
+                        "manifest": {
+                            "ok": True,
+                            "verification_scope": "tail",
+                            "verified_rows": 1,
+                            "latest_sequence": 1,
+                            "last_manifest_sha256": manifest_row["manifest_sha256"],
+                            "max_rows": 100,
+                        },
+                    }
+                )
             )
-            (root / "normalized" / "polymarket" / "latest_markets.json").write_text(
-                json.dumps({"ts": ts, "source": "polymarket_market_recorder_v0", "markets": []})
-            )
+            (root / "normalized" / "polymarket" / "latest_markets.json").write_text(json.dumps(latest_markets))
             fallback_markets = [{"market_id": "fallback", "question": "Dev smoke fallback", "volume": 1, "outcomes": [{"name": "Yes", "price": 0.4}, {"name": "No", "price": 0.6}]}]
             args = types.SimpleNamespace(limit=1, min_volume=0, mock_markets="", allow_proxy=False)
-            with mock.patch.dict(os.environ, {"AURUM_ALLOW_UNAUDITED_FALLBACK": "true"}, clear=False):
+            with mock.patch.dict(
+                os.environ,
+                {"AURUM_ALLOW_UNAUDITED_FALLBACK": "true", "AURUM_RECORDER_MAX_STALE_SECONDS": "999999999"},
+                clear=False,
+            ):
                 with mock.patch.object(agent_duel, "fetch_markets", return_value=fallback_markets) as fetch_markets:
                     loaded, source = agent_bot_loop.load_markets_for_tick(root / "paper_duel", args)
 

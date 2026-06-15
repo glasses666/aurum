@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import math
 import os
 import pathlib
 import re
@@ -56,10 +57,17 @@ SENSITIVE_KEY_PARTS = (
     "file",
     "remote_error",
 )
+PUBLIC_DIAGNOSTIC_COUNT_KEYS = {
+    "requested_tokens",
+    "ok_tokens",
+    "orderable_tokens",
+    "token_count",
+}
 SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I),
     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    re.compile(r"(?i)\baurum-[a-z0-9][a-z0-9-]*\d\b"),
     re.compile(r"(?:ssh|postgres|mysql|mongodb|redis)://[^\s\"']+", re.I),
     re.compile(r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"),
     re.compile(r"(?:^|[\s\"'])/(?:Users|home|root|opt|etc|var)/[^\s\"']+"),
@@ -288,6 +296,28 @@ def esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=True)
 
 
+def public_text(value: Any) -> str:
+    return redact_string(str(value if value is not None else ""))
+
+
+def public_count(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return "unknown"
+    try:
+        parsed = float(value)
+    except Exception:
+        return "invalid"
+    if not math.isfinite(parsed):
+        return "invalid"
+    if parsed.is_integer():
+        return str(int(parsed))
+    return str(round(parsed, 4))
+
+
+def esc_public(value: Any) -> str:
+    return esc(public_text(value))
+
+
 def trunc(value: Any, limit: int = 86) -> str:
     text = str(value if value is not None else "")
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -322,6 +352,10 @@ def sensitive_key(key: Any) -> bool:
     return any(part in lower for part in SENSITIVE_KEY_PARTS)
 
 
+def public_diagnostic_count_key(key: Any, value: Any) -> bool:
+    return str(key or "").lower() in PUBLIC_DIAGNOSTIC_COUNT_KEYS and isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def redact_string(value: str) -> str:
     redacted = value
     for pattern in SENSITIVE_VALUE_PATTERNS:
@@ -330,10 +364,10 @@ def redact_string(value: str) -> str:
 
 
 def redact_value(value: Any, key: Any = "") -> Any:
-    if sensitive_key(key) and isinstance(value, (str, int, float, bool)):
+    if sensitive_key(key) and isinstance(value, (str, int, float, bool)) and not public_diagnostic_count_key(key, value):
         return REDACTED
     if isinstance(value, dict):
-        return {str(k): redact_value(v, k) for k, v in value.items()}
+        return {redact_string(str(k)): redact_value(v, k) for k, v in value.items()}
     if isinstance(value, list):
         return [redact_value(item, key) for item in value]
     if isinstance(value, str):
@@ -481,20 +515,33 @@ def snapshot_records(data_dir: pathlib.Path, ticks: List[Dict[str, Any]], limit:
     seen: set[pathlib.Path] = set()
     paths: List[pathlib.Path] = []
     root = data_dir / "snapshots"
+    data_root_resolved = data_dir.resolve(strict=False)
+    root_resolved = root.resolve(strict=False)
+    if root.exists() and data_root_resolved not in (root_resolved, *root_resolved.parents):
+        return []
     if root.exists():
         paths.extend(sorted(root.glob("*.json"))[-limit:])
     for tick in ticks[-limit:]:
         raw = tick.get("snapshot_file")
-        if raw:
-            p = pathlib.Path(str(raw))
-            if p.exists():
-                paths.append(p)
+        if not raw:
+            continue
+        candidate = pathlib.Path(str(raw))
+        if not candidate.is_absolute():
+            candidate = data_dir / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved.parent != root_resolved:
+            continue
+        if resolved.exists():
+            paths.append(resolved)
     rows = []
     for path in paths:
-        if path in seen:
+        resolved = path.resolve(strict=False)
+        if resolved.parent != root_resolved:
             continue
-        seen.add(path)
-        row = read_json(path, None)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        row = read_json(resolved, None)
         if isinstance(row, dict):
             rows.append(row)
     rows.sort(key=lambda r: str(r.get("ts") or r.get("snapshot_id") or ""))
@@ -569,29 +616,50 @@ def data_quality_banner(latest_tick: Dict[str, Any], ticks: List[Dict[str, Any]]
         gate_missing = gate is None
     if not isinstance(gate, dict):
         gate = {}
+    market_source = redact_value(market_source)
+    gate = redact_value(gate)
     source = str(market_source.get("source") or "none")
+    public_source = redact_string(source)
     decision = str(gate.get("decision") or "UNKNOWN")
     reasons = gate.get("reason_codes", []) if isinstance(gate.get("reason_codes"), list) else []
-    reason_text = ",".join(str(reason) for reason in reasons) or "none"
+    reason_text = redact_string(",".join(str(reason) for reason in reasons) or "none")
     recorder_age = gate.get("recorder_age_seconds") or market_source.get("recorder_age_seconds")
     coverage = gate.get("book_coverage") if isinstance(gate.get("book_coverage"), dict) else {}
     requested_books = coverage.get("requested_tokens")
     ok_books = coverage.get("ok_tokens")
-    coverage_text = "unknown" if requested_books is None or ok_books is None else f"{ok_books}/{requested_books}"
-    manifest_scope = gate.get("manifest_verification_scope") or "unknown"
+    requested_books_text = public_count(requested_books)
+    ok_books_text = public_count(ok_books)
+    coverage_text = (
+        "unknown"
+        if requested_books is None or ok_books is None
+        else "invalid"
+        if "invalid" in {requested_books_text, ok_books_text}
+        else f"{ok_books_text}/{requested_books_text}"
+    )
+    manifest_scope = public_text(gate.get("manifest_verification_scope") or "unknown")
     manifest_max_rows = gate.get("manifest_verification_max_rows")
     manifest_verified_rows = gate.get("manifest_verification_verified_rows")
-    manifest_text = f"{manifest_scope} max {manifest_max_rows if manifest_max_rows is not None else 'full'} verified {manifest_verified_rows if manifest_verified_rows is not None else 'unknown'}"
+    manifest_max_text = public_text(manifest_max_rows) if manifest_max_rows is not None else "full"
+    manifest_verified_text = public_text(manifest_verified_rows) if manifest_verified_rows is not None else "unknown"
+    manifest_text = f"{manifest_scope} max {manifest_max_text} verified {manifest_verified_text}"
     orderable_count = gate.get("orderable_market_count")
+    orderable_count_text = public_count(orderable_count)
     universe = str(gate.get("universe") or env.get("AURUM_DUEL_UNIVERSE") or "unknown")
+    public_universe = redact_string(universe)
     normalized_universe = universe.strip().lower()
     btc_only = "yes" if normalized_universe in {"bitcoin", "btc"} else "unknown" if universe == "unknown" else "no"
     latest_age = seconds_since(latest_tick.get("ts")) if latest_tick else None
     actual_interval = latest_tick.get("loop_interval_sec")
-    configured_interval = env.get("AURUM_BOT_DEFAULT_INTERVAL_SEC") or env.get("AURUM_BOT_MIN_INTERVAL_SEC") or "unknown"
+    configured_interval_raw = env.get("AURUM_BOT_DEFAULT_INTERVAL_SEC") or env.get("AURUM_BOT_MIN_INTERVAL_SEC")
+    configured_interval = public_count(configured_interval_raw) if configured_interval_raw is not None else "unknown"
+    actual_interval_text = public_count(actual_interval) if actual_interval is not None else "unknown"
     mismatch = False
     try:
-        mismatch = actual_interval is not None and int(float(actual_interval)) != int(float(configured_interval))
+        mismatch = (
+            actual_interval is not None
+            and configured_interval_raw is not None
+            and int(float(actual_interval)) != int(float(configured_interval_raw))
+        )
     except Exception:
         mismatch = False
     warnings = []
@@ -608,14 +676,14 @@ def data_quality_banner(latest_tick: Dict[str, Any], ticks: List[Dict[str, Any]]
     return f"""
       <div class=\"{css}\" aria-label=\"Data quality\">
         <div class=\"quality-item\">Data quality<b>{esc(decision)} · {esc(warning_text)}</b></div>
-        <div class=\"quality-item\">Source<b>{esc(source)} · fallback ticks last 1h {fallback_ticks_last_hour(ticks, latest_tick)}</b></div>
-        <div class=\"quality-item\">Recorder age<b>{esc('n/a' if recorder_age is None else str(recorder_age) + 's')} · latest tick age {esc('n/a' if latest_age is None else str(round(latest_age, 1)) + 's')}</b></div>
+        <div class=\"quality-item\">Source<b>{esc(public_source)} · fallback ticks last 1h {fallback_ticks_last_hour(ticks, latest_tick)}</b></div>
+        <div class=\"quality-item\">Recorder age<b>{esc('n/a' if recorder_age is None else public_text(recorder_age) + 's')} · latest tick age {esc('n/a' if latest_age is None else str(round(latest_age, 1)) + 's')}</b></div>
         <div class=\"quality-item\">Manifest<b>{esc(manifest_text)}</b></div>
-        <div class=\"quality-item\">Book coverage<b>{esc(coverage_text)} · orderable markets {esc(orderable_count if orderable_count is not None else 'unknown')}</b></div>
-        <div class=\"quality-item\">BTC-only<b>{esc(btc_only)} · universe {esc(universe)}</b></div>
-        <div class=\"quality-item\">Interval<b>actual {esc(actual_interval if actual_interval is not None else 'unknown')}s · configured {esc(configured_interval)}s</b></div>
+        <div class=\"quality-item\">Book coverage<b>{esc(coverage_text)} · orderable markets {esc(orderable_count_text)}</b></div>
+        <div class=\"quality-item\">BTC-only<b>{esc(btc_only)} · universe {esc(public_universe)}</b></div>
+        <div class=\"quality-item\">Interval<b>actual {esc(actual_interval_text)}s · configured {esc(configured_interval)}s</b></div>
         <div class=\"quality-item\">Reasons<b>{esc(reason_text)}</b></div>
-        <div class=\"quality-item\">Tick<b>{esc(latest_tick.get('tick_id', 'none') if latest_tick else 'none')}</b></div>
+        <div class=\"quality-item\">Tick<b>{esc_public(latest_tick.get('tick_id', 'none') if latest_tick else 'none')}</b></div>
       </div>
     """
 
@@ -757,13 +825,9 @@ def replay_status(data_dir: pathlib.Path) -> Dict[str, Any]:
 def risk_ledger_status(data_dir: pathlib.Path) -> Dict[str, Any]:
     path = data_dir / "risk_ledger.jsonl"
     if not path.exists():
-        return {"ok": None, "status": "missing", "rows": 0}
-    rows = 0
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if line.strip():
-                rows += 1
-    return {"ok": True, "status": "present", "rows": rows}
+        return {"ok": None, "status": "missing", "rows_sampled": 0, "read_scope": "tail"}
+    rows = read_jsonl(path, limit=500)
+    return {"ok": True, "status": "present", "rows_sampled": len(rows), "read_scope": "tail"}
 
 
 def public_runtime_status(data_dir: pathlib.Path, latest_tick: Dict[str, Any]) -> Dict[str, Any]:
@@ -896,20 +960,23 @@ def public_tick_events(ticks: List[Dict[str, Any]], limit: int = 80) -> List[Dic
             order_count += len(decision.get("orders", []) or [])
             fill_count += len(result.get("fills", []) or [])
             reject_count += len(result.get("rejections", []) or [])
-        gate = tick.get("data_quality_gate") if isinstance(tick.get("data_quality_gate"), dict) else {}
+        raw_gate = tick.get("data_quality_gate")
+        gate: Dict[str, Any] = raw_gate if isinstance(raw_gate, dict) else {}
         rows.append(
-            {
-                "ts": tick.get("ts"),
-                "tick_id": tick.get("tick_id"),
-                "kind": "TICK",
-                "mode": tick.get("effective_mode") or tick.get("mode"),
-                "applied": bool(tick.get("applied")),
-                "market_count": tick.get("market_count"),
-                "decision": gate.get("decision", "UNKNOWN"),
-                "orders": order_count,
-                "fills": fill_count,
-                "rejects": reject_count,
-            }
+            redact_value(
+                {
+                    "ts": tick.get("ts"),
+                    "tick_id": tick.get("tick_id"),
+                    "kind": "TICK",
+                    "mode": tick.get("effective_mode") or tick.get("mode"),
+                    "applied": bool(tick.get("applied")),
+                    "market_count": tick.get("market_count"),
+                    "decision": gate.get("decision", "UNKNOWN"),
+                    "orders": order_count,
+                    "fills": fill_count,
+                    "rejects": reject_count,
+                }
+            )
         )
     rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
     return rows
@@ -938,7 +1005,7 @@ def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env:
             <span class="agent-name" style="color:{color}"><span class="dot"></span>{esc(AGENT_LABELS[agent])}</span>
             <span class="pill">rank #{esc(row.get('rank', '—'))}</span>
           </div>
-          <div class="agent-sub">{esc(env.get('AURUM_DUEL_MODE', 'review_only'))} · {esc(status)} · review {esc(review)}</div>
+          <div class="agent-sub">{esc_public(env.get('AURUM_DUEL_MODE', 'review_only'))} · {esc_public(status)} · review {esc_public(review)}</div>
           <div class="agent-stats">
             <span>score band<b>{esc(row.get('score_band', 'unknown'))}</b></span>
             <span>position bucket<b>{esc(row.get('position_bucket', 'unknown'))}</b></span>
@@ -972,10 +1039,12 @@ def positions_panel(scores: List[Dict[str, Any]]) -> str:
 
 def rule_excerpt(rules: Dict[str, Any]) -> str:
     sw = rules.get("superwing", {})
-    ds = rules.get("deepseek_rules_excerpt", "")
+    ds = str(rules.get("deepseek_rules_excerpt", ""))
     payload = {
         "superwing": {k: sw.get(k) for k in ("name", "version", "price_min", "price_max", "max_notional", "min_volume")},
-        "deepseek_excerpt": str(ds)[:650],
+        "deepseek_rules_length": rules.get("deepseek_rules_length", len(ds)),
+        "deepseek_rules_sha256": rules.get("deepseek_rules_sha256") or market_recorder.sha256_text(ds),
+        "deepseek_public_view": "metadata_only; raw prompts/rules stay operator-only",
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -1102,9 +1171,9 @@ def event_log(events: List[Dict[str, Any]]) -> str:
             <div class="log-row">
               <div class="log-time">{esc(short_time(item.get('ts')))}</div>
               <div class="log-main">
-                <div class="log-top"><span class="log-action">TICK · {esc(item.get('mode'))}</span><span class="pill">{esc(item.get('decision'))}</span></div>
-                <div class="log-detail">markets {esc(item.get('market_count'))} · orders {esc(item.get('orders'))} · fills {esc(item.get('fills'))} · rejects {esc(item.get('rejects'))}</div>
-                <div class="log-market">tick {esc(item.get('tick_id') or 'none')} · applied {esc(str(item.get('applied')).lower())}</div>
+        <div class="log-top"><span class="log-action">TICK · {esc_public(item.get('mode'))}</span><span class="pill">{esc_public(item.get('decision'))}</span></div>
+                <div class="log-detail">markets {esc_public(item.get('market_count'))} · orders {esc_public(item.get('orders'))} · fills {esc_public(item.get('fills'))} · rejects {esc_public(item.get('rejects'))}</div>
+                <div class="log-market">tick {esc_public(item.get('tick_id') or 'none')} · applied {esc_public(str(item.get('applied')).lower())}</div>
                 <div class="log-note">coarse public activity; detailed order and ledger diagnostics are operator-only</div>
               </div>
             </div>
@@ -1122,10 +1191,10 @@ def event_log(events: List[Dict[str, Any]]) -> str:
         <div class="log-row">
           <div class="log-time">{esc(short_time(item.get('ts')))}</div>
           <div class="log-main">
-            <div class="log-top"><span class="log-action" style="color:{color}">{esc(item.get('kind'))} · {esc(AGENT_LABELS.get(agent, agent))}</span><span class="pill">{esc(item.get('side'))}</span></div>
-            <div class="log-detail">{esc(item.get('outcome') or '')} · ${fmt_money(notional)} @ {fmt_price(price)}{esc(fee_text)}{esc(fee_category_text)}</div>
-            <div class="log-market">{esc(trunc(item.get('question') or item.get('market_id') or 'market', 96))}</div>
-            <div class="log-note">{esc(trunc(item.get('note'), 150))}</div>
+            <div class="log-top"><span class="log-action" style="color:{color}">{esc_public(item.get('kind'))} · {esc_public(AGENT_LABELS.get(agent, agent))}</span><span class="pill">{esc_public(item.get('side'))}</span></div>
+            <div class="log-detail">{esc_public(item.get('outcome') or '')} · ${fmt_money(notional)} @ {fmt_price(price)}{esc_public(fee_text)}{esc_public(fee_category_text)}</div>
+            <div class="log-market">{esc_public(trunc(item.get('question') or item.get('market_id') or 'market', 96))}</div>
+            <div class="log-note">{esc_public(trunc(item.get('note'), 150))}</div>
           </div>
         </div>
         """)
@@ -1137,7 +1206,8 @@ def latest_review_summary(reviews: List[Dict[str, Any]]) -> str:
         return "No 5h pro review yet."
     latest = reviews[-1]
     summary = latest.get("summary") or latest.get("public_dashboard_note") or "review recorded"
-    return f"{latest.get('review_id', '')} · {summary}"
+    review_id = public_text(latest.get("review_id", ""))
+    return f"{review_id} · {public_text(summary)}"
 
 
 def recorder_data_root(data_dir: pathlib.Path) -> pathlib.Path:
@@ -1152,18 +1222,21 @@ def recorder_data_root(data_dir: pathlib.Path) -> pathlib.Path:
 def recorder_panel(data_dir: pathlib.Path) -> str:
     summary = public_recorder_summary(data_dir)
     sources = summary.get("sources", {}) if isinstance(summary.get("sources"), dict) else {}
-    clob_book = sources.get("clob_book") if isinstance(sources.get("clob_book"), dict) else {}
+    clob_book_raw = sources.get("clob_book")
+    clob_book = clob_book_raw if isinstance(clob_book_raw, dict) else {}
     status = "live" if summary.get("ok") else "check"
     pill = "green" if summary.get("ok") else "amber"
     age = summary.get("age_seconds", "n/a")
     coverage = summary.get("book_coverage") if isinstance(summary.get("book_coverage"), dict) else {}
-    requested = coverage.get("requested_tokens", "unknown")
-    ok_tokens = coverage.get("ok_tokens", "unknown")
+    requested = public_count(coverage.get("requested_tokens", "unknown"))
+    ok_tokens = public_count(coverage.get("ok_tokens", "unknown"))
+    market_count = public_count(summary.get("market_count", 0))
+    ok_frames = public_count(clob_book.get("ok_frames", 0))
     return f"""
       <div class=\"rule-line\"><span>Status</span><b><span class=\"pill {pill}\">{esc(status)}</span></b></div>
-      <div class=\"rule-line\"><span>Age</span><b>{esc(age)}s</b></div>
-      <div class=\"rule-line\"><span>Markets</span><b>{esc(summary.get('market_count', 0))}</b></div>
-      <div class=\"rule-line\"><span>Books</span><b>{esc(clob_book.get('ok_frames', 0))} · coverage {esc(ok_tokens)}/{esc(requested)}</b></div>
+      <div class=\"rule-line\"><span>Age</span><b>{esc_public(age)}s</b></div>
+      <div class=\"rule-line\"><span>Markets</span><b>{esc(market_count)}</b></div>
+      <div class=\"rule-line\"><span>Books</span><b>{esc(ok_frames)} · coverage {esc(ok_tokens)}/{esc(requested)}</b></div>
       <div class=\"caption\">{esc(', '.join(summary.get('errors', [])) or 'Gamma/CLOB/Data API frames captured independently from paper fills.')}</div>
     """
 
@@ -1171,14 +1244,21 @@ def recorder_panel(data_dir: pathlib.Path) -> str:
 def runtime_panel(runtime: Dict[str, Any]) -> str:
     registry = runtime.get("bot_registry") if isinstance(runtime.get("bot_registry"), dict) else {}
     backup = runtime.get("backup") if isinstance(runtime.get("backup"), dict) else {}
-    replay = runtime.get("replay") if isinstance(runtime.get("replay"), dict) else {}
-    ledger = runtime.get("risk_ledger") if isinstance(runtime.get("risk_ledger"), dict) else {}
+    replay_raw = runtime.get("replay")
+    replay: Dict[str, Any] = replay_raw if isinstance(replay_raw, dict) else {}
+    ledger_raw = runtime.get("risk_ledger")
+    ledger: Dict[str, Any] = ledger_raw if isinstance(ledger_raw, dict) else {}
+    raw_victory = runtime.get("victory")
+    victory: Dict[str, Any] = raw_victory if isinstance(raw_victory, dict) else {}
+    victory_label = "valid" if bool(victory.get("valid_victory")) else "not yet"
+    ledger_rows = f"tail rows sampled {ledger.get('rows_sampled', 0)}" if ledger.get("read_scope") == "tail" else f"rows {ledger.get('rows', 0)}"
     return f"""
       <div class="rule-line"><span>Completion</span><b>{esc(runtime.get('completion_state', 'code-complete-only'))}</b></div>
       <div class="rule-line"><span>Bot registry</span><b>{esc('ok' if registry.get('ok') else 'check')}</b></div>
       <div class="rule-line"><span>Backup</span><b>{esc(backup.get('status', 'missing'))}</b></div>
       <div class="rule-line"><span>Replay</span><b>{esc(replay.get('status', 'missing'))}</b></div>
-      <div class="rule-line"><span>Risk ledger</span><b>{esc(ledger.get('status', 'missing'))} · rows {esc(ledger.get('rows', 0))}</b></div>
+      <div class="rule-line"><span>Risk ledger</span><b>{esc(ledger.get('status', 'missing'))} · {esc(ledger_rows)}</b></div>
+      <div class="rule-line"><span>Victory gate</span><b>{esc(victory_label)} · ROI &gt; 5%</b></div>
     """
 
 
@@ -1253,17 +1333,26 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     rules = strategy_rules.summarize_rules(data_dir)
     scores = latest_scores(state, ticks)
     scores.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
+    victory = duel.victory_status([
+        {"agent_id": row.get("agent_id"), "rank": idx, "roi": row.get("roi")}
+        for idx, row in enumerate(scores, 1)
+        if isinstance(row, dict)
+    ])
     latest_tick = ticks[-1] if ticks else {}
     btc, latest_btc_market, btc_source = bitcoin_series(data_dir, ticks, state)
     roi: Dict[str, List[Dict[str, Any]]] = {}
     public_events = public_tick_events(ticks)
     operator_events = extract_trade_events(ticks, decisions)
     runtime = public_runtime_status(data_dir, latest_tick)
+    runtime["victory"] = victory
     updated_at = utc_now()
     universe = env.get("AURUM_DUEL_UNIVERSE", "bitcoin").lower() or "bitcoin"
     contest_days = env.get("AURUM_FIRST_CONTEST_DAYS", "7")
+    contest_days_text = public_text(contest_days)
     min_interval = env.get("AURUM_BOT_MIN_INTERVAL_SEC", "5")
+    min_interval_text = public_count(min_interval)
     mode = env.get("AURUM_DUEL_MODE", latest_tick.get("mode", "review_only"))
+    mode_text = public_text(mode)
     market_question = latest_btc_market.get("question") if latest_btc_market else "Waiting for first Bitcoin snapshot"
     latest_btc_price = btc[-1]["value"] if btc else None
 
@@ -1280,7 +1369,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
   <main class="terminal">
     <aside class="left-rail">
       <section class="rail-section">
-        <div class="rail-title"><span>Contest</span><span class="pill amber">first {esc(contest_days)} days</span></div>
+        <div class="rail-title"><span>Contest</span><span class="pill amber">first {esc(contest_days_text)} days</span></div>
         <div class="big-number">BTC only</div>
         <div class="caption">第一版只交易 Bitcoin 相关 Polymarket 市场。paper engine 消费独立 market_recorder 的同源数据；agent 只比策略，不比谁抓到不同盘口。</div>
       </section>
@@ -1293,7 +1382,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         {runtime_panel(runtime)}
       </section>
       <section class="rail-section">
-        <div class="rail-title"><span>Agents</span><span>{esc(mode)}</span></div>
+        <div class="rail-title"><span>Agents</span><span>{esc(mode_text)}</span></div>
         {agent_status_panel(scores, state, env, data_dir)}
       </section>
       <section class="rail-section">
@@ -1321,7 +1410,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         <div class="chart-title">
           <div>
             <h2>Bitcoin recorder line × coarse score bands</h2>
-            <p>{esc(market_question)} · latest BTC market price {fmt_price(latest_btc_price)} · source {esc(btc_source)}</p>
+            <p>{esc_public(market_question)} · latest BTC market price {fmt_price(latest_btc_price)} · source {esc_public(btc_source)}</p>
           </div>
           <div class="legend-line">
             <span style="color:var(--btc)">● BTC market line</span>
@@ -1332,8 +1421,8 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         {trade_chart(btc, roi, [])}
       </div>
       <div class="stage-footer">
-        <div class="footer-cell"><span>Universe</span><b>{esc(universe)}</b></div>
-        <div class="footer-cell"><span>Fastest bot interval</span><b>{esc(min_interval)}s hard floor</b></div>
+        <div class="footer-cell"><span>Universe</span><b>{esc_public(universe)}</b></div>
+        <div class="footer-cell"><span>Fastest bot interval</span><b>{esc(min_interval_text)}s hard floor</b></div>
         <div class="footer-cell"><span>Runtime state</span><b>{esc(runtime.get('completion_state'))}</b></div>
         <div class="footer-cell"><span>Latest 5h review</span><b>{esc(trunc(latest_review_summary(reviews), 72))}</b></div>
       </div>
@@ -1355,12 +1444,13 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         "generated_at": updated_at,
         "tick_count": len(ticks),
         "btc_frame_count": len(btc),
-        "latest_tick": latest_tick.get("tick_id"),
-        "latest_review": (reviews[-1] if reviews else {}).get("review_id"),
-        "universe": universe,
-        "market_question": market_question,
+        "latest_tick": redact_string(str(latest_tick.get("tick_id") or "")) or None,
+        "latest_review": redact_string(str((reviews[-1] if reviews else {}).get("review_id") or "")) or None,
+        "universe": redact_string(universe),
+        "market_question": redact_string(str(market_question)),
         "scores": coarse_scores(scores),
-        "runtime": runtime,
+        "victory": victory,
+        "runtime": redact_value(runtime),
         "operator_output_enabled": bool(operator_output),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

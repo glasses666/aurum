@@ -38,6 +38,10 @@ SLIPPAGE_BPS = 50  # 0.50 percentage points in probability terms.
 POLYMARKET_FEE_DOC_URL = "https://docs.polymarket.com/trading/fees"
 FEE_PRECISION_PLACES = 5
 MIN_PAPER_ORDER_USDC = 5.0
+FEE_CHURN_FREE_FRACTION = 0.002
+DRAWDOWN_FREE_FRACTION = 0.02
+YOLO_EXPOSURE_FREE_FRACTION = MAX_TOTAL_RISK_FRACTION * 0.50
+VICTORY_ROI_THRESHOLD = 0.05
 TAKER_FEE_RATES = {
     "crypto": 0.07,
     "sports": 0.03,
@@ -625,6 +629,42 @@ def market_exposure(account: Dict[str, Any], market_id: str) -> float:
     return total
 
 
+def _iso_to_datetime(value: Any) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def account_total_fees(account: Dict[str, Any]) -> float:
+    total = 0.0
+    trades = account.get("trades", []) if isinstance(account.get("trades"), list) else []
+    for trade in trades:
+        if isinstance(trade, dict):
+            total += max(0.0, to_float(trade.get("fee"), 0.0))
+    return total
+
+
+def score_penalties(account: Dict[str, Any], *, portfolio_total: float, starting: float) -> Dict[str, float]:
+    if starting <= 0:
+        return {"fee_churn": 0.0, "drawdown": 0.0, "yolo_exposure": 0.0, "total": 0.0}
+    fee_ratio = account_total_fees(account) / starting
+    drawdown_ratio = max(0.0, (starting - portfolio_total) / starting)
+    exposure_ratio = account_exposure(account) / starting
+    penalties = {
+        "fee_churn": max(0.0, fee_ratio - FEE_CHURN_FREE_FRACTION) * 100.0,
+        "drawdown": max(0.0, drawdown_ratio - DRAWDOWN_FREE_FRACTION) * 100.0,
+        "yolo_exposure": max(0.0, exposure_ratio - YOLO_EXPOSURE_FREE_FRACTION) * 100.0,
+    }
+    penalties["total"] = sum(penalties.values())
+    return {key: round(value, 6) for key, value in penalties.items()}
+
+
 def portfolio_value(account: Dict[str, Any], prices: Dict[Tuple[str, str], float]) -> Dict[str, Any]:
     cash = float(account.get("cash", 0.0))
     pos_value = 0.0
@@ -640,6 +680,11 @@ def portfolio_value(account: Dict[str, Any], prices: Dict[Tuple[str, str], float
     starting = float(account.get("starting_equity", STARTING_EQUITY))
     total = cash + pos_value
     roi = (total - starting) / starting if starting else 0.0
+    raw_roi_score = roi * 100.0
+    penalties = score_penalties(account, portfolio_total=total, starting=starting)
+    exposure = account_exposure(account)
+    trades = account.get("trades", []) if isinstance(account.get("trades"), list) else []
+    risk_events = account.get("risk_events", []) if isinstance(account.get("risk_events"), list) else []
     return {
         "agent_id": account.get("agent_id"),
         "cash": round(cash, 4),
@@ -647,13 +692,67 @@ def portfolio_value(account: Dict[str, Any], prices: Dict[Tuple[str, str], float
         "portfolio_value": round(total, 4),
         "starting_equity": round(starting, 4),
         "roi": round(roi, 6),
-        "score": round(roi * 100.0, 4),
+        "raw_roi_score": round(raw_roi_score, 4),
+        "score": round(raw_roi_score - penalties["total"], 4),
+        "penalties": penalties,
+        "drawdown": round(max(0.0, (starting - total) / starting) if starting else 0.0, 6),
+        "cash_available": round(cash, 4),
+        "exposure": round(exposure, 4),
+        "trade_count": len(trades),
+        "order_count": len(trades) + len(risk_events),
+        "risk_event_count": len(risk_events),
+        "fees_paid": round(account_total_fees(account), FEE_PRECISION_PLACES),
         "open_positions": len(account.get("positions", {})),
         "details": details,
     }
 
 
+def _recent_trades(account: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
+    trades = account.get("trades", []) if isinstance(account.get("trades"), list) else []
+    out: List[Dict[str, Any]] = []
+    for trade in trades[-limit:]:
+        if not isinstance(trade, dict):
+            continue
+        out.append(
+            {
+                "ts": trade.get("ts"),
+                "market_id": trade.get("market_id"),
+                "question": str(trade.get("question") or "")[:180],
+                "outcome": trade.get("outcome"),
+                "side": trade.get("side"),
+                "notional": trade.get("notional", trade.get("gross_proceeds")),
+                "fill_price": trade.get("fill_price"),
+                "shares": trade.get("shares"),
+                "fee": trade.get("fee"),
+                "fee_category": trade.get("fee_category"),
+                "rationale": str(trade.get("rationale") or "")[:240],
+            }
+        )
+    return out
+
+
+def _recent_risk_events(account: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
+    events = account.get("risk_events", []) if isinstance(account.get("risk_events"), list) else []
+    out: List[Dict[str, Any]] = []
+    for event in events[-limit:]:
+        if not isinstance(event, dict):
+            continue
+        order = event.get("order") if isinstance(event.get("order"), dict) else {}
+        out.append(
+            {
+                "ts": event.get("ts"),
+                "reason": str(event.get("reason") or event.get("rejection_reason") or "")[:240],
+                "market_id": order.get("market_id") if isinstance(order, dict) else None,
+                "outcome": order.get("outcome") if isinstance(order, dict) else None,
+                "side": order.get("side") if isinstance(order, dict) else None,
+            }
+        )
+    return out
+
+
 def compact_account(account: Dict[str, Any]) -> Dict[str, Any]:
+    trades = account.get("trades", []) if isinstance(account.get("trades"), list) else []
+    risk_events = account.get("risk_events", []) if isinstance(account.get("risk_events"), list) else []
     return {
         "agent_id": account.get("agent_id"),
         "cash": round(float(account.get("cash", 0.0)), 4),
@@ -661,6 +760,111 @@ def compact_account(account: Dict[str, Any]) -> Dict[str, Any]:
         "reserve_cash": account.get("reserve_cash"),
         "open_positions": len(account.get("positions", {})),
         "open_risk_cost_basis": round(account_exposure(account), 4),
+        "trade_count": len(trades),
+        "risk_event_count": len(risk_events),
+        "fees_paid": round(account_total_fees(account), FEE_PRECISION_PLACES),
+        "recent_trades": _recent_trades(account),
+        "recent_risk_events": _recent_risk_events(account),
+    }
+
+
+def competition_context(*, now: Optional[str] = None, competition_ends_at: Optional[str] = None) -> Dict[str, Any]:
+    current = _iso_to_datetime(now or utc_now())
+    end_raw = competition_ends_at or os.environ.get("AURUM_COMPETITION_ENDS_AT", "").strip() or os.environ.get("AURUM_STABILITY_WINDOW_END", "").strip()
+    end = _iso_to_datetime(end_raw)
+    time_remaining = None
+    if current and end:
+        time_remaining = max(0, int((end - current).total_seconds()))
+    return {
+        "objective": "rank_1_within_stability_window",
+        "paper_only": True,
+        "goal": "Maximize risk-adjusted paper score/rank while obeying data-quality, reviewed-script, fee, drawdown, exposure, and paper-only gates.",
+        "victory_requires": "rank_1_and_roi_gt_5pct_after_fees",
+        "victory_roi_threshold": VICTORY_ROI_THRESHOLD,
+        "competition_ends_at": end_raw or None,
+        "time_remaining_seconds": time_remaining,
+        "score_formula": "raw_roi_score - fee_churn - drawdown - yolo_exposure penalties",
+        "anti_yolo_acceptance": [
+            "fee_churn",
+            "drawdown",
+            "yolo_exposure",
+            "paper_only_and_reviewed_data_quality_gates",
+        ],
+        "anti_yolo_notes": [
+            "fee_churn penalties reduce score when cumulative fees exceed the free fraction",
+            "drawdown penalties reduce score after the drawdown free fraction",
+            "yolo_exposure penalties reduce score before hard risk caps are reached",
+            "paper-only and reviewed-script/data-quality gates override rank chasing",
+        ],
+    }
+
+
+def _scoreboard_row(row: Dict[str, Any], rank: int) -> Dict[str, Any]:
+    return {
+        "agent_id": row.get("agent_id"),
+        "rank": rank,
+        "score": row.get("score"),
+        "raw_roi_score": row.get("raw_roi_score"),
+        "roi": row.get("roi"),
+        "drawdown": row.get("drawdown"),
+        "cash": row.get("cash"),
+        "cash_available": row.get("cash_available"),
+        "exposure": row.get("exposure"),
+        "open_positions": row.get("open_positions"),
+        "trade_count": row.get("trade_count"),
+        "order_count": row.get("order_count"),
+        "risk_event_count": row.get("risk_event_count"),
+        "fees_paid": row.get("fees_paid"),
+        "penalties": row.get("penalties"),
+    }
+
+
+def victory_status(ranked: List[Dict[str, Any]], *, threshold: float = VICTORY_ROI_THRESHOLD) -> Dict[str, Any]:
+    if not ranked:
+        return {
+            "valid_victory": False,
+            "winner_agent_id": None,
+            "leader_agent_id": None,
+            "threshold": threshold,
+            "reason": "no_scoreboard",
+        }
+    leader = ranked[0]
+    leader_roi = to_float(leader.get("roi"), 0.0)
+    valid = leader_roi > threshold
+    return {
+        "valid_victory": valid,
+        "winner_agent_id": leader.get("agent_id") if valid else None,
+        "leader_agent_id": leader.get("agent_id"),
+        "leader_rank": leader.get("rank"),
+        "leader_roi": round(leader_roi, 6),
+        "threshold": threshold,
+        "reason": "valid_victory" if valid else "rank_1_roi_below_threshold",
+    }
+
+
+def scoreboard_context(
+    state: Dict[str, Any],
+    prices: Dict[Tuple[str, str], float],
+    *,
+    viewer_agent_id: Optional[str] = None,
+    now: Optional[str] = None,
+    competition_ends_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    accounts = state.get("accounts", {}) if isinstance(state.get("accounts"), dict) else {}
+    rows = []
+    for agent_id, account in accounts.items():
+        if isinstance(account, dict):
+            rows.append(portfolio_value(account, prices))
+    rows.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
+    ranked = [_scoreboard_row(row, rank) for rank, row in enumerate(rows, 1)]
+    own = next((row for row in ranked if row.get("agent_id") == viewer_agent_id), None)
+    peers = [row for row in ranked if row.get("agent_id") != viewer_agent_id]
+    return {
+        "competition": competition_context(now=now, competition_ends_at=competition_ends_at),
+        "own_scoreboard": own,
+        "peer_scoreboard": peers,
+        "scoreboard": ranked,
+        "victory": victory_status(ranked),
     }
 
 
@@ -711,11 +915,20 @@ def superwing_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], m
     }
 
 
-def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any], strategy_text: str = "") -> Tuple[str, str]:
+def deepseek_prompt(
+    account: Dict[str, Any],
+    markets: List[Dict[str, Any]],
+    controls: Dict[str, Any],
+    strategy_text: str = "",
+    scoreboard: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    scoreboard = scoreboard or {"competition": competition_context(), "own_scoreboard": None, "peer_scoreboard": []}
     system = (
         "You are DeepSeek running a PAPER-ONLY Polymarket strategy test for Aurum. "
+        "The tournament objective is to rank #1 in the stability window, but only by risk-adjusted paper score. "
         "You cannot place real orders. You cannot request wallets, private keys, USDC, account logins, or geoblock bypass. "
         f"You must choose at most {controls['max_orders']} small buy orders or hold. "
+        "Avoid YOLO rank chasing: fee churn, drawdown, and excessive exposure reduce score before hard gates reject orders. "
         "Operator controls are enforced by the runner and cannot be overridden by your response. "
         "Output JSON only, no markdown."
     )
@@ -735,8 +948,12 @@ def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], cont
         )
     user = json.dumps(
         {
-            "task": "Pick paper trades for the deepseek account. If edge is unclear, return no orders.",
-            "account": compact_account(account),
+            "task": "Pick paper trades for the deepseek account. Rank #1 is the objective, but if edge is unclear or penalties/risk gates dominate, return no orders.",
+            "competition": scoreboard.get("competition"),
+            "own_account": compact_account(account),
+            "own_scoreboard": scoreboard.get("own_scoreboard"),
+            "peer_scoreboard": scoreboard.get("peer_scoreboard", []),
+            "victory_status": scoreboard.get("victory"),
             "risk_limits": {
                 "max_orders": controls["max_orders"],
                 "max_notional_per_order": round(float(controls["max_notional_per_order"]), 2),
@@ -771,14 +988,12 @@ def deepseek_prompt(account: Dict[str, Any], markets: List[Dict[str, Any]], cont
 def extract_json_object(text: str) -> Dict[str, Any]:
     text = text.strip()
     try:
-        return json.loads(text)
-    except Exception:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        return json.loads(text[start : end + 1])
-    raise DuelError("DeepSeek response did not contain a JSON object")
+        parsed = json.loads(text)
+    except Exception as exc:
+        raise DuelError("DeepSeek response must be exactly one valid JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise DuelError("DeepSeek response JSON root must be an object")
+    return parsed
 
 
 def deepseek_payload(
@@ -853,7 +1068,13 @@ def extract_deepseek_decision_from_response(data: Dict[str, Any]) -> Dict[str, A
     ) from last_error
 
 
-def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], controls: Dict[str, Any], data_dir: Optional[pathlib.Path] = None) -> Dict[str, Any]:
+def deepseek_decision(
+    account: Dict[str, Any],
+    markets: List[Dict[str, Any]],
+    controls: Dict[str, Any],
+    data_dir: Optional[pathlib.Path] = None,
+    scoreboard: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         raise DuelError("DEEPSEEK_API_KEY is not set; cannot ask DeepSeek to self-decide")
@@ -862,7 +1083,7 @@ def deepseek_decision(account: Dict[str, Any], markets: List[Dict[str, Any]], co
     if endpoint.rstrip("/").endswith("/v1"):
         endpoint = endpoint.rstrip("/") + "/chat/completions"
     strategy_text = strategy_rules.load_deepseek_rules(data_dir) if data_dir else ""
-    system, user = deepseek_prompt(account, markets, controls, strategy_text=strategy_text)
+    system, user = deepseek_prompt(account, markets, controls, strategy_text=strategy_text, scoreboard=scoreboard)
     first_payload = deepseek_payload(model, system, user, controls)
     data = call_deepseek_chat(endpoint, api_key, first_payload)
     retry_used = False
@@ -1261,7 +1482,8 @@ def command_decide(args: argparse.Namespace) -> None:
         validation_max_notional = float(controls["max_notional_per_order"])
         if not args.no_apply:
             require_deepseek_apply_authorized(controls)
-        decision = deepseek_decision(state["accounts"]["deepseek"], markets, controls, data_dir=data_dir)
+        scoreboard = scoreboard_context(state, market_price_map(markets), viewer_agent_id="deepseek")
+        decision = deepseek_decision(state["accounts"]["deepseek"], markets, controls, data_dir=data_dir, scoreboard=scoreboard)
     else:
         raise DuelError(f"unknown agent: {args.agent}")
     result = validate_and_apply(

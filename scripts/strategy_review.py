@@ -32,11 +32,13 @@ def compact_tick(tick: Dict[str, Any]) -> Dict[str, Any]:
     for agent_id, info in (tick.get("agents") or {}).items():
         decision = info.get("decision", {}) if isinstance(info, dict) else {}
         result = info.get("result", {}) if isinstance(info, dict) else {}
+        orders = decision.get("orders", []) if isinstance(decision.get("orders", []), list) else []
+        fills = result.get("fills", []) if isinstance(result.get("fills", []), list) else []
+        rejections = result.get("rejections", []) if isinstance(result.get("rejections", []), list) else []
         agents[agent_id] = {
-            "orders": decision.get("orders", [])[:3] if isinstance(decision.get("orders", []), list) else [],
-            "notes": decision.get("notes", ""),
-            "fills": result.get("fills", [])[:3] if isinstance(result.get("fills", []), list) else [],
-            "rejections": result.get("rejections", [])[:3] if isinstance(result.get("rejections", []), list) else [],
+            "order_count": len(orders),
+            "fill_count": len(fills),
+            "rejection_count": len(rejections),
         }
     return {
         "tick_id": tick.get("tick_id"),
@@ -49,54 +51,141 @@ def compact_tick(tick: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def review_context(data_dir: pathlib.Path, limit_ticks: int) -> Dict[str, Any]:
-    state = {}
+def _load_review_state(data_dir: pathlib.Path) -> Dict[str, Any]:
     try:
-        state = duel.load_state(data_dir)
+        return duel.load_state(data_dir)
     except Exception:
-        state = {"accounts": {}}
+        return {"accounts": {}}
+
+
+def _aggregate_agent_learning_context(
+    state: Dict[str, Any],
+    prices: Dict[Any, float],
+    agent: str,
+    replay_feedback: Dict[str, Any],
+) -> Dict[str, Any]:
+    per_agent_scoreboard = duel.scoreboard_context(state, prices, viewer_agent_id=agent)
+    return {
+        "agent_id": agent,
+        "scope": "aggregate_only_no_raw_ledger",
+        "own_scoreboard": per_agent_scoreboard.get("own_scoreboard"),
+        "peer_scoreboard": per_agent_scoreboard.get("peer_scoreboard", []),
+        "victory": per_agent_scoreboard.get("victory"),
+        "replay_feedback": replay_feedback,
+    }
+
+
+def _isolated_agent_learning_context(
+    state: Dict[str, Any],
+    prices: Dict[Any, float],
+    agent: str,
+    replay_feedback: Dict[str, Any],
+) -> Dict[str, Any]:
+    accounts = state.get("accounts", {}) if isinstance(state.get("accounts"), dict) else {}
+    raw_account = accounts.get(agent)
+    account: Dict[str, Any] = raw_account if isinstance(raw_account, dict) else {}
+    context = _aggregate_agent_learning_context(state, prices, agent, replay_feedback)
+    context.update(
+        {
+            "scope": "target_agent_raw_ledger_only",
+            "own_account": duel.compact_account(account),
+        }
+    )
+    return context
+
+
+def _required_output_schema() -> Dict[str, Any]:
+    return {
+        "summary": "one short paragraph",
+        "findings": ["short observation"],
+        "superwing_rules": {
+            "name": "string",
+            "selection": "string",
+            "price_min": "0.05-0.85",
+            "price_max": "price_min+0.01 to 0.95",
+            "max_notional": "1-45",
+            "limit_buffer": "0.001-0.035",
+            "confidence": "0.45-0.8",
+            "min_volume": "0-2000000",
+            "notes": "string",
+        },
+        "superwing_rationale": "why this rule change helps",
+        "deepseek_rules_md": "markdown rules for DeepSeek, paper-only/buy/sell/hold-if-no-edge",
+        "deepseek_rationale": "why this prompt change helps",
+        "bot_scripts": {
+            "superwing": "optional mechanical JSON script with buy_when/sell_when/hold_when",
+            "deepseek": "optional mechanical JSON script with buy_when/sell_when/hold_when",
+        },
+        "risk_notes": ["safety note"],
+        "public_dashboard_note": "one sentence for human transparency",
+    }
+
+
+def review_context(data_dir: pathlib.Path, limit_ticks: int) -> Dict[str, Any]:
+    state = _load_review_state(data_dir)
     ticks = read_jsonl(data_dir / "ticks.jsonl", limit_ticks)
     decisions = read_jsonl(data_dir / "decisions.jsonl", limit_ticks * 2)
     prices = duel.market_price_map(state.get("last_markets", []))
-    scores = []
-    for agent in duel.AGENTS:
-        account = state.get("accounts", {}).get(agent)
-        if account:
-            scores.append(duel.portfolio_value(account, prices))
+    scoreboard = duel.scoreboard_context(state, prices)
+    replay_feedback = generate_dashboard.replay_status(data_dir)
+    agent_learning_contexts = {
+        agent: _aggregate_agent_learning_context(state, prices, agent, replay_feedback)
+        for agent in duel.AGENTS
+    }
     return {
         "now": duel.utc_now(),
         "mode": os.environ.get("AURUM_DUEL_MODE", "review_only"),
         "paper_only": True,
-        "scores": scores,
+        "self_evolution_contract": "Use own ledger/fills/risk_events/replay outcomes to propose better bounded mechanical rules; strict DSL/review gates decide promotion; keep learning state per-agent isolated.",
+        "learning_isolation_contract": "Shared review context is aggregate-only. Raw trades/fills/risk_events are supplied only in the isolated target-agent review context for one agent at a time.",
+        "competition": scoreboard["competition"],
+        "victory": scoreboard.get("victory"),
+        "scores": scoreboard["scoreboard"],
+        "agent_learning_contexts": agent_learning_contexts,
+        "replay_feedback": replay_feedback,
         "current_rules": strategy_rules.summarize_rules(data_dir),
         "current_bot_scripts": {agent: bot_scripts.load_bot_script(data_dir, agent) for agent in duel.AGENTS},
         "recent_ticks": [compact_tick(t) for t in ticks[-limit_ticks:]],
         "recent_decision_count": len(decisions),
-        "required_output_schema": {
-            "summary": "one short paragraph",
-            "findings": ["short observation"],
-            "superwing_rules": {
-                "name": "string",
-                "selection": "string",
-                "price_min": "0.05-0.85",
-                "price_max": "price_min+0.01 to 0.95",
-                "max_notional": "1-45",
-                "limit_buffer": "0.001-0.035",
-                "confidence": "0.45-0.8",
-                "min_volume": "0-2000000",
-                "notes": "string",
-            },
-            "superwing_rationale": "why this rule change helps",
-            "deepseek_rules_md": "markdown rules for DeepSeek, paper-only/buy/sell/hold-if-no-edge",
-            "deepseek_rationale": "why this prompt change helps",
-            "bot_scripts": {
-                "superwing": "optional mechanical JSON script with buy_when/sell_when/hold_when",
-                "deepseek": "optional mechanical JSON script with buy_when/sell_when/hold_when",
-            },
-            "risk_notes": ["safety note"],
-            "public_dashboard_note": "one sentence for human transparency",
-        },
+        "required_output_schema": _required_output_schema(),
     }
+
+
+def _target_current_rules(data_dir: pathlib.Path, agent_id: str) -> Dict[str, Any]:
+    if agent_id == "superwing":
+        return {"superwing": strategy_rules.load_superwing_rules(data_dir)}
+    if agent_id == "deepseek":
+        text = strategy_rules.load_deepseek_rules(data_dir)
+        return {"deepseek_rules_md": text, "deepseek_rules_length": len(text)}
+    return {}
+
+
+def agent_review_context(
+    data_dir: pathlib.Path,
+    agent_id: str,
+    limit_ticks: int,
+    *,
+    base_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if agent_id not in duel.AGENTS:
+        raise duel.DuelError(f"unknown review agent: {agent_id}")
+    base = dict(base_context) if base_context is not None else review_context(data_dir, limit_ticks)
+    state = _load_review_state(data_dir)
+    prices = duel.market_price_map(state.get("last_markets", []))
+    replay_feedback_raw = base.get("replay_feedback")
+    replay_feedback: Dict[str, Any] = replay_feedback_raw if isinstance(replay_feedback_raw, dict) else generate_dashboard.replay_status(data_dir)
+    isolated = _isolated_agent_learning_context(state, prices, agent_id, replay_feedback)
+    base["target_agent_id"] = agent_id
+    base["agent_learning_context"] = isolated
+    base["agent_learning_contexts"] = {agent_id: isolated}
+    base["current_rules"] = _target_current_rules(data_dir, agent_id)
+    base["current_bot_scripts"] = {agent_id: bot_scripts.load_bot_script(data_dir, agent_id)}
+    base["learning_isolation_contract"] = (
+        "This model call is isolated for target_agent_id only. "
+        "It may use own_account/recent_trades/recent_risk_events only for that target; "
+        "peer data is aggregate peer_scoreboard only. Do not infer or copy peer raw ledgers, prompts, or strategy internals."
+    )
+    return base
 
 
 def call_review_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
@@ -109,11 +198,18 @@ def call_review_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
     primary = os.environ.get("AURUM_REVIEW_MODEL", "deepseek-v4-pro").strip() or "deepseek-v4-pro"
     fallback = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
     models = [primary] + ([fallback] if fallback != primary else [])
+    target_agent = str(ctx.get("target_agent_id") or "").strip()
     system = (
         "You are the advanced strategy-review model for Aurum's PAPER-ONLY Polymarket duel. "
         "Improve transparency and strategy quality, but never propose real wallets, private keys, USDC deposits, logins, geoblock bypass, live trading, or risk-cap changes. "
         "Return JSON only. The runner will validate and may reject unsafe updates."
     )
+    if target_agent:
+        system += (
+            f" This review call is isolated for target_agent_id={target_agent}. "
+            "Use only agent_learning_context.own_account as raw ledger evidence; peer_scoreboard is aggregate only. "
+            "Do not infer or copy peer raw trades, prompts, or strategy internals."
+        )
     user = json.dumps(ctx, ensure_ascii=False)
     last_error = ""
     for model in models:
@@ -183,6 +279,41 @@ def auto_promote_enabled(args: argparse.Namespace) -> bool:
     return allow and confirm
 
 
+def _list_field(review: Dict[str, Any], key: str) -> List[Any]:
+    value = review.get(key)
+    return value if isinstance(value, list) else ([] if value in (None, "") else [value])
+
+
+def merge_isolated_agent_reviews(agent_reviews: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    superwing_review = agent_reviews.get("superwing", {})
+    deepseek_review = agent_reviews.get("deepseek", {})
+    merged_bot_scripts: Dict[str, Any] = {}
+    for agent_id, review in agent_reviews.items():
+        raw_scripts = review.get("bot_scripts") if isinstance(review.get("bot_scripts"), dict) else {}
+        candidate = raw_scripts.get(agent_id) if isinstance(raw_scripts, dict) else None
+        if isinstance(candidate, dict):
+            merged_bot_scripts[agent_id] = candidate
+    model_parts = []
+    for agent_id in duel.AGENTS:
+        model = str(agent_reviews.get(agent_id, {}).get("review_model") or "unknown")[:120]
+        model_parts.append(f"{agent_id}={model}")
+    summaries = [str(agent_reviews.get(agent_id, {}).get("summary") or "").strip() for agent_id in duel.AGENTS]
+    notes = [str(agent_reviews.get(agent_id, {}).get("public_dashboard_note") or "").strip() for agent_id in duel.AGENTS]
+    return {
+        "summary": " | ".join(item for item in summaries if item) or "Per-agent isolated strategy reviews completed.",
+        "findings": [item for agent_id in duel.AGENTS for item in _list_field(agent_reviews.get(agent_id, {}), "findings")],
+        "superwing_rules": superwing_review.get("superwing_rules"),
+        "superwing_rationale": superwing_review.get("superwing_rationale", ""),
+        "deepseek_rules_md": deepseek_review.get("deepseek_rules_md"),
+        "deepseek_rationale": deepseek_review.get("deepseek_rationale", ""),
+        "bot_scripts": merged_bot_scripts,
+        "risk_notes": [item for agent_id in duel.AGENTS for item in _list_field(agent_reviews.get(agent_id, {}), "risk_notes")],
+        "public_dashboard_note": " | ".join(item for item in notes if item) or "Per-agent isolated strategy reviews completed.",
+        "review_model": "per-agent-isolated:" + ",".join(model_parts),
+        "structured_retry_used": any(bool(agent_reviews.get(agent_id, {}).get("structured_retry_used")) for agent_id in duel.AGENTS),
+    }
+
+
 def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     data_dir = pathlib.Path(args.data_dir)
     env_file = pathlib.Path(args.env_file) if args.env_file else None
@@ -190,14 +321,18 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     duel.load_env_file(env_file)
     strategy_rules.ensure_default_rules(data_dir)
     bot_scripts.ensure_default_bot_scripts(data_dir)
-    ctx = review_context(data_dir, args.limit_ticks)
-    try:
-        review = call_review_model(ctx)
-        model_failed = False
-        model_error = ""
-    except Exception as exc:
-        model_failed = True
-        model_error = str(exc)
+    base_ctx = review_context(data_dir, args.limit_ticks)
+    agent_reviews: Dict[str, Dict[str, Any]] = {}
+    model_errors: Dict[str, str] = {}
+    for agent_id in duel.AGENTS:
+        isolated_ctx = agent_review_context(data_dir, agent_id, args.limit_ticks, base_context=base_ctx)
+        try:
+            agent_reviews[agent_id] = call_review_model(isolated_ctx)
+        except Exception as exc:
+            model_errors[agent_id] = str(exc)
+    model_failed = bool(model_errors)
+    if model_failed:
+        model_error = "; ".join(f"{agent}: {error[:500]}" for agent, error in model_errors.items())
         review = {
             "summary": "Strategy review model output was not parseable; no rule changes promoted in this maintenance cycle.",
             "findings": [f"review_model_error: {model_error[:500]}"],
@@ -210,6 +345,9 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
             "review_model": "fallback_no_promote",
             "structured_retry_used": True,
         }
+    else:
+        model_error = ""
+        review = merge_isolated_agent_reviews(agent_reviews)
     review_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
     proposed: Dict[str, Any] = {}
     promoted: Dict[str, Any] = {}

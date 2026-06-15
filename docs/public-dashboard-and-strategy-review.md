@@ -4,15 +4,15 @@ Aurum now exposes a static public transparency dashboard for the paper duel.
 
 ## Purpose
 
-The dashboard removes the black-box feeling from the SuperWing vs DeepSeek paper duel. It shows:
+The dashboard removes the black-box feeling from the SuperWing vs DeepSeek paper duel while keeping the public surface coarse. It shows:
 
-- LLM / agent names;
-- starting paper funds;
-- current paper funds and ROI score;
-- recent trading dynamics: orders, fills, rejections, notes;
-- the current trading flow and safety gates;
+- agent names and public rank/score bands;
+- aggregate paper exposure buckets, not raw balances or position keys;
+- coarse trading dynamics: tick/order/fill/rejection counts and safety-gate status;
+- the current trading flow and data-quality / reviewed-script gates;
+- the ROI victory gate: a valid winner must be rank #1 **and** ROI `> 5%` after fees inside the scoring window;
 - the Polymarket-style paper execution rules, including taker-fee formula/rates;
-- the current SuperWing rules and DeepSeek strategy prompt;
+- public rule/review summaries without raw prompts, ledgers, private paths, or account-like balances;
 - a score-history chart;
 - the latest 5h advanced review and rule updates.
 
@@ -100,7 +100,7 @@ Even when auto-promote is enabled:
 - only strategy prompts/rules are updated;
 - live-trading terms are rejected;
 - SuperWing numeric rules are clamped to safe ranges;
-- DeepSeek rules are validated for paper-only/buy-only/hold-if-no-edge language;
+- DeepSeek rules are validated for paper-only/buy-sell-or-hold-if-no-edge language;
 - previous rules are copied to history before promotion;
 - every update is recorded in `versions.jsonl` and the public dashboard.
 

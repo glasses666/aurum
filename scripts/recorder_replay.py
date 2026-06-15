@@ -132,6 +132,8 @@ def latest_tail_manifest_proof(root: pathlib.Path, capture_ts: str) -> Dict[str,
         raise RuntimeError("recorder health manifest is not tail verified")
     if not market_recorder.strict_positive_int(manifest.get("verified_rows")):
         raise RuntimeError("recorder health manifest has no verified rows")
+    if not isinstance(manifest.get("last_manifest_sha256"), str) or not str(manifest.get("last_manifest_sha256") or "").strip():
+        raise RuntimeError("recorder health manifest missing last_manifest_sha256")
     return manifest
 
 
@@ -169,9 +171,14 @@ def verify_manifest_tail_chain(
 
     verified_rows = 0
     latest_sequence: Optional[int] = None
+    latest_ts = ""
     last_hash = ""
     proof_sequence = market_recorder.strict_positive_int(proof.get("latest_sequence"))
     proof_hash = str(proof.get("last_manifest_sha256") or "")
+    if proof_sequence is None:
+        raise RuntimeError("manifest latest_sequence missing")
+    if not proof_hash:
+        raise RuntimeError("manifest last_manifest_sha256 missing")
     proof_matched = False
     for line in manifest_lines:
         if not line.strip():
@@ -189,6 +196,7 @@ def verify_manifest_tail_chain(
         if str(row.get("prev_manifest_sha256") or "") != prev_hash:
             raise RuntimeError("manifest_prev_hash_error")
         last_hash = str(row.get("manifest_sha256") or "")
+        latest_ts = str(row.get("ts") or "")
         if proof_sequence is not None and sequence == proof_sequence:
             if proof_hash and last_hash != proof_hash:
                 raise RuntimeError("manifest_latest_hash_mismatch")
@@ -200,6 +208,10 @@ def verify_manifest_tail_chain(
 
     if proof_sequence is not None and not proof_matched:
         raise RuntimeError("manifest_latest_sequence_mismatch")
+    if proof_sequence is not None and (latest_sequence != proof_sequence or (proof_hash and last_hash != proof_hash)):
+        raise RuntimeError("manifest_tail_terminal_mismatch")
+    if latest_ts and latest_ts != str(capture_ts):
+        raise RuntimeError("manifest_tail_terminal_mismatch")
     if proof_sequence is None and proof_hash and last_hash != proof_hash:
         raise RuntimeError("manifest_latest_hash_mismatch")
     return {
@@ -236,30 +248,28 @@ def build_recorder_context(
     capture_ts = str(ts or latest_ts)
     if verify_scope not in {"tail", "full"}:
         raise ValueError("verify_scope must be tail or full")
+    if verify_scope == "tail" and capture_ts != latest_ts:
+        raise RuntimeError("non_latest_tail_requires_full_scope")
     use_latest_tail_proof = verify_scope == "tail" and capture_ts == latest_ts
+    max_manifest_lines = max(50, int(max_rows or 500)) if use_latest_tail_proof else None
     if use_latest_tail_proof:
         verified = latest_tail_manifest_proof(root, capture_ts)
-        tail_chain = verify_manifest_tail_chain(root, capture_ts, verified, max_rows=max_rows)
+        tail_chain = verify_manifest_tail_chain(root, capture_ts, verified, max_rows=max_manifest_lines)
         verified = {**verified, **tail_chain}
     else:
         verified = market_recorder.verify_manifest(root, ts=capture_ts, max_rows=None if verify_scope == "full" else max_rows)
     if not verified.get("ok"):
         raise RuntimeError("recorder manifest verification failed: " + ",".join(str(e) for e in verified.get("errors", [])))
 
-    orderable_path = root / "features" / "polymarket_orderable_feed.json"
-    orderable_feed = read_json(orderable_path)
-    orderable_feed_sha256 = hash_file(orderable_path)
-    use_bounded_manifest_lookup = verify_scope == "tail" and capture_ts == latest_ts
-    max_manifest_lines = max(50, int(max_rows or 500)) if use_bounded_manifest_lookup else None
     manifest_rows = manifest_rows_for_ts(root, capture_ts, max_lines=max_manifest_lines)
-    if not manifest_rows and use_bounded_manifest_lookup:
-        manifest_rows = manifest_rows_for_ts(root, capture_ts, max_lines=None)
     if not manifest_rows:
         raise RuntimeError("no manifest rows for recorder capture")
 
     source_refs: Dict[str, List[Dict[str, Any]]] = {}
     books_by_token: Dict[str, Any] = {}
     book_refs_by_token: Dict[str, Dict[str, Any]] = {}
+    requested_token_ids: List[str] = []
+    capture_markets: List[Dict[str, Any]] = []
     max_frame_lines = 2000 if verify_scope == "tail" else None
     capture_day = market_recorder.parse_ts(capture_ts).date().isoformat()
     for row in manifest_rows:
@@ -271,14 +281,38 @@ def build_recorder_context(
         if not frame_ref:
             raise RuntimeError("missing recorder raw frame for manifest row")
         source_refs.setdefault(source, []).append(_public_frame_ref(frame_ref))
+        frame = frame_ref.get("frame") or {}
+        payload = frame.get("payload") if isinstance(frame, dict) else {}
+        if source == "gamma_markets":
+            normalized = market_recorder.normalize_markets(payload, universe="bitcoin")
+            if normalized:
+                capture_markets = normalized
         if source == "clob_book":
-            frame = frame_ref.get("frame") or {}
-            payload = frame.get("payload") if isinstance(frame, dict) else {}
             if isinstance(payload, dict):
                 token_id = str(payload.get("token_id") or "")
                 if token_id:
-                    books_by_token[token_id] = payload.get("book")
-                    book_refs_by_token[token_id] = _public_frame_ref(frame_ref)
+                    requested_token_ids.append(token_id)
+                    if frame.get("ok") is True:
+                        books_by_token[token_id] = payload.get("book")
+                        book_refs_by_token[token_id] = _public_frame_ref(frame_ref)
+
+    if not capture_markets:
+        raise RuntimeError("missing recorder gamma market frame")
+    orderable_feed = market_recorder.build_orderable_feed(
+        capture_markets,
+        books_by_token,
+        capture_ts,
+        requested_token_ids=requested_token_ids,
+    )
+    orderable_feed_sha256 = hash_json(orderable_feed)
+    book_coverage = {
+        "requested_tokens": orderable_feed.get("requested_tokens"),
+        "ok_tokens": orderable_feed.get("ok_tokens"),
+        "orderable_tokens": orderable_feed.get("orderable_tokens"),
+        "coverage_ratio": orderable_feed.get("coverage_ratio"),
+        "orderable_ratio": orderable_feed.get("orderable_ratio"),
+    }
+    orderable_market_count = sum(1 for row in orderable_feed.get("markets", []) if isinstance(row, dict) and row.get("orderable"))
 
     latest_manifest_hash = str((manifest_rows[-1] or {}).get("manifest_sha256") or verified.get("last_manifest_sha256") or "")
     capture_id = hash_json({"ts": capture_ts, "latest_manifest_sha256": latest_manifest_hash, "orderable_feed_sha256": orderable_feed_sha256})
@@ -295,12 +329,13 @@ def build_recorder_context(
             "last_manifest_sha256": verified.get("last_manifest_sha256"),
         },
         "orderable_feed_sha256": orderable_feed_sha256,
-        "orderable_market_count": latest.get("orderable_market_count"),
-        "book_coverage": latest.get("book_coverage"),
+        "orderable_market_count": orderable_market_count,
+        "book_coverage": book_coverage,
         "source_refs": source_refs,
         "books_by_token": books_by_token,
         "book_refs_by_token": book_refs_by_token,
         "orderable_feed": orderable_feed,
+        "markets": capture_markets,
     }
 
 
@@ -444,6 +479,17 @@ def _copy_bot_scripts(src_paper_dir: pathlib.Path, dst_paper_dir: pathlib.Path) 
         bot_scripts.ensure_default_bot_scripts(dst_paper_dir)
 
 
+def _paths_overlap(left: pathlib.Path, right: pathlib.Path) -> bool:
+    left_resolved = left.resolve(strict=False)
+    right_resolved = right.resolve(strict=False)
+    return left_resolved == right_resolved or left_resolved in right_resolved.parents or right_resolved in left_resolved.parents
+
+
+def _ensure_safe_replay_output(paper_data_dir: pathlib.Path, recorder_data_dir: pathlib.Path, replay_paper: pathlib.Path) -> None:
+    if _paths_overlap(paper_data_dir, replay_paper) or _paths_overlap(recorder_data_dir, replay_paper):
+        raise RuntimeError("unsafe_replay_output_dir overlaps source data")
+
+
 def replay_session(
     *,
     recorder_data_dir: pathlib.Path,
@@ -468,14 +514,14 @@ def replay_session(
     )
     if end_ts and str(context["ts"]) > str(end_ts):
         raise RuntimeError("selected recorder capture is after replay end-ts")
-    latest = market_recorder.load_latest_markets(recorder_data_dir, max_stale_seconds=999999999)
-    markets = [m for m in latest.get("markets", []) if float(m.get("volume") or 0.0) >= float(min_volume)]
+    markets = [m for m in context.get("markets", []) if isinstance(m, dict) and float(m.get("volume") or 0.0) >= float(min_volume)]
     if limit > 0:
         markets = markets[:limit]
     if not markets:
         raise RuntimeError("no replay markets after filters")
 
     replay_paper = output_dir / "paper_duel"
+    _ensure_safe_replay_output(paper_data_dir, recorder_data_dir, replay_paper)
     if replay_paper.exists():
         shutil.rmtree(replay_paper)
     _copy_bot_scripts(paper_data_dir, replay_paper)
@@ -524,6 +570,7 @@ def replay_session(
         "recorder_context": public_context(context),
         "bot_registry_ok": registry.get("ok"),
         "market_count": len(markets),
+        "market_ids": [str(market.get("market_id") or "") for market in markets],
         "agents": agents,
         "scores": scores,
         "state_path": str(replay_paper / "state.json"),

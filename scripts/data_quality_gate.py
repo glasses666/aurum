@@ -11,10 +11,13 @@ operators see hard breaks instead of silently fetching an unaudited fallback fee
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import pathlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import market_recorder
 
 TRADE_ALLOWED = "TRADE_ALLOWED"
 HOLD_ONLY = "HOLD_ONLY"
@@ -54,6 +57,10 @@ def _read_json(path: pathlib.Path) -> Tuple[Optional[Any], Optional[str]]:
         return json.loads(path.read_text(encoding="utf-8")), None
     except Exception as exc:
         return None, "parse:" + type(exc).__name__
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def _append_health_reasons(health: Any, reasons: List[str], stop_reasons: List[str]) -> Optional[Dict[str, Any]]:
@@ -144,6 +151,47 @@ def _finite_integer(value: Any) -> Optional[int]:
     if parsed is None or not parsed.is_integer():
         return None
     return int(parsed)
+
+
+def _tail_manifest_terminal_reason(root: pathlib.Path, health: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(health, dict):
+        return None
+    manifest = health.get("manifest") if isinstance(health.get("manifest"), dict) else None
+    if not isinstance(manifest, dict) or manifest.get("ok") is not True:
+        return None
+    if manifest.get("verification_scope") != "tail":
+        return None
+    capture_ts = str(health.get("ts") or "")
+    parsed_ts = parse_ts(capture_ts)
+    if not parsed_ts:
+        return None
+    expected_sequence = _finite_integer(manifest.get("latest_sequence"))
+    expected_hash = str(manifest.get("last_manifest_sha256") or "")
+    if expected_sequence is None or not expected_hash:
+        return "manifest_tail_terminal_mismatch"
+    day = parsed_ts.date().isoformat()
+    manifest_path = root / "raw" / "polymarket" / day / "manifest.jsonl"
+    try:
+        lines = [line for line in market_recorder.tail_text_lines(manifest_path, 1) if line.strip()]
+    except Exception:
+        return "manifest_tail_terminal_unreadable"
+    if not lines:
+        return "manifest_tail_terminal_unreadable"
+    try:
+        row = json.loads(lines[-1])
+    except Exception:
+        return "manifest_tail_terminal_unreadable"
+    if not isinstance(row, dict):
+        return "manifest_tail_terminal_unreadable"
+    manifest_hash = str(row.get("manifest_sha256") or "")
+    unsigned = {k: v for k, v in row.items() if k != "manifest_sha256"}
+    if manifest_hash != market_recorder.sha256_text(market_recorder.canonical_json(unsigned)):
+        return "manifest_tail_terminal_mismatch"
+    terminal_sequence = _finite_integer(row.get("sequence"))
+    terminal_ts = str(row.get("ts") or "")
+    if terminal_sequence != expected_sequence or manifest_hash != expected_hash or terminal_ts != capture_ts:
+        return "manifest_tail_terminal_mismatch"
+    return None
 
 
 def _market_payload_is_complete(market: Dict[str, Any]) -> bool:
@@ -252,6 +300,11 @@ def evaluate_data_quality_gate(
     if any(age is not None and age > max_stale_seconds for age in (health_age, latest_age)):
         reason_codes.append("recorder_stale")
     if isinstance(health, dict) and isinstance(latest, dict):
+        expected_latest_hash = health.get("latest_markets_sha256")
+        if not isinstance(expected_latest_hash, str) or not expected_latest_hash.strip():
+            reason_codes.append("latest_markets_hash_missing")
+        elif _canonical_hash(latest) != expected_latest_hash:
+            reason_codes.append("latest_markets_hash_mismatch")
         if str(health.get("ts") or "") != str(latest.get("ts") or ""):
             reason_codes.append("recorder_artifact_ts_mismatch")
         health_source_value = health.get("source") or health.get("recorder")
@@ -262,8 +315,32 @@ def evaluate_data_quality_gate(
             reason_codes.append("recorder_artifact_book_coverage_mismatch")
         if health.get("orderable_market_count") != latest.get("orderable_market_count"):
             reason_codes.append("recorder_artifact_orderable_count_mismatch")
+    tail_terminal_reason = _tail_manifest_terminal_reason(root, health)
+    if tail_terminal_reason:
+        reason_codes.append(tail_terminal_reason)
 
     all_reasons = stop_reasons + reason_codes
+    integrity_block_reasons = {
+        "missing_health_report",
+        "missing_latest_markets",
+        "latest_markets_hash_missing",
+        "latest_markets_hash_mismatch",
+        "recorder_artifact_ts_mismatch",
+        "recorder_artifact_source_mismatch",
+        "recorder_artifact_book_coverage_mismatch",
+        "recorder_artifact_orderable_count_mismatch",
+        "missing_manifest_verification",
+        "manifest_verification_failed",
+        "manifest_verification_scope_invalid",
+        "manifest_verification_empty",
+        "manifest_latest_sequence_invalid",
+        "manifest_tail_scope_invalid",
+        "manifest_full_scope_invalid",
+        "manifest_tail_terminal_mismatch",
+        "manifest_tail_terminal_unreadable",
+        "recorder_stale",
+    }
+    fallback_integrity_blocked = any(reason in integrity_block_reasons for reason in all_reasons)
     manifest_info: Dict[str, Any] = {}
     book_coverage_info: Dict[str, Any] = {}
     orderable_market_count: Optional[int] = None
@@ -290,7 +367,7 @@ def evaluate_data_quality_gate(
         "ok": decision == TRADE_ALLOWED,
         "decision": decision,
         "trade_allowed": decision == TRADE_ALLOWED,
-        "fallback_allowed": bool(allow_unaudited_fallback and decision != STOP_SERVICE),
+        "fallback_allowed": bool(allow_unaudited_fallback and decision != STOP_SERVICE and not fallback_integrity_blocked),
         "hold_only": decision == HOLD_ONLY,
         "stop_service": decision == STOP_SERVICE,
         "reason_codes": all_reasons,

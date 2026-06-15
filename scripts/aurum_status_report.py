@@ -13,6 +13,7 @@ import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
+import agent_duel as duel
 import data_quality_gate
 import generate_dashboard
 
@@ -35,6 +36,26 @@ def gate_status(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_se
     )
 
 
+def public_scoreboard_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    allowed = (
+        "agent_id",
+        "rank",
+        "score",
+        "raw_roi_score",
+        "roi",
+        "drawdown",
+        "open_positions",
+        "trade_count",
+        "order_count",
+        "risk_event_count",
+    )
+    public_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            public_rows.append({key: row.get(key) for key in allowed if key in row})
+    return public_rows
+
+
 def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_seconds: int) -> Dict[str, Any]:
     data_dir = pathlib.Path(data_dir)
     recorder_dir = pathlib.Path(recorder_dir)
@@ -45,6 +66,12 @@ def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_s
     backup = generate_dashboard.backup_status(data_dir)
     replay = generate_dashboard.replay_status(data_dir)
     ledger = generate_dashboard.risk_ledger_status(data_dir)
+    try:
+        state = duel.load_state(data_dir)
+        prices = duel.market_price_map(state.get("last_markets", []))
+        scoreboard = duel.scoreboard_context(state, prices)
+    except Exception:
+        scoreboard = {"competition": duel.competition_context(), "scoreboard": [], "victory": duel.victory_status([])}
     runtime_complete = bool(
         gate.get("decision") == data_quality_gate.TRADE_ALLOWED
         and recorder.get("ok") is True
@@ -62,6 +89,9 @@ def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_s
         "book_coverage": recorder.get("book_coverage", {}),
         "orderable_market_count": recorder.get("orderable_market_count"),
         "bot_registry": registry,
+        "competition": scoreboard.get("competition", {}),
+        "scoreboard": public_scoreboard_rows(scoreboard.get("scoreboard", [])),
+        "victory": scoreboard.get("victory", duel.victory_status([])),
         "backup": {k: v for k, v in backup.items() if k != "redacted"},
         "replay": replay,
         "risk_ledger": ledger,

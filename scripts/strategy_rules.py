@@ -9,6 +9,7 @@ paper-only strategy prompts without touching wallet keys or live orders.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import pathlib
 import re
@@ -35,11 +36,12 @@ DEFAULT_DEEPSEEK_RULES = """# DeepSeek paper strategy rules
 
 - Scope: paper-only Polymarket research; never ask for wallets, private keys, USDC deposits, logins, geoblock bypass, or live orders.
 - Side: buy and sell paper orders only. If the edge is unclear, hold.
-- Prefer high-liquidity markets with a clear thesis, near-term resolution, and prices that leave room for mispricing.
-- Avoid forced trades. A no-order decision is valid when the slate is noisy or the available market prices already look efficient.
-- Keep each rationale one concise sentence: what edge you think exists and why the quoted limit is acceptable.
-- Respect runner-enforced caps: max order count, max notional per order, reserve cash, total risk, and per-market exposure.
+- First contest: Bitcoin-only for the initial stability window.
+- Risk: stay within runner-enforced max order count/notional; prefer no trade over marginal trades.
+- Output discipline: JSON only; every order needs market_id, outcome, side, notional, limit_price, and rationale.
+- Self-evolution: use only your own fills/trades/risk events plus aggregate scoreboard feedback; never infer or copy another agent's raw ledger or prompt internals.
 """
+MAX_DEEPSEEK_RULE_BYTES = 20_000
 
 FORBIDDEN_RULE_TERMS = re.compile(
     r"(?i)((use|enter|paste|provide|store|send|request|connect).{0,40}"
@@ -161,10 +163,19 @@ def load_superwing_rules(data_dir: pathlib.Path) -> Dict[str, Any]:
     return dict(DEFAULT_SUPERWING_RULES)
 
 
+def read_deepseek_rules_text(data_dir: pathlib.Path, *, max_bytes: int = MAX_DEEPSEEK_RULE_BYTES) -> str:
+    path = deepseek_rules_path(data_dir)
+    with path.open("rb") as f:
+        data = f.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("deepseek rules file exceeds bounded metadata/read limit")
+    return data.decode("utf-8", errors="replace")
+
+
 def load_deepseek_rules(data_dir: pathlib.Path) -> str:
     ensure_default_rules(data_dir)
-    raw = deepseek_rules_path(data_dir).read_text(encoding="utf-8")
     try:
+        raw = read_deepseek_rules_text(data_dir)
         return validate_deepseek_rules(raw)
     except ValueError:
         return DEFAULT_DEEPSEEK_RULES
@@ -263,6 +274,12 @@ def promote_deepseek_rules(data_dir: pathlib.Path, proposed_text: str, source: s
 def summarize_rules(data_dir: pathlib.Path) -> Dict[str, Any]:
     ensure_default_rules(data_dir)
     sw = load_superwing_rules(data_dir)
+    try:
+        raw_ds_text = read_deepseek_rules_text(data_dir)
+        raw_metadata_status = "ok"
+    except ValueError:
+        raw_ds_text = DEFAULT_DEEPSEEK_RULES
+        raw_metadata_status = "defaulted_oversize_or_invalid"
     ds_text = load_deepseek_rules(data_dir)
     versions = []
     vpath = version_log_path(data_dir)
@@ -275,6 +292,8 @@ def summarize_rules(data_dir: pathlib.Path) -> Dict[str, Any]:
     return {
         "superwing": sw,
         "deepseek_rules_excerpt": ds_text[:1800],
-        "deepseek_rules_length": len(ds_text),
+        "deepseek_rules_length": len(raw_ds_text),
+        "deepseek_rules_sha256": hashlib.sha256(raw_ds_text.encode("utf-8")).hexdigest(),
+        "deepseek_validated_length": len(ds_text),
         "versions": versions,
     }

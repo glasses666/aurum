@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import pathlib
 import sys
@@ -13,6 +14,8 @@ import agent_duel
 import aurum_status_report
 import bot_scripts
 import generate_dashboard
+import strategy_rules
+import strategy_review
 
 
 class DashboardDataQualityTests(unittest.TestCase):
@@ -28,6 +31,167 @@ class DashboardDataQualityTests(unittest.TestCase):
                 rows = generate_dashboard.read_jsonl(path, limit=2)
 
         self.assertEqual([row["idx"] for row in rows], [3, 4])
+
+    def test_risk_ledger_status_uses_bounded_tail_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            ledger_path = data_dir / "risk_ledger.jsonl"
+            ledger_path.write_text(json.dumps({"idx": 1}) + "\n", encoding="utf-8")
+
+            with mock.patch.object(generate_dashboard, "read_jsonl", return_value=[{"idx": 1}, {"idx": 2}]) as read_jsonl:
+                status = generate_dashboard.risk_ledger_status(data_dir)
+
+        read_jsonl.assert_called_once_with(ledger_path, limit=500)
+        self.assertEqual(status["rows_sampled"], 2)
+        self.assertEqual(status["read_scope"], "tail")
+
+    def test_risk_ledger_status_does_not_label_tail_sample_as_total_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            ledger_path = data_dir / "risk_ledger.jsonl"
+            ledger_path.write_text("\n".join(json.dumps({"idx": idx}) for idx in range(600)) + "\n", encoding="utf-8")
+
+            status = generate_dashboard.risk_ledger_status(data_dir)
+
+        self.assertEqual(status["rows_sampled"], 500)
+        self.assertEqual(status["read_scope"], "tail")
+        self.assertNotIn("rows", status)
+
+    def test_strategy_review_context_includes_replay_feedback_for_self_evolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            agent_duel.init_state(data_dir, reset=True)
+            (data_dir / "reports").mkdir(parents=True)
+            (data_dir / "reports" / "replay_summary.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "audit",
+                        "risk_ledger_rows": 3,
+                        "bot_registry_ok": True,
+                        "findings": ["fee_churn_detected"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ctx = strategy_review.review_context(data_dir, limit_ticks=2)
+
+        self.assertEqual(ctx["replay_feedback"]["status"], "ok")
+        self.assertEqual(ctx["replay_feedback"]["risk_ledger_rows"], 3)
+        self.assertIn("Use own ledger/fills/risk_events/replay outcomes", ctx["self_evolution_contract"])
+
+    def test_strategy_review_agent_learning_context_is_peer_aggregate_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            state = agent_duel.init_state(data_dir, reset=True)
+            own = state["accounts"]["deepseek"]
+            own["trades"] = [{"market_id": "deep-own-market", "rationale": "deep own rationale", "fee": 0.01}]
+            peer = state["accounts"]["superwing"]
+            peer["trades"] = [{"market_id": "peer-secret-market", "rationale": "peer raw rationale", "fee": 0.02}]
+            agent_duel.save_state(data_dir, state)
+
+            shared_ctx = strategy_review.review_context(data_dir, limit_ticks=2)
+            shared_text = json.dumps(shared_ctx["agent_learning_contexts"], ensure_ascii=False, sort_keys=True)
+            isolated = strategy_review.agent_review_context(data_dir, "deepseek", limit_ticks=2)
+            deep_ctx = isolated["agent_learning_context"]
+            deep_text = json.dumps(deep_ctx, ensure_ascii=False, sort_keys=True)
+
+        self.assertNotIn("deep-own-market", shared_text)
+        self.assertNotIn("deep own rationale", shared_text)
+        self.assertNotIn("peer-secret-market", shared_text)
+        self.assertNotIn("peer raw rationale", shared_text)
+        self.assertEqual(isolated["target_agent_id"], "deepseek")
+        self.assertIn("deep-own-market", deep_text)
+        self.assertIn("deep own rationale", deep_text)
+        self.assertNotIn("peer-secret-market", deep_text)
+        self.assertNotIn("peer raw rationale", deep_text)
+        self.assertIn("peer_scoreboard", deep_ctx)
+        self.assertNotIn("recent_trades", deep_ctx["peer_scoreboard"][0])
+
+    def test_run_review_calls_model_once_per_agent_with_isolated_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            state = agent_duel.init_state(data_dir, reset=True)
+            state["accounts"]["deepseek"]["trades"] = [
+                {"market_id": "deep-own-market", "rationale": "deep own rationale", "fee": 0.01}
+            ]
+            state["accounts"]["superwing"]["trades"] = [
+                {"market_id": "peer-secret-market", "rationale": "peer raw rationale", "fee": 0.02}
+            ]
+            agent_duel.save_state(data_dir, state)
+            strategy_rules.ensure_default_rules(data_dir)
+            superwing_rules = strategy_rules.load_superwing_rules(data_dir)
+            superwing_rules["selection"] = "SUPERWING-PRIVATE-STRATEGY-INTERNAL paper buy hold"
+            strategy_rules.superwing_rules_path(data_dir).write_text(
+                json.dumps(superwing_rules, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            strategy_rules.deepseek_rules_path(data_dir).write_text(
+                "# DeepSeek paper rules\n- DEEPSEEK-PRIVATE-STRATEGY-INTERNAL: paper buy sell hold only.\n",
+                encoding="utf-8",
+            )
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            seen_contexts = {}
+
+            def fake_review_model(ctx):
+                agent = ctx["target_agent_id"]
+                seen_contexts[agent] = json.dumps(ctx, ensure_ascii=False, sort_keys=True)
+                if agent == "superwing":
+                    return {
+                        "summary": "SuperWing isolated review",
+                        "findings": ["superwing-own-ledger-only"],
+                        "superwing_rules": strategy_rules.load_superwing_rules(data_dir),
+                        "superwing_rationale": "Keep conservative paper-only settings after reviewing own ledger.",
+                        "bot_scripts": {"superwing": bot_scripts.load_bot_script(data_dir, "superwing")},
+                        "risk_notes": ["paper-only"],
+                        "public_dashboard_note": "SuperWing reviewed in an isolated lane.",
+                        "review_model": "mock-superwing",
+                    }
+                return {
+                    "summary": "DeepSeek isolated review",
+                    "findings": ["deepseek-own-ledger-only"],
+                    "deepseek_rules_md": strategy_rules.load_deepseek_rules(data_dir),
+                    "deepseek_rationale": "Keep paper-only buy/sell/hold rules after reviewing own ledger.",
+                    "bot_scripts": {"deepseek": bot_scripts.load_bot_script(data_dir, "deepseek")},
+                    "risk_notes": ["paper-only"],
+                    "public_dashboard_note": "DeepSeek reviewed in an isolated lane.",
+                    "review_model": "mock-deepseek",
+                }
+
+            with mock.patch.object(strategy_review, "call_review_model", side_effect=fake_review_model):
+                record = strategy_review.run_review(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        dashboard_dir=str(out_dir),
+                        operator_dashboard_dir="",
+                        limit_ticks=2,
+                        auto_promote=False,
+                        no_promote=True,
+                    )
+                )
+
+        self.assertEqual(set(seen_contexts), {"superwing", "deepseek"})
+        self.assertIn("deep-own-market", seen_contexts["deepseek"])
+        self.assertNotIn("peer-secret-market", seen_contexts["deepseek"])
+        self.assertIn("DEEPSEEK-PRIVATE-STRATEGY-INTERNAL", seen_contexts["deepseek"])
+        self.assertNotIn("SUPERWING-PRIVATE-STRATEGY-INTERNAL", seen_contexts["deepseek"])
+        self.assertIn("peer-secret-market", seen_contexts["superwing"])
+        self.assertNotIn("deep-own-market", seen_contexts["superwing"])
+        self.assertIn("SUPERWING-PRIVATE-STRATEGY-INTERNAL", seen_contexts["superwing"])
+        self.assertNotIn("DEEPSEEK-PRIVATE-STRATEGY-INTERNAL", seen_contexts["superwing"])
+        self.assertFalse(record["auto_promote"])
+        self.assertIn("per-agent-isolated", record["review_model"])
+
+    def test_redact_value_redacts_sensitive_dictionary_keys(self):
+        private_label = "aurum-" + "testhost-01"
+        safe = generate_dashboard.redact_value({private_label: {"ok": True}})
+
+        self.assertNotIn(private_label, safe)
+        self.assertIn("[redacted]", safe)
 
     def test_dashboard_shows_deepseek_awaiting_validated_strategy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,6 +382,56 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertEqual(manifest["view"], "public_trade_terminal_v3")
         self.assertEqual(manifest["scores"][0]["score_band"], "up")
 
+    def test_snapshot_records_ignore_tick_paths_outside_snapshot_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            data_dir.mkdir(parents=True)
+            outside = root / "outside.json"
+            outside.write_text(
+                json.dumps({"snapshot_id": "outside", "ts": "2026-06-14T03:30:00+00:00", "markets": [{"market_id": "leak"}]}),
+                encoding="utf-8",
+            )
+            ticks = [{"tick_id": "tampered", "snapshot_file": str(outside)}]
+
+            rows = generate_dashboard.snapshot_records(data_dir, ticks)
+
+        self.assertEqual(rows, [])
+
+    def test_snapshot_records_ignore_symlinked_snapshots_outside_snapshot_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            snapshot_dir = data_dir / "snapshots"
+            snapshot_dir.mkdir(parents=True)
+            outside = root / "outside.json"
+            outside.write_text(
+                json.dumps({"snapshot_id": "outside", "ts": "2026-06-14T03:30:00+00:00", "markets": [{"market_id": "leak"}]}),
+                encoding="utf-8",
+            )
+            (snapshot_dir / "linked.json").symlink_to(outside)
+
+            rows = generate_dashboard.snapshot_records(data_dir, [])
+
+        self.assertEqual(rows, [])
+
+    def test_snapshot_records_ignore_snapshot_root_symlink_outside_data_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            data_dir.mkdir(parents=True)
+            outside_dir = root / "external-snapshots"
+            outside_dir.mkdir()
+            (outside_dir / "external.json").write_text(
+                json.dumps({"snapshot_id": "external", "ts": "2026-06-14T03:30:00+00:00", "markets": [{"market_id": "leak"}]}),
+                encoding="utf-8",
+            )
+            (data_dir / "snapshots").symlink_to(outside_dir, target_is_directory=True)
+
+            rows = generate_dashboard.snapshot_records(data_dir, [])
+
+        self.assertEqual(rows, [])
+
     def test_operator_output_is_redacted_but_keeps_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -259,6 +473,266 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertNotIn(dummy_host, operator_json)
         self.assertNotIn(dummy_bearer, operator_json)
 
+    def test_redaction_hides_private_host_labels_but_keeps_book_coverage_counts(self):
+        private_label = "aurum-" + "testhost-01"
+
+        redacted = generate_dashboard.redact_value(
+            {
+                "message": f"probe failed on {private_label}",
+                "book_coverage": {"requested_tokens": 2, "ok_tokens": 1, "orderable_tokens": 1},
+                "token_id": "secret-token-id-like-value",
+            }
+        )
+
+        blob = json.dumps(redacted, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn(private_label, blob)
+        self.assertIn("[redacted]", blob)
+        self.assertEqual(redacted["book_coverage"]["requested_tokens"], 2)
+        self.assertEqual(redacted["book_coverage"]["ok_tokens"], 1)
+        self.assertEqual(redacted["book_coverage"]["orderable_tokens"], 1)
+        self.assertEqual(redacted["token_id"], "[redacted]")
+
+    def test_status_report_keeps_public_book_coverage_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (root / "reports").mkdir(parents=True)
+            (root / "reports" / "market_recorder_health.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "ts": "2026-06-14T03:30:00+00:00",
+                        "book_coverage": {"requested_tokens": 2, "ok_tokens": 1, "orderable_tokens": 1},
+                        "sources": {},
+                        "manifest": {"ok": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = aurum_status_report.build_report(data_dir, root, max_stale_seconds=999999999)
+
+        self.assertEqual(report["book_coverage"]["requested_tokens"], 2)
+        self.assertEqual(report["book_coverage"]["ok_tokens"], 1)
+
+    def test_public_dashboard_redacts_gate_and_manifest_strings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            private_label = "aurum-" + "testhost-01"
+            bearer = "Bearer " + "abcdefghijklmnop"
+            ssh_path = "/Users/example/" + ".ssh/aurum_key"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (data_dir / "ticks.jsonl").write_text(
+                json.dumps(
+                    {
+                        "tick_id": "sensitive-gate",
+                        "ts": "2026-06-14T03:30:00+00:00",
+                        "mode": "paper_apply",
+                        "loop_interval_sec": 15,
+                        "market_source": {"source": f"{private_label} recorder"},
+                        "data_quality_gate": {
+                            "decision": "HOLD_ONLY",
+                            "reason_codes": [f"remote {private_label} failed with {bearer} at {ssh_path}"],
+                            "book_coverage": {
+                                "requested_tokens": 2,
+                                "ok_tokens": 1,
+                                "orderable_tokens": 1,
+                                "token_id": "secret-token-id-like-value",
+                            },
+                            "universe": f"bitcoin via {private_label}",
+                        },
+                        "scores": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            public_blob = path.read_text(encoding="utf-8") + (out_dir / "manifest.json").read_text(encoding="utf-8")
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn(private_label, public_blob)
+        self.assertNotIn(bearer, public_blob)
+        self.assertNotIn(".ssh", public_blob)
+        self.assertNotIn("secret-token-id-like-value", public_blob)
+        self.assertEqual(manifest["runtime"]["data_quality_gate"]["book_coverage"]["requested_tokens"], 2)
+        self.assertEqual(manifest["runtime"]["data_quality_gate"]["book_coverage"]["ok_tokens"], 1)
+
+    def test_public_html_redacts_env_market_question_and_invalid_count_strings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            env_file = root / ".env"
+            private_label = "aurum-" + "testhost-01"
+            env_file.write_text(f"AURUM_DUEL_UNIVERSE=bitcoin via {private_label}\n", encoding="utf-8")
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            snapshot_dir = data_dir / "snapshots"
+            snapshot_dir.mkdir(parents=True)
+            (snapshot_dir / "sensitive.json").write_text(
+                json.dumps(
+                    {
+                        "snapshot_id": "sensitive",
+                        "ts": "2026-06-14T03:30:00+00:00",
+                        "markets": [
+                            {
+                                "market_id": "btc-sensitive",
+                                "question": f"Will Bitcoin route through {private_label}?",
+                                "outcomes": [{"name": "Yes", "price": 0.42}, {"name": "No", "price": 0.58}],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (data_dir / "ticks.jsonl").write_text(
+                json.dumps(
+                    {
+                        "tick_id": "invalid-counts",
+                        "ts": "2026-06-14T03:30:00+00:00",
+                        "mode": "paper_apply",
+                        "loop_interval_sec": 15,
+                        "market_source": {"source": "polymarket_market_recorder_v0"},
+                        "data_quality_gate": {
+                            "decision": "HOLD_ONLY",
+                            "reason_codes": [],
+                            "book_coverage": {"requested_tokens": private_label, "ok_tokens": 1},
+                            "orderable_market_count": private_label,
+                        },
+                        "scores": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file=str(env_file), output_dir=str(out_dir)))
+            public_blob = path.read_text(encoding="utf-8") + (out_dir / "manifest.json").read_text(encoding="utf-8")
+
+        self.assertNotIn(private_label, public_blob)
+        self.assertIn("[redacted]", public_blob)
+
+    def test_public_rule_panel_uses_metadata_not_raw_deepseek_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            raw_rule = "RAW STRATEGY PROMPT SECRET\n" + ("x" * 2000) + "\nTAIL UNIQUE RULE"
+            expected_hash = hashlib.sha256(raw_rule.encode("utf-8")).hexdigest()
+            agent_duel.init_state(data_dir, reset=True)
+            strategy_rules.ensure_default_rules(data_dir)
+            strategy_rules.deepseek_rules_path(data_dir).write_text(raw_rule, encoding="utf-8")
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = path.read_text(encoding="utf-8")
+
+        self.assertNotIn(raw_rule, html)
+        self.assertIn("deepseek_rules_sha256", html)
+        self.assertIn(expected_hash, html)
+
+    def test_public_html_redacts_review_and_runtime_scalar_strings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            private_label = "aurum-" + "testhost-01"
+            private_path = "/Users/example/" + ".ssh" + "/aurum_key"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            review_dir = data_dir / "strategy_reviews"
+            review_dir.mkdir(parents=True)
+            (review_dir / "review.json").write_text(
+                json.dumps({"review_id": "review-1", "summary": f"checked {private_label} at {private_path}"}),
+                encoding="utf-8",
+            )
+            (data_dir / "ticks.jsonl").write_text(
+                json.dumps(
+                    {
+                        "tick_id": "runtime-sensitive",
+                        "ts": "2026-06-14T03:30:00+00:00",
+                        "mode": "paper_apply",
+                        "loop_interval_sec": 15,
+                        "market_source": {"source": "polymarket_market_recorder_v0"},
+                        "data_quality_gate": {
+                            "decision": "HOLD_ONLY",
+                            "reason_codes": [],
+                            "recorder_age_seconds": private_label,
+                            "manifest_verification_scope": private_label,
+                            "manifest_verification_max_rows": private_label,
+                            "manifest_verification_verified_rows": private_label,
+                            "book_coverage": {"requested_tokens": 2, "ok_tokens": 1},
+                            "orderable_market_count": 1,
+                        },
+                        "scores": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            recorder_health = {
+                "ok": False,
+                "age_seconds": private_label,
+                "errors": [f"probe failed at {private_path}"],
+                "last_capture": {
+                    "market_count": private_label,
+                    "book_coverage": {"requested_tokens": private_label, "ok_tokens": 1},
+                    "sources": {"clob_book": {"ok_frames": private_label}},
+                    "manifest": {"ok": True, "verification_scope": private_label, "max_rows": private_label, "verified_rows": private_label},
+                    "orderable_market_count": private_label,
+                },
+            }
+
+            with mock.patch.object(generate_dashboard.market_recorder, "recorder_health", return_value=recorder_health):
+                path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            public_blob = path.read_text(encoding="utf-8") + (out_dir / "manifest.json").read_text(encoding="utf-8")
+
+        self.assertNotIn(private_label, public_blob)
+        self.assertNotIn(private_path, public_blob)
+        self.assertNotIn(".ssh", public_blob)
+        self.assertIn("[redacted]", public_blob)
+
+    def test_public_html_and_manifest_redact_tick_env_and_key_sinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            env_file = root / "aurum.env"
+            private_label = "aurum-" + "testhost-02"
+            env_file.write_text(
+                f"AURUM_DUEL_MODE={private_label}\nAURUM_FIRST_CONTEST_DAYS={private_label}\n",
+                encoding="utf-8",
+            )
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (data_dir / "ticks.jsonl").write_text(
+                json.dumps(
+                    {
+                        "tick_id": private_label,
+                        "ts": "2026-06-14T03:30:00+00:00",
+                        "mode": private_label,
+                        "effective_mode": private_label,
+                        "applied": False,
+                        private_label: {"nested": True},
+                        "data_quality_gate": {"decision": "HOLD_ONLY", "reason_codes": [private_label]},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file=str(env_file), output_dir=str(out_dir)))
+            public_blob = path.read_text(encoding="utf-8") + (out_dir / "manifest.json").read_text(encoding="utf-8")
+
+        self.assertNotIn(private_label, public_blob)
+        self.assertIn("[redacted]", public_blob)
+
     def test_status_report_includes_runtime_contract_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -278,8 +752,16 @@ class DashboardDataQualityTests(unittest.TestCase):
             "backup",
             "replay",
             "risk_ledger",
+            "competition",
+            "scoreboard",
+            "victory",
         ):
             self.assertIn(key, report)
+        self.assertEqual(report["competition"]["objective"], "rank_1_within_stability_window")
+        self.assertEqual(report["competition"]["victory_requires"], "rank_1_and_roi_gt_5pct_after_fees")
+        self.assertNotIn("details", report["scoreboard"][0])
+        for private_key in ("cash", "cash_available", "exposure", "fees_paid", "penalties"):
+            self.assertNotIn(private_key, report["scoreboard"][0])
 
 
 if __name__ == "__main__":

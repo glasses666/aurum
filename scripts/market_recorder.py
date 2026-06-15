@@ -784,8 +784,23 @@ def capture_once(
     atomic_write_json(data_dir / "features" / "polymarket_orderable_feed.json", orderable_feed)
     manifest_status = verify_manifest(data_dir, ts=ts)
     trades = trades_payload if isinstance(trades_payload, list) else market_items(trades_payload)
-    book_coverage_ok = bool(orderable_feed["requested_tokens"] > 0 and orderable_feed["ok_tokens"] == orderable_feed["requested_tokens"])
+    book_coverage = {
+        "requested_tokens": orderable_feed["requested_tokens"],
+        "ok_tokens": orderable_feed["ok_tokens"],
+        "orderable_tokens": orderable_feed["orderable_tokens"],
+        "coverage_ratio": orderable_feed["coverage_ratio"],
+        "orderable_ratio": orderable_feed["orderable_ratio"],
+    }
     orderable_market_count = sum(1 for row in orderable_feed["markets"] if row.get("orderable"))
+    latest_markets = {
+        "ts": ts,
+        "source": "polymarket_market_recorder_v0",
+        "markets": markets,
+        "book_coverage": book_coverage,
+        "orderable_market_count": orderable_market_count,
+    }
+    latest_markets_sha256 = sha256_text(canonical_json(latest_markets))
+    book_coverage_ok = bool(orderable_feed["requested_tokens"] > 0 and orderable_feed["ok_tokens"] == orderable_feed["requested_tokens"])
     summary_ok = bool(gamma_ok and clob_ok and trades_ok and markets and book_ok > 0 and book_coverage_ok and orderable_market_count > 0 and manifest_status.get("ok"))
     summary = {
         "ok": summary_ok,
@@ -797,25 +812,13 @@ def capture_once(
         "token_count": len(token_ids),
         "trade_count": len(trades) if isinstance(trades, list) else 0,
         "sources": sources,
-        "book_coverage": {
-            "requested_tokens": orderable_feed["requested_tokens"],
-            "ok_tokens": orderable_feed["ok_tokens"],
-            "orderable_tokens": orderable_feed["orderable_tokens"],
-            "coverage_ratio": orderable_feed["coverage_ratio"],
-            "orderable_ratio": orderable_feed["orderable_ratio"],
-        },
+        "book_coverage": book_coverage,
         "orderable_market_count": orderable_market_count,
+        "latest_markets_sha256": latest_markets_sha256,
         "manifest": manifest_status,
         "raw_day_dir": str(raw_day_dir(data_dir, ts)),
     }
     atomic_write_json(data_dir / "normalized" / "polymarket" / "latest_summary.json", summary)
-    latest_markets = {
-        "ts": ts,
-        "source": "polymarket_market_recorder_v0",
-        "markets": markets,
-        "book_coverage": summary["book_coverage"],
-        "orderable_market_count": summary["orderable_market_count"],
-    }
     atomic_write_json(data_dir / "normalized" / "polymarket" / "latest_markets.json", latest_markets)
     atomic_write_json(data_dir / "reports" / "market_recorder_health.json", summary)
     return summary

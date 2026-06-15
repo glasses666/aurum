@@ -22,9 +22,10 @@ PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("bearer", re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{12,}", re.I)),
     ("credential_assignment", re.compile(r"(?i)\b(api[_-]?key|secret|token|password|credential)\b\s*[:=]\s*['\"][^'\"]{8,}['\"]")),
-    ("ssh_path", re.compile(r"(?:^|[\s\"'])~?/.ssh/[^\s\"']+")),
+    ("ssh_path", re.compile(r"(?<![\w.-])(?:~?/|/)[^\s\"'`)\]\}>]*\.ssh/[^\s\"'`)\]\}>]+")),
     ("private_connection", re.compile(r"(?i)\b(?:ssh|postgres|mysql|mongodb|redis)://[^\s\"']+")),
     ("host_ip", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    ("private_host_label", re.compile(r"(?i)\baurum-[a-z0-9][a-z0-9-]*\d\b")),
 )
 REDACT_PATTERNS = tuple(pattern for _, pattern in PATTERNS)
 
@@ -86,7 +87,7 @@ def scan_diff(diff_text: str) -> List[Tuple[str, str, str]]:
             continue
         for name, pattern in PATTERNS:
             if pattern.search(text):
-                findings.append((current_path or "<unknown>", name, redact(text)))
+                findings.append((redact(current_path or "<unknown>"), name, redact(text)))
     return findings
 
 
@@ -101,7 +102,7 @@ def scan_extra_files(paths: Iterable[str]) -> List[Tuple[str, str, str]]:
                 continue
             for name, pattern in PATTERNS:
                 if pattern.search(line):
-                    findings.append((str(path), name, redact(line)))
+                    findings.append((redact(str(path)), name, redact(line)))
     return findings
 
 

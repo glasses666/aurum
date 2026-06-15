@@ -12,8 +12,8 @@ Read-only access and network checks only:
 
 - SSH key authentication as `root`;
 - host snapshot (`whoami`, `hostname`, `uname`, `python3 --version`, `df`, `free`, `date`);
-- copied the read-only preflight script to `/tmp/aurum-vps-preflight.py`;
-- ran `python3 /tmp/aurum-vps-preflight.py --json --timeout 12` three times;
+- copied the read-only preflight script to `/tmp/[REDACTED_HOST].py`;
+- ran `python3 /tmp/[REDACTED_HOST].py --json --timeout 12` three times;
 - no package installation;
 - no service deployment;
 - no firewall changes;
@@ -23,8 +23,8 @@ Read-only access and network checks only:
 
 - IP: `[REDACTED_IP]`
 - User: `root`
-- Hostname: `aurum-tokyo-01`
-- Kernel: `Linux aurum-tokyo-01 6.8.0-124-generic #124-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 13:00:45 UTC 2026 x86_64`
+- Hostname: `[REDACTED_HOST]`
+- Kernel: `Linux [REDACTED_HOST] 6.8.0-124-generic #124-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 13:00:45 UTC 2026 x86_64`
 - Python: `Python 3.12.3`
 - Disk `/`: `52G` total, `8.8G` used, `40G` available, `19%` used
 - Memory: `1.9Gi` total, `1.6Gi` available
@@ -34,7 +34,7 @@ Read-only access and network checks only:
 
 - TCP `[REDACTED_IP]:22`: reachable
 - SSH key login: successful
-- Local key used: `/Users/dracoglasser/.ssh/aurum_vultr_20260613_ed25519`
+- Local key used: `[REDACTED_SSH_PATH]`
 
 ## Preflight runs
 

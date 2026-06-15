@@ -64,15 +64,15 @@ It is read-only: no login, no credentials, no orders.
 From Draco Mac, after SSH access is available:
 
 ```bash
-scp /Users/dracoglasser/workspace/aurum/scripts/vps_network_preflight.py USER@GUANGZHOU_SERVER:/tmp/aurum-vps-preflight.py
-ssh USER@GUANGZHOU_SERVER 'python3 /tmp/aurum-vps-preflight.py --json'
+scp /Users/dracoglasser/workspace/aurum/scripts/vps_network_preflight.py USER@GUANGZHOU_SERVER:/tmp/[REDACTED_HOST].py
+ssh USER@GUANGZHOU_SERVER 'python3 /tmp/[REDACTED_HOST].py --json'
 ```
 
 If SSH uses a key or non-standard port:
 
 ```bash
-scp -P PORT -i /path/to/key /Users/dracoglasser/workspace/aurum/scripts/vps_network_preflight.py USER@GUANGZHOU_SERVER:/tmp/aurum-vps-preflight.py
-ssh -p PORT -i /path/to/key USER@GUANGZHOU_SERVER 'python3 /tmp/aurum-vps-preflight.py --json'
+scp -P PORT -i /path/to/key /Users/dracoglasser/workspace/aurum/scripts/vps_network_preflight.py USER@GUANGZHOU_SERVER:/tmp/[REDACTED_HOST].py
+ssh -p PORT -i /path/to/key USER@GUANGZHOU_SERVER 'python3 /tmp/[REDACTED_HOST].py --json'
 ```
 
 ## SSH information needed
