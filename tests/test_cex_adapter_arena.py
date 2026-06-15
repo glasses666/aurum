@@ -202,6 +202,8 @@ class CexAdapterArenaTests(unittest.TestCase):
             html = (out_dir / "index.html").read_text()
             manifest = json.loads((out_dir / "manifest.json").read_text())
 
+        self.assertIn("Aurum CEX Paper Arena", html)
+        self.assertIn("CEX 传统量化 paper canary", html)
         self.assertIn("CEX Traditional Quant", html)
         self.assertEqual(manifest["cex"]["completion_state"], "runtime-complete")
         self.assertEqual(manifest["cex"]["latest_market"]["exchange"], "okx")

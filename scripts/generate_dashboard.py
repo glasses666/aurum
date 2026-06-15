@@ -1659,6 +1659,12 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     runtime["victory"] = victory
     runtime["lanes"] = public_lane_summary(data_dir, scores)
     cex_summary = public_cex_summary(data_dir)
+    raw_cex_latest = cex_summary.get("latest_market")
+    cex_latest: Dict[str, Any] = raw_cex_latest if isinstance(raw_cex_latest, dict) else {}
+    cex_market_text = f"{cex_latest.get('exchange') or '—'} · {cex_latest.get('symbol') or '—'}"
+    cex_last_text = fmt_price(cex_latest.get("last"))
+    cex_spread_text = public_count(cex_latest.get("spread_bps"))
+    cex_funding_text = public_count(cex_latest.get("funding_rate"))
     updated_at = utc_now()
     universe = env.get("AURUM_DUEL_UNIVERSE", "bitcoin").lower() or "bitcoin"
     contest_days = env.get("AURUM_FIRST_CONTEST_DAYS", "7")
@@ -1677,16 +1683,16 @@ def render(args: argparse.Namespace) -> pathlib.Path:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex,nofollow" />
-  <title>Aurum BTC Paper Duel 公共终端</title>
+  <title>Aurum CEX Paper Arena 公共终端</title>
   <style>{CSS}</style>
 </head>
 <body>
   <main class="terminal">
     <aside class="left-rail">
       <section class="rail-section">
-        <div class="rail-title"><span>比赛 Contest</span><span class="pill amber">first {esc(contest_days_text)} days</span></div>
-        <div class="big-number">BTC only</div>
-        <div class="caption">第一版只交易 Bitcoin 相关 Polymarket 市场。paper engine 消费独立 market_recorder 的同源数据；agent 只比策略，不比谁抓到不同盘口。</div>
+        <div class="rail-title"><span>主线 Mainline</span><span class="pill green">CEX canary</span></div>
+        <div class="big-number">CEX paper</div>
+        <div class="caption">主线已切到 CEX public perp frame + local paper ledger。Polymarket 预测盘保留为支线/历史对照；当前页顶部优先展示传统量化 canary。</div>
       </section>
       <section class="rail-section">
         <div class="rail-title"><span>Recorder</span><span>市场数据 market data</span></div>
@@ -1721,15 +1727,15 @@ def render(args: argparse.Namespace) -> pathlib.Path:
 
     <section class="center-stage">
       <div class="topbar">
-        <div class="brand"><h1>Aurum BTC Paper Duel</h1><span>paper-only · no wallet · no live order</span></div>
+        <div class="brand"><h1>Aurum CEX Paper Arena</h1><span>traditional quant · paper-only · no wallet · no live order</span></div>
         <div class="meta"><span>生成 {esc(updated_at)}</span><span>ticks {len(ticks)}</span><span>btc frames {len(btc)}</span></div>
       </div>
       {data_quality_banner(latest_tick, ticks, env)}
       <div class="chart-wrap">
         <div class="chart-title">
           <div>
-            <h2>BTC Yes 概率曲线 × agent ROI</h2>
-            <p>{esc_public(market_question)} · latest BTC market price {fmt_price(latest_btc_price)} · source {esc_public(btc_source)} · chart {esc_public(btc_summary.get('status_label'))}</p>
+            <h2>CEX 传统量化 paper canary</h2>
+            <p>{esc_public(cex_market_text)} · last {esc(cex_last_text)} · spread {esc_public(cex_spread_text)} bps · funding {esc_public(cex_funding_text)}。旧 Polymarket BTC Yes 概率曲线保留为支线对照：{esc_public(market_question)}。</p>
           </div>
           <div class="legend-line">
             <span style="color:var(--btc)">● BTC Yes 概率</span>
