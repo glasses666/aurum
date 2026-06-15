@@ -320,6 +320,55 @@ class RecorderReplayTests(unittest.TestCase):
         self.assertEqual(first["risk_ledger_hash"], second["risk_ledger_hash"])
         self.assertGreater(first["risk_ledger_rows"], 0)
 
+    def test_replay_summary_uses_bounded_tail_reader_for_risk_ledger_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            recorder_dir = root / "recorder"
+            paper_dir = root / "paper"
+            self.capture(recorder_dir)
+            bot_scripts.ensure_default_bot_scripts(paper_dir)
+            ledger_path = recorder_replay.risk_ledger_path(paper_dir)
+            original_read_text = pathlib.Path.read_text
+
+            def guarded_read_text(path, *args, **kwargs):
+                if pathlib.Path(path) == ledger_path:
+                    raise AssertionError("full risk ledger read")
+                return original_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(pathlib.Path, "read_text", guarded_read_text):
+                summary = recorder_replay.replay_session(
+                    recorder_data_dir=recorder_dir,
+                    paper_data_dir=paper_dir,
+                    output_dir=root / "replay-tail",
+                )
+
+        self.assertEqual(summary["risk_ledger_read_scope"], "tail")
+        self.assertGreater(summary["risk_ledger_rows"], 0)
+        self.assertTrue(summary["risk_ledger_hash"])
+
+    def test_replay_fails_closed_on_invalid_risk_ledger_tail_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            recorder_dir = root / "recorder"
+            paper_dir = root / "paper"
+            self.capture(recorder_dir)
+            bot_scripts.ensure_default_bot_scripts(paper_dir)
+            original_validate = recorder_replay.duel.validate_and_apply
+
+            def tampering_validate(data_dir, *args, **kwargs):
+                result = original_validate(data_dir, *args, **kwargs)
+                with recorder_replay.risk_ledger_path(pathlib.Path(data_dir)).open("a", encoding="utf-8") as f:
+                    f.write("{tampered-risk-ledger-json\n")
+                return result
+
+            with mock.patch.object(recorder_replay.duel, "validate_and_apply", side_effect=tampering_validate):
+                with self.assertRaisesRegex(RuntimeError, "risk ledger json"):
+                    recorder_replay.replay_session(
+                        recorder_data_dir=recorder_dir,
+                        paper_data_dir=paper_dir,
+                        output_dir=root / "replay-tampered-ledger",
+                    )
+
     def test_replay_uses_requested_historical_capture_markets_not_current_latest(self):
         first_ts = "2026-06-14T03:30:00+00:00"
         second_ts = "2026-06-14T03:31:00+00:00"

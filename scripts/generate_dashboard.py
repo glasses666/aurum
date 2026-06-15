@@ -703,10 +703,15 @@ def latest_json_candidate(paths: Iterable[pathlib.Path]) -> Optional[Dict[str, A
     return None
 
 
-def public_recorder_summary(data_dir: pathlib.Path) -> Dict[str, Any]:
+def public_recorder_summary(
+    data_dir: pathlib.Path,
+    recorder_dir: Optional[pathlib.Path] = None,
+    max_stale_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    root = pathlib.Path(recorder_dir) if recorder_dir is not None else recorder_data_root(data_dir)
     health = market_recorder.recorder_health(
-        recorder_data_root(data_dir),
-        max_stale_seconds=int(os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180")),
+        root,
+        max_stale_seconds=int(max_stale_seconds if max_stale_seconds is not None else os.environ.get("AURUM_RECORDER_MAX_STALE_SECONDS", "180")),
     )
     last = health.get("last_capture", {}) if isinstance(health.get("last_capture"), dict) else {}
     manifest = last.get("manifest") if isinstance(last.get("manifest"), dict) else {}
@@ -739,11 +744,16 @@ def public_gate_summary(latest_tick: Dict[str, Any]) -> Dict[str, Any]:
     if not gate:
         market_source = latest_tick.get("market_source") if isinstance(latest_tick.get("market_source"), dict) else {}
         gate = market_source.get("data_quality_gate") if isinstance(market_source.get("data_quality_gate"), dict) else {}
+    gate = gate if isinstance(gate, dict) else {}
+    raw_reason_codes = gate.get("reason_codes", [])
+    reason_codes = safe_errors(raw_reason_codes) if isinstance(raw_reason_codes, list) else ["invalid_reason_codes"]
     return {
         "decision": gate.get("decision", "UNKNOWN"),
-        "trade_allowed": bool(gate.get("trade_allowed")),
-        "hold_only": bool(gate.get("hold_only")),
-        "reason_codes": safe_errors(gate.get("reason_codes", [])),
+        "ok": gate.get("ok") is True,
+        "trade_allowed": gate.get("trade_allowed") is True,
+        "hold_only": gate.get("hold_only") is True,
+        "stop_service": gate.get("stop_service") is True,
+        "reason_codes": reason_codes,
         "recorder_age_seconds": gate.get("recorder_age_seconds"),
         "book_coverage": gate.get("book_coverage") if isinstance(gate.get("book_coverage"), dict) else {},
         "orderable_market_count": gate.get("orderable_market_count"),
@@ -774,22 +784,28 @@ def public_bot_registry_summary(data_dir: pathlib.Path) -> Dict[str, Any]:
     }
 
 
-def backup_status(data_dir: pathlib.Path) -> Dict[str, Any]:
-    root = recorder_data_root(data_dir)
-    candidates = (
-        data_dir / "reports" / "aurum_stability_backup_status.json",
-        data_dir / "reports" / "stability_backup_status.json",
+def backup_status(data_dir: pathlib.Path, recorder_dir: Optional[pathlib.Path] = None) -> Dict[str, Any]:
+    root = pathlib.Path(recorder_dir) if recorder_dir is not None else recorder_data_root(data_dir)
+    candidates = [
         root / "reports" / "aurum_stability_backup_status.json",
         root / "reports" / "stability_backup_status.json",
         root / "reports" / "backup_status.json",
-    )
+    ]
+    if recorder_dir is None:
+        candidates.extend(
+            [
+                data_dir / "reports" / "aurum_stability_backup_status.json",
+                data_dir / "reports" / "stability_backup_status.json",
+            ]
+        )
     payload = latest_json_candidate(candidates)
     if not payload:
         return {"ok": None, "status": "missing"}
     safe = redact_value(payload)
+    ok = payload.get("ok") is True
     return {
-        "ok": bool(payload.get("ok")),
-        "status": "ok" if payload.get("ok") else "check",
+        "ok": ok,
+        "status": "ok" if ok else "check",
         "artifact_count": payload.get("artifact_count") or payload.get("file_count") or payload.get("snapshot_count"),
         "contains_recorder_raw": bool(payload.get("contains_recorder_raw") or payload.get("recorder_raw")),
         "contains_manifest": bool(payload.get("contains_manifest") or payload.get("manifest")),
@@ -799,22 +815,27 @@ def backup_status(data_dir: pathlib.Path) -> Dict[str, Any]:
     }
 
 
-def replay_status(data_dir: pathlib.Path) -> Dict[str, Any]:
-    root = recorder_data_root(data_dir)
-    payload = latest_json_candidate(
-        (
-            data_dir / "replay_summary.json",
-            data_dir / "reports" / "replay_summary.json",
-            data_dir / "replays",
-            root / "reports" / "replay_summary.json",
-            root / "replays",
+def replay_status(data_dir: pathlib.Path, recorder_dir: Optional[pathlib.Path] = None) -> Dict[str, Any]:
+    root = pathlib.Path(recorder_dir) if recorder_dir is not None else recorder_data_root(data_dir)
+    candidates = [
+        root / "reports" / "replay_summary.json",
+        root / "replays",
+    ]
+    if recorder_dir is None:
+        candidates.extend(
+            [
+                data_dir / "replay_summary.json",
+                data_dir / "reports" / "replay_summary.json",
+                data_dir / "replays",
+            ]
         )
-    )
+    payload = latest_json_candidate(candidates)
     if not payload:
         return {"ok": None, "status": "missing"}
+    ok = payload.get("ok") is True
     return {
-        "ok": bool(payload.get("ok")),
-        "status": "ok" if payload.get("ok") else "check",
+        "ok": ok,
+        "status": "ok" if ok else "check",
         "mode": payload.get("mode"),
         "market_count": payload.get("market_count"),
         "bot_registry_ok": payload.get("bot_registry_ok"),
@@ -830,6 +851,42 @@ def risk_ledger_status(data_dir: pathlib.Path) -> Dict[str, Any]:
     return {"ok": True, "status": "present", "rows_sampled": len(rows), "read_scope": "tail"}
 
 
+def runtime_is_complete(
+    gate: Dict[str, Any],
+    recorder: Dict[str, Any],
+    registry: Dict[str, Any],
+    backup: Dict[str, Any],
+    replay: Dict[str, Any],
+    ledger: Dict[str, Any],
+) -> bool:
+    raw_reason_codes = gate.get("reason_codes")
+    if not isinstance(raw_reason_codes, list):
+        return False
+    raw_rows_sampled = ledger.get("rows_sampled")
+    if raw_rows_sampled is None or isinstance(raw_rows_sampled, bool):
+        return False
+    try:
+        rows_sampled = float(raw_rows_sampled)
+    except Exception:
+        return False
+    if not math.isfinite(rows_sampled) or rows_sampled <= 0:
+        return False
+    return bool(
+        gate.get("decision") == "TRADE_ALLOWED"
+        and gate.get("ok") is True
+        and gate.get("trade_allowed") is True
+        and gate.get("hold_only") is not True
+        and gate.get("stop_service") is not True
+        and not raw_reason_codes
+        and recorder.get("ok") is True
+        and registry.get("ok") is True
+        and backup.get("ok") is True
+        and replay.get("ok") is True
+        and ledger.get("ok") is True
+        and rows_sampled > 0
+    )
+
+
 def public_runtime_status(data_dir: pathlib.Path, latest_tick: Dict[str, Any]) -> Dict[str, Any]:
     recorder = public_recorder_summary(data_dir)
     registry = public_bot_registry_summary(data_dir)
@@ -837,12 +894,7 @@ def public_runtime_status(data_dir: pathlib.Path, latest_tick: Dict[str, Any]) -
     replay = replay_status(data_dir)
     ledger = risk_ledger_status(data_dir)
     gate = public_gate_summary(latest_tick)
-    runtime_complete = bool(
-        gate.get("decision") == "TRADE_ALLOWED"
-        and recorder.get("ok") is True
-        and registry.get("ok") is True
-        and backup.get("ok") is True
-    )
+    runtime_complete = runtime_is_complete(gate, recorder, registry, backup, replay, ledger)
     return {
         "completion_state": "runtime-complete" if runtime_complete else "code-complete-only",
         "data_quality_gate": gate,
@@ -1219,6 +1271,15 @@ def recorder_data_root(data_dir: pathlib.Path) -> pathlib.Path:
     return data_dir
 
 
+def validate_operator_output_dir(output_dir: pathlib.Path, operator_output: str) -> None:
+    if not operator_output:
+        return
+    public_root = output_dir.expanduser().resolve(strict=False)
+    operator_root = pathlib.Path(operator_output).expanduser().resolve(strict=False)
+    if operator_root == public_root or public_root in operator_root.parents or operator_root in public_root.parents:
+        raise ValueError("operator_output_dir must not overlap public dashboard output_dir")
+
+
 def recorder_panel(data_dir: pathlib.Path) -> str:
     summary = public_recorder_summary(data_dir)
     sources = summary.get("sources", {}) if isinstance(summary.get("sources"), dict) else {}
@@ -1323,6 +1384,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     out_dir = pathlib.Path(args.output_dir)
     env_file = pathlib.Path(args.env_file) if args.env_file else None
     operator_output = str(getattr(args, "operator_output_dir", "") or os.environ.get("AURUM_OPERATOR_DASHBOARD_DIR", "")).strip()
+    validate_operator_output_dir(out_dir, operator_output)
     duel.ensure_data_dir(data_dir)
     strategy_rules.ensure_default_rules(data_dir)
     env = env_public(env_file)
@@ -1340,7 +1402,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     ])
     latest_tick = ticks[-1] if ticks else {}
     btc, latest_btc_market, btc_source = bitcoin_series(data_dir, ticks, state)
-    roi: Dict[str, List[Dict[str, Any]]] = {}
+    roi = roi_series(ticks, state, scores)
     public_events = public_tick_events(ticks)
     operator_events = extract_trade_events(ticks, decisions)
     runtime = public_runtime_status(data_dir, latest_tick)

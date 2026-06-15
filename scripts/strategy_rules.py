@@ -14,6 +14,7 @@ import json
 import pathlib
 import re
 import shutil
+from collections import deque
 from typing import Any, Dict, Optional
 
 DEFAULT_SUPERWING_RULES: Dict[str, Any] = {
@@ -271,6 +272,25 @@ def promote_deepseek_rules(data_dir: pathlib.Path, proposed_text: str, source: s
     return dest
 
 
+def _tail_jsonl(path: pathlib.Path, limit: int) -> list[Dict[str, Any]]:
+    if limit <= 0 or not path.exists():
+        return []
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = deque((line.rstrip("\n") for line in f if line.strip()), maxlen=limit)
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    except Exception:
+        return []
+    return rows
+
+
 def summarize_rules(data_dir: pathlib.Path) -> Dict[str, Any]:
     ensure_default_rules(data_dir)
     sw = load_superwing_rules(data_dir)
@@ -281,14 +301,7 @@ def summarize_rules(data_dir: pathlib.Path) -> Dict[str, Any]:
         raw_ds_text = DEFAULT_DEEPSEEK_RULES
         raw_metadata_status = "defaulted_oversize_or_invalid"
     ds_text = load_deepseek_rules(data_dir)
-    versions = []
-    vpath = version_log_path(data_dir)
-    if vpath.exists():
-        try:
-            lines = vpath.read_text(encoding="utf-8").splitlines()[-12:]
-            versions = [json.loads(line) for line in lines if line.strip()]
-        except Exception:
-            versions = []
+    versions = _tail_jsonl(version_log_path(data_dir), 12)
     return {
         "superwing": sw,
         "deepseek_rules_excerpt": ds_text[:1800],

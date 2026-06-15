@@ -562,8 +562,18 @@ def replay_session(
     scores.sort(key=lambda row: row["score"], reverse=True)
     ledger_rows = []
     ledger_path = risk_ledger_path(replay_paper)
+    risk_ledger_read_scope = "tail"
     if ledger_path.exists():
-        ledger_rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        for line in reversed(list(market_recorder.iter_tail_text_lines(ledger_path, max_lines=500))):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception as exc:
+                raise RuntimeError("risk ledger json error") from exc
+            if not isinstance(row, dict):
+                raise RuntimeError("risk ledger row schema error")
+            ledger_rows.append(row)
     summary = {
         "ok": True,
         "mode": "recorder_replay",
@@ -576,6 +586,8 @@ def replay_session(
         "state_path": str(replay_paper / "state.json"),
         "risk_ledger_path": str(ledger_path),
         "risk_ledger_rows": len(ledger_rows),
+        "risk_ledger_read_scope": risk_ledger_read_scope,
+        "risk_ledger_rows_sampled": len(ledger_rows),
         "account_state_hash": hash_json(final_state.get("accounts", {})),
         "risk_ledger_hash": hash_json(ledger_rows),
     }

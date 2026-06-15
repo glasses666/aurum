@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import random
@@ -69,8 +70,18 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def json_safe_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else "[non-finite-number]"
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe_value(item) for item in value]
+    return value
+
+
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(json_safe_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def sha256_json(value: Any) -> str:
@@ -102,7 +113,7 @@ def risk_ledger_path(data_dir: pathlib.Path) -> pathlib.Path:
 def append_jsonl(path: pathlib.Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        f.write(json.dumps(json_safe_value(record), ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n")
 
 
 def append_risk_ledger(data_dir: pathlib.Path, record: Dict[str, Any]) -> None:
@@ -244,7 +255,7 @@ def load_state(data_dir: pathlib.Path) -> Dict[str, Any]:
 def save_state(data_dir: pathlib.Path, state: Dict[str, Any], *, now_fn: Callable[[], str] = utc_now) -> None:
     state["updated_at"] = now_fn()
     tmp = state_path(data_dir).with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(json_safe_value(state), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
     tmp.replace(state_path(data_dir))
 
 
@@ -341,6 +352,21 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def require_finite_float(value: Any, field: str, default: Optional[float] = None) -> float:
+    if value is None or value == "":
+        if default is None:
+            raise DuelError(f"{field} must be finite")
+        parsed = default
+    else:
+        try:
+            parsed = float(value)
+        except Exception as exc:
+            raise DuelError(f"{field} must be finite") from exc
+    if not math.isfinite(parsed):
+        raise DuelError(f"{field} must be finite")
+    return parsed
 
 
 def optional_bool(value: Any) -> Optional[bool]:
@@ -988,7 +1014,10 @@ def deepseek_prompt(
 def extract_json_object(text: str) -> Dict[str, Any]:
     text = text.strip()
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(
+            text,
+            parse_constant=lambda constant: (_ for _ in ()).throw(ValueError(f"non-finite JSON constant: {constant}")),
+        )
     except Exception as exc:
         raise DuelError("DeepSeek response must be exactly one valid JSON object") from exc
     if not isinstance(parsed, dict):
@@ -1203,14 +1232,14 @@ def validate_and_apply(
                     break
             if not outcome:
                 raise DuelError("unknown outcome")
-            observed_price = float(outcome["price"])
-            limit_price = to_float(order.get("limit_price"), 0.0)
+            observed_price = require_finite_float(outcome.get("price"), "observed_price")
+            limit_price = require_finite_float(order.get("limit_price"), "limit_price", 0.0)
             if not (0.01 <= limit_price <= 0.99):
                 raise DuelError("valid limit_price is required")
             pos_key = market_id + "::" + str(outcome["name"])
 
             if side == "buy":
-                requested_notional = to_float(order.get("notional"), 0.0)
+                requested_notional = require_finite_float(order.get("notional"), "notional", 0.0)
                 if requested_notional > max_notional_per_order:
                     raise DuelError(f"notional {requested_notional:.4f} exceeds configured cap {max_notional_per_order:.4f}")
                 notional = requested_notional
@@ -1227,9 +1256,9 @@ def validate_and_apply(
                 if book_walk is not None:
                     if not book_walk.get("ok"):
                         raise DuelError(str(book_walk.get("reason") or "recorded_book_walk_rejected"))
-                    fill_price = float(book_walk["fill_price"])
-                    shares = float(book_walk["shares"])
-                    notional = float(book_walk["notional"])
+                    fill_price = require_finite_float(book_walk.get("fill_price"), "recorded fill_price")
+                    shares = require_finite_float(book_walk.get("shares"), "recorded shares")
+                    notional = require_finite_float(book_walk.get("notional"), "recorded notional")
                     fill_source = "recorded_orderbook_depth"
                 else:
                     book_walk = {}
@@ -1324,9 +1353,9 @@ def validate_and_apply(
                 existing = account["positions"].get(pos_key)
                 if not existing:
                     raise DuelError("cannot sell without an open position")
-                held_shares = float(existing.get("shares", 0.0))
-                requested_shares = to_float(order.get("shares"), 0.0)
-                requested_notional = to_float(order.get("notional"), 0.0)
+                held_shares = require_finite_float(existing.get("shares", 0.0), "held shares", 0.0)
+                requested_shares = require_finite_float(order.get("shares"), "shares", 0.0)
+                requested_notional = require_finite_float(order.get("notional"), "notional", 0.0)
                 if requested_shares <= 0 and requested_notional > 0:
                     requested_shares = requested_notional / max(0.01, observed_price)
                 shares = min(held_shares, requested_shares)
@@ -1343,8 +1372,8 @@ def validate_and_apply(
                 if book_walk is not None:
                     if not book_walk.get("ok"):
                         raise DuelError(str(book_walk.get("reason") or "recorded_book_walk_rejected"))
-                    fill_price = float(book_walk["fill_price"])
-                    shares = float(book_walk["shares"])
+                    fill_price = require_finite_float(book_walk.get("fill_price"), "recorded fill_price")
+                    shares = require_finite_float(book_walk.get("shares"), "recorded shares")
                     fill_source = "recorded_orderbook_depth"
                 else:
                     book_walk = {}
@@ -1420,7 +1449,8 @@ def validate_and_apply(
                     },
                 )
         except Exception as exc:
-            rejection = {"ts": now_fn(), "agent_id": agent_id, "order": order, "reason": str(exc)}
+            safe_order = json_safe_value(order)
+            rejection = {"ts": now_fn(), "agent_id": agent_id, "order": safe_order, "reason": str(exc)}
             rejections.append(rejection)
             if apply:
                 account.setdefault("risk_events", []).append(rejection)
@@ -1434,7 +1464,7 @@ def validate_and_apply(
                     "order_id": order_id,
                     "applied": bool(apply),
                     "execution_context": risk_ledger_context(execution_context),
-                    "order": order,
+                    "order": safe_order,
                     "rejection_reason": str(exc),
                     "account_delta": {"before": account_before, "after": account_digest(account)},
                 },

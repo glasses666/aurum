@@ -57,6 +57,29 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertEqual(status["read_scope"], "tail")
         self.assertNotIn("rows", status)
 
+    def test_strategy_rule_summary_versions_uses_bounded_tail_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            strategy_rules.ensure_default_rules(data_dir)
+            version_log = strategy_rules.version_log_path(data_dir)
+            version_log.write_text(
+                "\n".join(json.dumps({"idx": idx, "action": "promote"}) for idx in range(20)) + "\n",
+                encoding="utf-8",
+            )
+            original_read_text = pathlib.Path.read_text
+
+            def guarded_read_text(path, *args, **kwargs):
+                if pathlib.Path(path) == version_log:
+                    raise AssertionError("full version log read")
+                return original_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(pathlib.Path, "read_text", guarded_read_text):
+                summary = strategy_rules.summarize_rules(data_dir)
+
+        self.assertEqual(len(summary["versions"]), 12)
+        self.assertEqual(summary["versions"][0]["idx"], 8)
+        self.assertEqual(summary["versions"][-1]["idx"], 19)
+
     def test_strategy_review_context_includes_replay_feedback_for_self_evolution(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = pathlib.Path(tmp) / "paper_duel"
@@ -108,6 +131,39 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertNotIn("peer raw rationale", deep_text)
         self.assertIn("peer_scoreboard", deep_ctx)
         self.assertNotIn("recent_trades", deep_ctx["peer_scoreboard"][0])
+
+    def test_strategy_review_recent_tick_scores_are_public_aggregate_only(self):
+        tick = {
+            "tick_id": "tick-peer-leak",
+            "ts": "2026-06-14T03:30:00+00:00",
+            "mode": "paper_apply",
+            "applied": True,
+            "market_count": 1,
+            "scores": [
+                {
+                    "agent_id": "superwing",
+                    "rank": 1,
+                    "score": 4.2,
+                    "roi": 0.01,
+                    "trade_count": 2,
+                    "cash": 1490.0,
+                    "fees_paid": 0.2,
+                    "details": [{"market_id": "peer-secret-position", "shares": 12.0}],
+                    "positions": {"peer-secret-position": {"shares": 12.0}},
+                }
+            ],
+            "agents": {},
+        }
+
+        compact = strategy_review.compact_tick(tick)
+        blob = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+
+        self.assertEqual(compact["scores"][0]["agent_id"], "superwing")
+        self.assertEqual(compact["scores"][0]["rank"], 1)
+        self.assertIn("trade_count", compact["scores"][0])
+        for private_field in ("cash", "fees_paid", "details", "positions"):
+            self.assertNotIn(private_field, compact["scores"][0])
+        self.assertNotIn("peer-secret-position", blob)
 
     def test_run_review_calls_model_once_per_agent_with_isolated_context(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,6 +241,110 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertNotIn("DEEPSEEK-PRIVATE-STRATEGY-INTERNAL", seen_contexts["superwing"])
         self.assertFalse(record["auto_promote"])
         self.assertIn("per-agent-isolated", record["review_model"])
+
+    def test_run_review_never_promotes_outputs_from_fallback_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            strategy_rules.ensure_default_rules(data_dir)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+
+            def fallback_review(ctx):
+                agent = ctx["target_agent_id"]
+                review = {
+                    "summary": f"Fallback review for {agent}",
+                    "findings": ["fallback-model-used"],
+                    "bot_scripts": {agent: bot_scripts.load_bot_script(data_dir, agent)},
+                    "risk_notes": ["fallback should not promote"],
+                    "public_dashboard_note": "Fallback model used; keep current rules.",
+                    "review_model": "deepseek-v4-flash",
+                    "primary_review_model": "deepseek-v4-pro",
+                    "review_model_fallback_used": True,
+                    "review_model_usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+                }
+                if agent == "superwing":
+                    review["superwing_rules"] = strategy_rules.load_superwing_rules(data_dir)
+                    review["superwing_rationale"] = "Fallback model must not promote SuperWing rules."
+                else:
+                    review["deepseek_rules_md"] = strategy_rules.load_deepseek_rules(data_dir)
+                    review["deepseek_rationale"] = "Fallback model must not promote DeepSeek rules."
+                return review
+
+            with mock.patch.object(strategy_review, "call_review_model", side_effect=fallback_review):
+                record = strategy_review.run_review(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        dashboard_dir=str(out_dir),
+                        operator_dashboard_dir="",
+                        limit_ticks=2,
+                        auto_promote=True,
+                        no_promote=False,
+                    )
+                )
+
+            self.assertTrue(record["model_fallback_used"])
+            self.assertEqual(record["review_status"], "fallback_no_promote")
+            self.assertFalse(record["auto_promote"])
+            self.assertEqual(record["promoted"], {})
+            self.assertEqual(record["review_model_usage"]["agents"]["superwing"]["total_tokens"], 14)
+            self.assertEqual(record["review_model_usage"]["aggregate"]["total_tokens"], 28)
+            for agent in agent_duel.AGENTS:
+                agent_record = data_dir / "strategy_reviews" / "agents" / agent / f"{record['review_id']}.json"
+                self.assertTrue(agent_record.exists())
+                payload = json.loads(agent_record.read_text(encoding="utf-8"))
+                self.assertEqual(payload["agent_id"], agent)
+                self.assertEqual(payload["learning_scope"], "target_agent_raw_ledger_only")
+                self.assertTrue(payload["model_fallback_used"])
+
+    def test_call_review_model_records_api_usage_metadata_not_model_claim(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "summary": "safe review",
+                                            "findings": [],
+                                            "review_model_usage": {"total_tokens": 999999},
+                                        }
+                                    )
+                                }
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+
+        class FakeOpener:
+            def open(self, req, timeout):
+                return FakeResponse()
+
+        with mock.patch.dict(
+            strategy_review.os.environ,
+            {
+                "DEEPSEEK_API_KEY": "unit-test-key",
+                "AURUM_REVIEW_MODEL": "deepseek-v4-pro",
+                "DEEPSEEK_MODEL": "deepseek-v4-flash",
+                "AURUM_REVIEW_THINKING": "disabled",
+            },
+            clear=False,
+        ), mock.patch.object(strategy_review.duel, "no_proxy_opener", return_value=FakeOpener()):
+            review = strategy_review.call_review_model({"target_agent_id": "superwing"})
+
+        self.assertEqual(review["review_model_usage"], {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17})
+        self.assertNotEqual(review["review_model_usage"].get("total_tokens"), 999999)
 
     def test_redact_value_redacts_sensitive_dictionary_keys(self):
         private_label = "aurum-" + "testhost-01"
@@ -473,6 +633,164 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertNotIn(dummy_host, operator_json)
         self.assertNotIn(dummy_bearer, operator_json)
 
+    def test_public_dashboard_does_not_plot_operator_trade_pips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            tick = {
+                "tick_id": "fill-pip",
+                "ts": "2026-06-14T03:30:00+00:00",
+                "mode": "paper_apply",
+                "scores": [{"agent_id": "superwing", "roi": 0.01}],
+                "agents": {
+                    "superwing": {
+                        "decision": {"orders": [{"side": "buy", "outcome": "Yes", "limit_price": 0.4567}]},
+                        "result": {
+                            "fills": [
+                                {
+                                    "side": "buy",
+                                    "outcome": "Yes",
+                                    "fill_price": 0.4567,
+                                    "notional": 9.5,
+                                    "question": "operator-only exact fill question",
+                                    "rationale": "operator-only rationale",
+                                }
+                            ],
+                            "rejections": [],
+                        },
+                    }
+                },
+            }
+            (data_dir / "ticks.jsonl").write_text(json.dumps(tick) + "\n", encoding="utf-8")
+
+            public_path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = public_path.read_text(encoding="utf-8")
+
+        self.assertNotIn('<circle class="trade-pip"', html)
+        self.assertNotIn("0.457", html)
+        self.assertNotIn("operator-only exact fill question", html)
+        self.assertNotIn("operator-only rationale", html)
+
+    def test_runtime_complete_rejects_inconsistent_gate_flags(self):
+        healthy_parts = (
+            {"ok": True},
+            {"ok": True},
+            {"ok": True},
+            {"ok": True},
+            {"ok": True, "rows_sampled": 1},
+        )
+        self.assertFalse(
+            generate_dashboard.runtime_is_complete(
+                {"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": False, "hold_only": True, "reason_codes": []},
+                *healthy_parts,
+            )
+        )
+        self.assertFalse(
+            generate_dashboard.runtime_is_complete(
+                {"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": True, "reason_codes": ["recorder_stale"]},
+                *healthy_parts,
+            )
+        )
+        self.assertFalse(
+            generate_dashboard.runtime_is_complete(
+                {"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": True, "hold_only": False, "stop_service": False, "reason_codes": "recorder_stale"},
+                *healthy_parts,
+            )
+        )
+        self.assertFalse(
+            generate_dashboard.runtime_is_complete(
+                {"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": True, "hold_only": False, "stop_service": False, "reason_codes": None},
+                *healthy_parts,
+            )
+        )
+        self.assertFalse(
+            generate_dashboard.runtime_is_complete(
+                {"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": True, "hold_only": False, "stop_service": False, "reason_codes": []},
+                {"ok": True},
+                {"ok": True},
+                {"ok": True},
+                {"ok": True},
+                {"ok": True, "rows_sampled": "abc"},
+            )
+        )
+
+    def test_public_runtime_status_fails_closed_on_malformed_gate_reason_codes(self):
+        latest_tick = {
+            "tick_id": "malformed-reasons",
+            "data_quality_gate": {
+                "decision": "TRADE_ALLOWED",
+                "ok": True,
+                "trade_allowed": True,
+                "hold_only": False,
+                "stop_service": False,
+                "reason_codes": "recorder_stale",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            data_dir.mkdir(parents=True)
+            with mock.patch.object(generate_dashboard, "public_recorder_summary", return_value={"ok": True}), mock.patch.object(
+                generate_dashboard, "public_bot_registry_summary", return_value={"ok": True}
+            ), mock.patch.object(generate_dashboard, "backup_status", return_value={"ok": True}), mock.patch.object(
+                generate_dashboard, "replay_status", return_value={"ok": True}
+            ), mock.patch.object(
+                generate_dashboard, "risk_ledger_status", return_value={"ok": True, "rows_sampled": 1}
+            ):
+                runtime = generate_dashboard.public_runtime_status(data_dir, latest_tick)
+
+        self.assertEqual(runtime["completion_state"], "code-complete-only")
+        self.assertIn("invalid_reason_codes", runtime["data_quality_gate"]["reason_codes"])
+
+    def test_backup_and_replay_status_require_boolean_true_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            recorder_dir = root / "recorder"
+            reports_dir = recorder_dir / "reports"
+            reports_dir.mkdir(parents=True)
+            (reports_dir / "aurum_stability_backup_status.json").write_text(
+                json.dumps({"ok": "false", "artifact_count": 3, "contains_manifest": True}),
+                encoding="utf-8",
+            )
+            (reports_dir / "replay_summary.json").write_text(
+                json.dumps({"ok": "false", "mode": "tampered"}),
+                encoding="utf-8",
+            )
+
+            backup = generate_dashboard.backup_status(data_dir, recorder_dir=recorder_dir)
+            replay = generate_dashboard.replay_status(data_dir, recorder_dir=recorder_dir)
+
+        self.assertIs(backup["ok"], False)
+        self.assertEqual(backup["status"], "check")
+        self.assertIs(replay["ok"], False)
+        self.assertEqual(replay["status"], "check")
+
+    def test_status_report_evaluates_gate_from_explicit_recorder_dir_not_stale_tick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            recorder_dir = root / "recorder"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (data_dir / "ticks.jsonl").write_text(
+                json.dumps({"tick_id": "stale-ok", "data_quality_gate": {"decision": "TRADE_ALLOWED", "trade_allowed": True, "reason_codes": []}}) + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                aurum_status_report.data_quality_gate,
+                "evaluate_data_quality_gate",
+                return_value={"decision": "HOLD_ONLY", "trade_allowed": False, "hold_only": True, "reason_codes": ["recorder_missing"]},
+            ) as gate_mock:
+                report = aurum_status_report.build_report(data_dir, recorder_dir, max_stale_seconds=180)
+
+        self.assertEqual(pathlib.Path(gate_mock.call_args.args[0]), recorder_dir)
+        self.assertEqual(report["data_quality_gate"]["decision"], "HOLD_ONLY")
+        self.assertEqual(report["completion_state"], "code-complete-only")
+
     def test_redaction_hides_private_host_labels_but_keeps_book_coverage_counts(self):
         private_label = "aurum-" + "testhost-01"
 
@@ -733,6 +1051,33 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertNotIn(private_label, public_blob)
         self.assertIn("[redacted]", public_blob)
 
+    def test_operator_output_dir_cannot_overlap_public_dashboard_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+
+            with self.assertRaises(ValueError):
+                generate_dashboard.render(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        output_dir=str(out_dir),
+                        operator_output_dir=str(out_dir),
+                    )
+                )
+            with self.assertRaises(ValueError):
+                generate_dashboard.render(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        output_dir=str(out_dir),
+                        operator_output_dir=str(out_dir / "operator"),
+                    )
+                )
+
     def test_status_report_includes_runtime_contract_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -762,6 +1107,175 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertNotIn("details", report["scoreboard"][0])
         for private_key in ("cash", "cash_available", "exposure", "fees_paid", "penalties"):
             self.assertNotIn(private_key, report["scoreboard"][0])
+
+    def test_status_report_runtime_complete_requires_replay_and_risk_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            recorder_dir = root / "recorder"
+            reports_dir = recorder_dir / "reports"
+            reports_dir.mkdir(parents=True)
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (reports_dir / "aurum_stability_backup_status.json").write_text(
+                json.dumps({"ok": True, "artifact_count": 3, "contains_manifest": True}),
+                encoding="utf-8",
+            )
+            (reports_dir / "replay_summary.json").write_text(
+                json.dumps({"ok": True, "mode": "runtime-proof", "risk_ledger_rows": 1}),
+                encoding="utf-8",
+            )
+            recorder_health = {
+                "ok": True,
+                "age_seconds": 3,
+                "errors": [],
+                "last_capture": {
+                    "market_count": 1,
+                    "orderable_market_count": 1,
+                    "sources": {"clob_book": {"ok_frames": 2}},
+                    "manifest": {"ok": True, "verification_scope": "tail", "verified_rows": 10},
+                    "book_coverage": {"requested_tokens": 2, "ok_tokens": 2},
+                },
+            }
+
+            with mock.patch.object(aurum_status_report.data_quality_gate, "evaluate_data_quality_gate", return_value={"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": True, "hold_only": False, "stop_service": False, "reason_codes": []}), mock.patch.object(
+                generate_dashboard.market_recorder, "recorder_health", return_value=recorder_health
+            ):
+                missing_ledger = aurum_status_report.build_report(data_dir, recorder_dir, max_stale_seconds=180)
+                (data_dir / "risk_ledger.jsonl").write_text(json.dumps({"event": "fill"}) + "\n", encoding="utf-8")
+                complete = aurum_status_report.build_report(data_dir, recorder_dir, max_stale_seconds=180)
+
+        self.assertEqual(missing_ledger["risk_ledger"]["status"], "missing")
+        self.assertEqual(missing_ledger["completion_state"], "code-complete-only")
+        self.assertEqual(complete["replay"]["status"], "ok")
+        self.assertEqual(complete["risk_ledger"]["status"], "present")
+        self.assertEqual(complete["completion_state"], "runtime-complete")
+
+    def test_status_report_explicit_recorder_dir_does_not_fallback_to_stale_data_dir_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            recorder_dir = root / "empty_explicit_recorder"
+            stale_reports = data_dir / "reports"
+            recorder_dir.mkdir(parents=True)
+            stale_reports.mkdir(parents=True)
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (data_dir / "risk_ledger.jsonl").write_text(json.dumps({"event": "fill"}) + "\n", encoding="utf-8")
+            (stale_reports / "aurum_stability_backup_status.json").write_text(
+                json.dumps({"ok": True, "artifact_count": 9, "contains_manifest": True}),
+                encoding="utf-8",
+            )
+            (stale_reports / "replay_summary.json").write_text(
+                json.dumps({"ok": True, "mode": "stale-data-dir", "risk_ledger_rows": 9}),
+                encoding="utf-8",
+            )
+            recorder_health = {
+                "ok": True,
+                "age_seconds": 3,
+                "errors": [],
+                "last_capture": {
+                    "market_count": 1,
+                    "orderable_market_count": 1,
+                    "sources": {"clob_book": {"ok_frames": 2}},
+                    "manifest": {"ok": True, "verification_scope": "tail", "verified_rows": 10},
+                    "book_coverage": {"requested_tokens": 2, "ok_tokens": 2},
+                },
+            }
+
+            with mock.patch.object(aurum_status_report.data_quality_gate, "evaluate_data_quality_gate", return_value={"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": True, "hold_only": False, "stop_service": False, "reason_codes": []}), mock.patch.object(
+                generate_dashboard.market_recorder, "recorder_health", return_value=recorder_health
+            ):
+                report = aurum_status_report.build_report(data_dir, recorder_dir, max_stale_seconds=180)
+
+        self.assertEqual(report["backup"]["status"], "missing")
+        self.assertEqual(report["replay"]["status"], "missing")
+        self.assertEqual(report["completion_state"], "code-complete-only")
+
+    def test_status_report_uses_explicit_recorder_dir_for_all_recorder_summaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            recorder_dir = root / "explicit_recorder_root"
+            data_dir.mkdir(parents=True)
+            recorder_dir.mkdir(parents=True)
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (recorder_dir / "reports").mkdir(parents=True)
+            (recorder_dir / "reports" / "aurum_stability_backup_status.json").write_text(
+                json.dumps({"ok": True, "artifact_count": 7, "contains_manifest": True}),
+                encoding="utf-8",
+            )
+            (recorder_dir / "reports" / "replay_summary.json").write_text(
+                json.dumps({"ok": True, "mode": "explicit-root", "market_count": 3}),
+                encoding="utf-8",
+            )
+            recorder_health = {
+                "ok": True,
+                "age_seconds": 3,
+                "errors": [],
+                "last_capture": {
+                    "market_count": 1,
+                    "orderable_market_count": 1,
+                    "sources": {"clob_book": {"ok_frames": 2}},
+                    "manifest": {"ok": True, "verification_scope": "tail", "verified_rows": 10},
+                    "book_coverage": {"requested_tokens": 2, "ok_tokens": 2},
+                },
+            }
+
+            with mock.patch.object(aurum_status_report.data_quality_gate, "evaluate_data_quality_gate", return_value={"decision": "TRADE_ALLOWED", "ok": True, "trade_allowed": True, "hold_only": False, "stop_service": False, "reason_codes": []}), mock.patch.object(
+                generate_dashboard.market_recorder, "recorder_health", return_value=recorder_health
+            ) as recorder_health_mock:
+                report = aurum_status_report.build_report(data_dir, recorder_dir, max_stale_seconds=180)
+
+        self.assertEqual(pathlib.Path(recorder_health_mock.call_args.args[0]), recorder_dir)
+        self.assertEqual(report["backup"]["status"], "ok")
+        self.assertEqual(report["backup"]["artifact_count"], 7)
+        self.assertEqual(report["replay"]["mode"], "explicit-root")
+
+    def test_dashboard_wires_tick_roi_series_into_chart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            (data_dir / "ticks.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "tick_id": "t1",
+                                "ts": "2026-06-14T03:30:00+00:00",
+                                "mode": "paper_apply",
+                                "scores": [
+                                    {"agent_id": "superwing", "roi": 0.01},
+                                    {"agent_id": "deepseek", "roi": -0.002},
+                                ],
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "tick_id": "t2",
+                                "ts": "2026-06-14T03:31:00+00:00",
+                                "mode": "paper_apply",
+                                "scores": [
+                                    {"agent_id": "superwing", "roi": 0.015},
+                                    {"agent_id": "deepseek", "roi": 0.003},
+                                ],
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = path.read_text(encoding="utf-8")
+
+        self.assertIn('stroke="#a78bfa"', html)
+        self.assertIn('stroke="#22d3ee"', html)
 
 
 if __name__ == "__main__":

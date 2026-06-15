@@ -27,6 +27,22 @@ def read_jsonl(path: pathlib.Path, limit: int) -> List[Dict[str, Any]]:
     return generate_dashboard.read_jsonl(path, limit=limit)
 
 
+def compact_score_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = (
+        "agent_id",
+        "rank",
+        "score",
+        "raw_roi_score",
+        "roi",
+        "drawdown",
+        "open_positions",
+        "trade_count",
+        "order_count",
+        "risk_event_count",
+    )
+    return {key: row.get(key) for key in allowed if key in row}
+
+
 def compact_tick(tick: Dict[str, Any]) -> Dict[str, Any]:
     agents = {}
     for agent_id, info in (tick.get("agents") or {}).items():
@@ -46,7 +62,7 @@ def compact_tick(tick: Dict[str, Any]) -> Dict[str, Any]:
         "mode": tick.get("mode"),
         "applied": tick.get("applied"),
         "market_count": tick.get("market_count"),
-        "scores": tick.get("scores", []),
+        "scores": [compact_score_row(row) for row in tick.get("scores", []) if isinstance(row, dict)],
         "agents": agents,
     }
 
@@ -255,6 +271,9 @@ def call_review_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
                     data = json.loads(resp.read().decode("utf-8"))
                 out = duel.extract_deepseek_decision_from_response(data)
                 out["review_model"] = model
+                out["primary_review_model"] = primary
+                out["review_model_fallback_used"] = model != primary
+                out["review_model_usage"] = compact_model_usage(data.get("usage"))
                 out["structured_retry_used"] = retry_used
                 return out
             except urllib.error.HTTPError as exc:
@@ -284,6 +303,81 @@ def _list_field(review: Dict[str, Any], key: str) -> List[Any]:
     return value if isinstance(value, list) else ([] if value in (None, "") else [value])
 
 
+USAGE_TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens")
+
+
+def compact_model_usage(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in USAGE_TOKEN_FIELDS:
+        if key not in value:
+            continue
+        try:
+            out[key] = int(value.get(key) or 0)
+        except Exception:
+            continue
+    if "total_tokens" not in out:
+        total = out.get("prompt_tokens", out.get("input_tokens", 0)) + out.get("completion_tokens", out.get("output_tokens", 0))
+        if total:
+            out["total_tokens"] = total
+    return out
+
+
+def merge_model_usage(agent_reviews: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    agents: Dict[str, Dict[str, Any]] = {}
+    aggregate: Dict[str, int] = {}
+    for agent_id in duel.AGENTS:
+        usage = compact_model_usage(agent_reviews.get(agent_id, {}).get("review_model_usage"))
+        agents[agent_id] = usage
+        for key, value in usage.items():
+            if isinstance(value, int):
+                aggregate[key] = aggregate.get(key, 0) + value
+    return {"agents": agents, "aggregate": aggregate}
+
+
+def agent_review_record_path(data_dir: pathlib.Path, agent_id: str, review_id: str) -> pathlib.Path:
+    return data_dir / "strategy_reviews" / "agents" / agent_id / f"{review_id}.json"
+
+
+def write_agent_review_records(
+    data_dir: pathlib.Path,
+    review_id: str,
+    agent_reviews: Dict[str, Dict[str, Any]],
+    model_errors: Dict[str, str],
+    review_status: str,
+    validation_errors: List[str],
+) -> Dict[str, str]:
+    paths: Dict[str, str] = {}
+    for agent_id in duel.AGENTS:
+        review = agent_reviews.get(agent_id, {})
+        payload = {
+            "ok": agent_id in agent_reviews and agent_id not in model_errors,
+            "review_id": review_id,
+            "ts": duel.utc_now(),
+            "agent_id": agent_id,
+            "learning_scope": "target_agent_raw_ledger_only",
+            "peer_scope": "aggregate_peer_scoreboard_only",
+            "review_status": review_status,
+            "model_error": model_errors.get(agent_id, "")[:500],
+            "review_model": review.get("review_model", "fallback_no_promote" if agent_id in model_errors else "unknown"),
+            "primary_review_model": review.get("primary_review_model"),
+            "model_fallback_used": bool(review.get("review_model_fallback_used")) or bool(model_errors),
+            "structured_retry_used": bool(review.get("structured_retry_used")) or bool(model_errors),
+            "review_model_usage": compact_model_usage(review.get("review_model_usage")),
+            "summary": review.get("summary", ""),
+            "findings": _list_field(review, "findings"),
+            "risk_notes": _list_field(review, "risk_notes"),
+            "public_dashboard_note": review.get("public_dashboard_note", ""),
+            "validation_errors": validation_errors,
+        }
+        path = agent_review_record_path(data_dir, agent_id, review_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        paths[agent_id] = str(path)
+    return paths
+
+
 def merge_isolated_agent_reviews(agent_reviews: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     superwing_review = agent_reviews.get("superwing", {})
     deepseek_review = agent_reviews.get("deepseek", {})
@@ -310,6 +404,7 @@ def merge_isolated_agent_reviews(agent_reviews: Dict[str, Dict[str, Any]]) -> Di
         "risk_notes": [item for agent_id in duel.AGENTS for item in _list_field(agent_reviews.get(agent_id, {}), "risk_notes")],
         "public_dashboard_note": " | ".join(item for item in notes if item) or "Per-agent isolated strategy reviews completed.",
         "review_model": "per-agent-isolated:" + ",".join(model_parts),
+        "review_model_fallback_used": any(bool(agent_reviews.get(agent_id, {}).get("review_model_fallback_used")) for agent_id in duel.AGENTS),
         "structured_retry_used": any(bool(agent_reviews.get(agent_id, {}).get("structured_retry_used")) for agent_id in duel.AGENTS),
     }
 
@@ -348,6 +443,7 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         model_error = ""
         review = merge_isolated_agent_reviews(agent_reviews)
+    model_fallback_used = (not model_failed) and bool(review.get("review_model_fallback_used"))
     review_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
     proposed: Dict[str, Any] = {}
     promoted: Dict[str, Any] = {}
@@ -401,19 +497,30 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         )
         proposed[f"{agent_id}_bot_script"] = str(proposal_path)
 
-    promote = (not model_failed) and (not validation_errors) and auto_promote_enabled(args)
+    promote = (not model_failed) and (not model_fallback_used) and (not validation_errors) and auto_promote_enabled(args)
     if promote:
         promoted["superwing_rules"] = str(strategy_rules.promote_superwing_rules(data_dir, sw_rules, source=f"review:{review_id}", rationale=str(review.get("superwing_rationale", ""))))
         promoted["deepseek_rules"] = str(strategy_rules.promote_deepseek_rules(data_dir, ds_rules_text, source=f"review:{review_id}", rationale=str(review.get("deepseek_rationale", ""))))
         for agent_id, candidate in bot_script_candidates.items():
             promoted[f"{agent_id}_bot_script"] = str(bot_scripts.write_bot_script(data_dir, agent_id, candidate, source=f"review:{review_id}"))
 
+    if model_failed or model_fallback_used:
+        review_status = "fallback_no_promote"
+    elif validation_errors:
+        review_status = "validation_no_promote"
+    else:
+        review_status = "model_ok"
+    usage_summary = merge_model_usage(agent_reviews)
+    agent_review_paths = write_agent_review_records(data_dir, review_id, agent_reviews, model_errors, review_status, validation_errors)
     record = {
         "ok": True,
         "review_id": review_id,
         "ts": duel.utc_now(),
         "review_model": review.get("review_model"),
-        "review_status": "fallback_no_promote" if model_failed else ("validation_no_promote" if validation_errors else "model_ok"),
+        "review_status": review_status,
+        "model_fallback_used": model_fallback_used,
+        "review_model_usage": usage_summary,
+        "per_agent_review_paths": agent_review_paths,
         "review_model_error": model_error if model_failed else "",
         "validation_errors": validation_errors,
         "structured_retry_used": bool(review.get("structured_retry_used")),

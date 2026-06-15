@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import pathlib
 import sys
@@ -644,6 +645,53 @@ class MechanicalBotScriptTests(unittest.TestCase):
             agent_duel.extract_deepseek_decision_from_response(
                 {"choices": [{"message": {"content": '{"orders": []}{"orders": []}'}}]}
             )
+        with self.assertRaises(agent_duel.DuelError):
+            agent_duel.extract_deepseek_decision_from_response(
+                {"choices": [{"message": {"content": '{"orders":[{"notional": NaN}]}'}}]}
+            )
+
+    def test_non_finite_order_numbers_fail_closed_without_account_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            state = agent_duel.init_state(data_dir, reset=True)
+            starting_cash = state["accounts"]["superwing"]["cash"]
+            markets = [
+                {
+                    "market_id": "btc-nan",
+                    "question": "Will Bitcoin stay finite?",
+                    "volume": 10000,
+                    "outcomes": [
+                        {"name": "Yes", "price": 0.42},
+                        {"name": "No", "price": 0.58},
+                    ],
+                }
+            ]
+            decision = json.loads(
+                '{"orders":[{"market_id":"btc-nan","outcome":"Yes","side":"buy","notional":NaN,"limit_price":0.5}]}'
+            )
+
+            result = agent_duel.validate_and_apply(
+                data_dir,
+                state,
+                "superwing",
+                decision,
+                markets,
+                apply=True,
+                max_orders=1,
+                max_notional_per_order=45.0,
+                now_fn=lambda: "2026-06-14T03:30:00+00:00",
+            )
+            raw_state = (data_dir / "state.json").read_text(encoding="utf-8")
+
+        account = state["accounts"]["superwing"]
+        self.assertEqual(result["fills"], [])
+        self.assertEqual(len(result["rejections"]), 1)
+        self.assertIn("finite", result["rejections"][0]["reason"])
+        self.assertEqual(account["cash"], starting_cash)
+        self.assertTrue(math.isfinite(account["cash"]))
+        self.assertEqual(account["positions"], {})
+        self.assertNotIn("NaN", raw_state)
+        json.loads(raw_state, parse_constant=lambda constant: (_ for _ in ()).throw(AssertionError(f"non-finite JSON constant: {constant}")))
 
     def test_scoreboard_requires_rank_one_and_roi_above_five_percent_for_valid_victory(self):
         leader_below_threshold = agent_duel.new_account("superwing", now_fn=lambda: "2026-06-14T03:30:00+00:00")

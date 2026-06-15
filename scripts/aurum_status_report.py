@@ -24,9 +24,6 @@ def latest_tick(data_dir: pathlib.Path) -> Dict[str, Any]:
 
 
 def gate_status(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_seconds: int) -> Dict[str, Any]:
-    tick = latest_tick(data_dir)
-    if isinstance(tick.get("data_quality_gate"), dict):
-        return generate_dashboard.public_gate_summary(tick)
     return generate_dashboard.redact_value(
         data_quality_gate.evaluate_data_quality_gate(
             recorder_dir,
@@ -61,10 +58,10 @@ def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_s
     recorder_dir = pathlib.Path(recorder_dir)
     tick = latest_tick(data_dir)
     gate = gate_status(data_dir, recorder_dir, max_stale_seconds)
-    recorder = generate_dashboard.public_recorder_summary(data_dir)
+    recorder = generate_dashboard.public_recorder_summary(data_dir, recorder_dir=recorder_dir, max_stale_seconds=max_stale_seconds)
     registry = generate_dashboard.public_bot_registry_summary(data_dir)
-    backup = generate_dashboard.backup_status(data_dir)
-    replay = generate_dashboard.replay_status(data_dir)
+    backup = generate_dashboard.backup_status(data_dir, recorder_dir=recorder_dir)
+    replay = generate_dashboard.replay_status(data_dir, recorder_dir=recorder_dir)
     ledger = generate_dashboard.risk_ledger_status(data_dir)
     try:
         state = duel.load_state(data_dir)
@@ -72,12 +69,7 @@ def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_s
         scoreboard = duel.scoreboard_context(state, prices)
     except Exception:
         scoreboard = {"competition": duel.competition_context(), "scoreboard": [], "victory": duel.victory_status([])}
-    runtime_complete = bool(
-        gate.get("decision") == data_quality_gate.TRADE_ALLOWED
-        and recorder.get("ok") is True
-        and registry.get("ok") is True
-        and backup.get("ok") is True
-    )
+    runtime_complete = generate_dashboard.runtime_is_complete(gate, recorder, registry, backup, replay, ledger)
     report = {
         "ok": True,
         "report": "aurum_status_report_v1",
