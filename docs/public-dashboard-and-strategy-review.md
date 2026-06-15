@@ -153,6 +153,30 @@ AURUM_REVIEW_CADENCE_SECONDS=1800
 
 If the configured review model is unavailable, the script falls back to the normal decision model and records which model actually produced the review. Review thinking is disabled by default because `deepseek-v4-pro` produced cleaner machine-parseable JSON in this mode; DeepSeek's per-tick decision lane still uses thinking/reasoning.
 
+## 2026-06-15 v4pro canary deployment note
+
+Live canary release `20260615T085922Z-926b023b0db0` is deployed from commit `926b023b0db0cc70c7eb13f8fee7316be8d2ffd5`.
+
+Runtime mode:
+
+```text
+AURUM_REVIEW_MODEL=deepseek-v4-pro
+AURUM_REVIEW_THINKING=disabled
+AURUM_REVIEW_SKIP_NO_CHANGE=true
+AURUM_REVIEW_QUOTA_SKIP_PCT=90
+AURUM_REVIEW_QUOTA_USED_PCT=0
+AURUM_RULE_AUTO_PROMOTE=false
+```
+
+The canary treats v4pro as a 30-minute reviewer, not a trading operator:
+
+- resident bot ticks remain `resident_mechanical_bot_loop` / `paper_apply`;
+- proposal promotion remains disabled unless explicitly operator-approved;
+- invalid JSON or invalid proposal schema records `fallback_no_promote` and leaves executable strategies unchanged;
+- public dashboard remains runtime-complete and must not expose proposal controls, strategy proposal internals, server paths, quota env values, host/IP values, or credentials.
+
+Initial canary observation: v4pro calls are live, but early proposals repeatedly produced `fallback_no_promote` because generated proposals did not fully satisfy the executable bot-script/schema gate. This is contained by design: no proposal was promoted, no executable strategy changed, and the public dashboard stayed clean. If repeated after the canary window, harden the review prompt/schema examples or parser rather than weakening promotion gates.
+
 ## Manual commands
 
 Generate dashboard once:
