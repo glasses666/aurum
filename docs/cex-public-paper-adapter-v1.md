@@ -18,7 +18,11 @@ Aurum should therefore split into two lanes:
 - public snapshot normalization for OKX, Bybit, and Binance perpetual APIs;
 - a common CEX frame contract with `exchange`, `symbol`, `last`, `best_bid`, `best_ask`, `mid`, `spread_bps`, `funding_rate`, candles, and fee assumptions;
 - an exchange-like paper account with cash, positions, trades, fees, and realized PnL;
-- recorder-style output at `normalized/cex/latest_markets.json`, `reports/cex_recorder_health.json`, and `raw/cex/<day>/snapshots.jsonl` when `snapshot --data-dir` is used;
+- recorder-style output at `normalized/cex/latest_markets.json`, `reports/cex_recorder_health.json`, and `raw/cex/<day>/snapshots.jsonl` when `record-once`, `recorder-loop`, or `snapshot --data-dir` is used;
+- multi-symbol resident recorder support via `scripts/run_cex_recorder.sh` and `deploy/systemd/aurum-cex-recorder.service`;
+- baseline strategy lanes: `momentum`, `mean_reversion`, `volatility_breakout`, `funding_filter`, and `grid_shadow`;
+- resident paper tick support via `scripts/run_cex_bot_loop.sh` and `deploy/systemd/aurum-cex-bot-loop.service`;
+- dashboard public CEX summary embedded into the existing terminal manifest/HTML;
 - long-only paper market buy/reduce-sell fills by default;
 - an explicit safety guard rejecting exchange credential/live-trading env vars.
 
@@ -58,6 +62,33 @@ v1 paper fills are deliberately conservative:
 
 This is enough for BTC/ETH baseline strategies before adding leverage, margin, shorting, maker queue simulation, or exchange testnet support.
 
+## Resident canary services
+
+The CEX path is designed to run beside the existing Polymarket paper duel, not replace it in-place:
+
+```bash
+# one public-data capture
+python3 scripts/cex_arena.py record-once \
+  --data-dir data/cex_arena \
+  --markets okx:BTC-USDT-SWAP,okx:ETH-USDT-SWAP
+
+# one mechanical paper tick over the latest CEX frame
+python3 scripts/cex_arena.py tick \
+  --data-dir data/cex_arena \
+  --strategies momentum,mean_reversion,volatility_breakout,funding_filter,grid_shadow
+
+# public dashboard picks up CEX summary from AURUM_CEX_DATA_DIR or ../cex_arena
+AURUM_CEX_DATA_DIR=data/cex_arena \
+  python3 scripts/generate_dashboard.py --data-dir data/paper_duel --output-dir public/dashboard
+```
+
+Systemd units added for VPS canary:
+
+- `aurum-cex-recorder.service` — public CEX data capture loop.
+- `aurum-cex-bot-loop.service` — resident mechanical CEX paper tick + dashboard refresh.
+
+Both set `AURUM_CEX_ENABLE_LIVE_TRADING=false` and the Python guard still fails closed if exchange-scoped credentials such as `OKX_API_KEY` or `BYBIT_API_SECRET` are present.
+
 ## Safety boundary
 
 The CEX adapter fails closed when it sees exchange-scoped credentials such as `OKX_API_KEY`, `BYBIT_API_SECRET`, `BINANCE_API_KEY`, `HYPERLIQUID_PRIVATE_KEY`, or a truthy `AURUM_CEX_ENABLE_LIVE_TRADING`.
@@ -66,8 +97,7 @@ Public keys for unrelated local tools are not blocked; only exchange-scoped/live
 
 ## Suggested next steps
 
-1. Add a resident CEX recorder service writing `normalized/cex/latest_markets.json`.
-2. Add CEX baseline strategies: momentum, mean reversion, volatility breakout, funding/basis filter, and grid shadow.
-3. Add exchange-like replay/backtest with fee/slippage and drawdown gates.
-4. Extend dashboard to show a CEX terminal view separate from the Polymarket terminal.
-5. Deploy as a new release only after runtime proof; do not mutate the current Polymarket canary in place.
+1. Run VPS canary services beside the existing Polymarket paper duel and verify public dashboard CEX summary.
+2. Add exchange-like replay/backtest with fee/slippage and drawdown gates.
+3. Add maker/limit-order simulation only after the public-data/taker-paper lane proves stable.
+4. Keep live trading, leverage, shorting, private keys, and real exchange account credentials out of this branch.

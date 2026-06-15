@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import agent_duel as duel
 import bot_scripts
+import cex_arena
 import market_recorder
 import quant_lanes
 import strategy_rules
@@ -407,6 +408,12 @@ def env_public(env_file: Optional[pathlib.Path]) -> Dict[str, str]:
         "AURUM_RULE_AUTO_PROMOTE",
         "AURUM_REVIEW_INTERVAL_HOURS",
         "AURUM_PUBLIC_DASHBOARD_DIR",
+        "AURUM_CEX_DATA_DIR",
+        "AURUM_CEX_MARKETS",
+        "AURUM_CEX_RECORDER_INTERVAL_SEC",
+        "AURUM_CEX_BOT_INTERVAL_SEC",
+        "AURUM_CEX_STRATEGIES",
+        "AURUM_CEX_NOTIONAL_USDT",
         "AURUM_PAPER_TRADE_ROLE",
         "AURUM_POLYMARKET_FEE_MODE",
         "AURUM_POLY_MIN_ORDER_USDC",
@@ -1476,6 +1483,78 @@ def runtime_panel(runtime: Dict[str, Any]) -> str:
     """
 
 
+def cex_data_root(data_dir: pathlib.Path) -> pathlib.Path:
+    configured = os.environ.get("AURUM_CEX_DATA_DIR", "").strip()
+    if configured:
+        return pathlib.Path(configured)
+    return pathlib.Path(data_dir).parent / "cex_arena"
+
+
+def public_cex_summary(data_dir: pathlib.Path) -> Dict[str, Any]:
+    root = cex_data_root(data_dir)
+    latest = read_json(root / "normalized" / "cex" / "latest_markets.json", {})
+    status = read_json(root / "reports" / "cex_runtime_status.json", {})
+    health = read_json(root / "reports" / "cex_recorder_health.json", {})
+    state = read_json(root / "cex_paper" / "state.json", {})
+    markets = latest.get("markets") if isinstance(latest, dict) else []
+    markets = markets if isinstance(markets, list) else []
+    latest_market = markets[0] if markets and isinstance(markets[0], dict) else {}
+    accounts = state.get("accounts") if isinstance(state, dict) else {}
+    accounts = accounts if isinstance(accounts, dict) else {}
+    active_positions = 0
+    trade_count = 0
+    for account in accounts.values():
+        if not isinstance(account, dict):
+            continue
+        raw_positions = account.get("positions")
+        raw_trades = account.get("trades")
+        positions = raw_positions if isinstance(raw_positions, dict) else {}
+        trades = raw_trades if isinstance(raw_trades, list) else []
+        active_positions += len(positions)
+        trade_count += len(trades)
+    return {
+        "ok": bool(status.get("ok") or health.get("ok")),
+        "source": "cex_public_api_v0",
+        "completion_state": status.get("completion_state", "missing"),
+        "paper_only": True,
+        "market_count": latest.get("market_count") if isinstance(latest, dict) else 0,
+        "health_ok": health.get("ok") is True,
+        "runtime_ok": status.get("ok") is True,
+        "latest_market": redact_value(
+            {
+                "exchange": latest_market.get("exchange"),
+                "symbol": latest_market.get("symbol"),
+                "last": latest_market.get("last"),
+                "spread_bps": latest_market.get("spread_bps"),
+                "funding_rate": latest_market.get("funding_rate"),
+            }
+        ),
+        "strategy_count": len(accounts),
+        "active_position_bucket": bucket_count(active_positions),
+        "trade_count_bucket": bucket_count(trade_count),
+        "data_quality_gate": redact_value(status.get("data_quality_gate", {})),
+    }
+
+
+def cex_panel(summary: Dict[str, Any]) -> str:
+    raw_latest = summary.get("latest_market")
+    latest: Dict[str, Any] = raw_latest if isinstance(raw_latest, dict) else {}
+    status = summary.get("completion_state", "missing")
+    pill = "green" if status == "runtime-complete" else "amber"
+    last = latest.get("last")
+    spread = latest.get("spread_bps")
+    funding = latest.get("funding_rate")
+    return f"""
+      <div class="rule-line"><span>CEX Traditional Quant</span><b><span class="pill {pill}">{esc(status)}</span></b></div>
+      <div class="rule-line"><span>市场 Market</span><b>{esc_public(latest.get('exchange') or '—')} · {esc_public(latest.get('symbol') or '—')}</b></div>
+      <div class="rule-line"><span>价格 Last</span><b>{fmt_price(last)}</b></div>
+      <div class="rule-line"><span>价差 / Funding</span><b>{esc_public(public_count(spread))} bps · {esc_public(public_count(funding))}</b></div>
+      <div class="rule-line"><span>Baseline strategies</span><b>{esc_public(summary.get('strategy_count'))} · paper-only</b></div>
+      <div class="rule-line"><span>公开持仓桶</span><b>{esc_public(summary.get('active_position_bucket'))} · trades {esc_public(summary.get('trade_count_bucket'))}</b></div>
+      <div class="caption">传统 CEX paper arena：public API + local paper ledger；无交易所密钥、无 live order、无真钱路径。</div>
+    """
+
+
 def write_operator_output(
     operator_dir: pathlib.Path,
     *,
@@ -1519,6 +1598,7 @@ def write_operator_output(
             "replay": replay_status(data_dir),
             "risk_ledger": risk_ledger_status(data_dir),
             "baselines": baseline_status(data_dir),
+            "cex": public_cex_summary(data_dir),
         }
     )
     (operator_dir / "operator.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1578,6 +1658,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     runtime = public_runtime_status(data_dir, latest_tick)
     runtime["victory"] = victory
     runtime["lanes"] = public_lane_summary(data_dir, scores)
+    cex_summary = public_cex_summary(data_dir)
     updated_at = utc_now()
     universe = env.get("AURUM_DUEL_UNIVERSE", "bitcoin").lower() or "bitcoin"
     contest_days = env.get("AURUM_FIRST_CONTEST_DAYS", "7")
@@ -1614,6 +1695,10 @@ def render(args: argparse.Namespace) -> pathlib.Path:
       <section class="rail-section">
         <div class="rail-title"><span>运行时 Runtime</span><span>证明状态 proof status</span></div>
         {runtime_panel(runtime)}
+      </section>
+      <section class="rail-section">
+        <div class="rail-title"><span>CEX 传统量化</span><span>public paper</span></div>
+        {cex_panel(cex_summary)}
       </section>
       <section class="rail-section">
         <div class="rail-title"><span>模型 lanes / Agents</span><span>{esc(mode_text)}</span></div>
@@ -1686,6 +1771,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         "scores": coarse_scores(scores),
         "victory": victory,
         "runtime": redact_value(runtime),
+        "cex": redact_value(cex_summary),
         "operator_output_enabled": bool(operator_output),
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
