@@ -1,6 +1,6 @@
 # Aurum
 
-Aurum is a research-only paper-trading and market-microstructure recorder for Polymarket CLOB markets.
+Aurum is a research-only paper-trading and market-microstructure recorder. It started with Polymarket CLOB markets and is now adding a traditional crypto CEX public-data paper lane.
 
 It records public orderbook data, replays strategy decisions, and evaluates simulated fills, cancels, partial fills, post-only behavior, rate limits, and risk controls before any live trading.
 
@@ -55,3 +55,4 @@ Polymarket Builder/sandbox access is not required for Phase 0/1. While waiting f
 - Paper duel scheduling and VPS timer: [`docs/paper-duel-scheduling.md`](docs/paper-duel-scheduling.md)
 - Public dashboard and 5h strategy review: [`docs/public-dashboard-and-strategy-review.md`](docs/public-dashboard-and-strategy-review.md)
 - Polymarket-style paper execution rules and taker-fee model: [`docs/polymarket-paper-execution-rules.md`](docs/polymarket-paper-execution-rules.md)
+- CEX public-data paper adapter v1: [`docs/cex-public-paper-adapter-v1.md`](docs/cex-public-paper-adapter-v1.md)
