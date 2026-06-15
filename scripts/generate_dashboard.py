@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import agent_duel as duel
 import bot_scripts
 import market_recorder
+import quant_lanes
 import strategy_rules
 
 AGENT_LABELS = {
@@ -399,6 +400,9 @@ def env_public(env_file: Optional[pathlib.Path]) -> Dict[str, str]:
         "AURUM_DEEPSEEK_REASONING_EFFORT",
         "DEEPSEEK_MODEL",
         "AURUM_REVIEW_MODEL",
+        "AURUM_REVIEW_CADENCE_SECONDS",
+        "AURUM_REVIEW_INTERVAL_SECONDS",
+        "AURUM_REVIEW_INTERVAL_MINUTES",
         "AURUM_RULE_AUTO_PROMOTE",
         "AURUM_REVIEW_INTERVAL_HOURS",
         "AURUM_PUBLIC_DASHBOARD_DIR",
@@ -569,6 +573,42 @@ def bitcoin_series(data_dir: pathlib.Path, ticks: List[Dict[str, Any]], state: D
     return points[-120:], latest_market, "btc_market_yes_price"
 
 
+def btc_chart_summary(points: List[Dict[str, Any]], *, epsilon: float = 1e-6) -> Dict[str, Any]:
+    values: List[float] = []
+    for point in points:
+        try:
+            value = float(point.get("value"))
+        except Exception:
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    if len(values) < 2:
+        return {
+            "metric": "btc_market_yes_price",
+            "point_count": len(values),
+            "is_flat": True,
+            "status": "flat_or_insufficient",
+            "status_label": "平坦或样本不足 flat_or_insufficient",
+            "min": values[0] if values else None,
+            "max": values[0] if values else None,
+            "delta": 0.0,
+        }
+    low = min(values)
+    high = max(values)
+    delta = high - low
+    is_flat = delta <= epsilon
+    return {
+        "metric": "btc_market_yes_price",
+        "point_count": len(values),
+        "is_flat": is_flat,
+        "status": "flat" if is_flat else "variable",
+        "status_label": "平坦 flat" if is_flat else "真实波动 variable",
+        "min": round(low, 8),
+        "max": round(high, 8),
+        "delta": round(delta, 8),
+    }
+
+
 def roi_series(ticks: List[Dict[str, Any]], state: Dict[str, Any], scores: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     series: Dict[str, List[Dict[str, Any]]] = {"superwing": [], "deepseek": []}
     for tick in ticks[-120:]:
@@ -674,16 +714,16 @@ def data_quality_banner(latest_tick: Dict[str, Any], ticks: List[Dict[str, Any]]
     warning_text = "; ".join(warnings) or "clear"
     css = "quality-banner warning" if warnings else "quality-banner"
     return f"""
-      <div class=\"{css}\" aria-label=\"Data quality\">
-        <div class=\"quality-item\">Data quality<b>{esc(decision)} · {esc(warning_text)}</b></div>
-        <div class=\"quality-item\">Source<b>{esc(public_source)} · fallback ticks last 1h {fallback_ticks_last_hour(ticks, latest_tick)}</b></div>
-        <div class=\"quality-item\">Recorder age<b>{esc('n/a' if recorder_age is None else public_text(recorder_age) + 's')} · latest tick age {esc('n/a' if latest_age is None else str(round(latest_age, 1)) + 's')}</b></div>
-        <div class=\"quality-item\">Manifest<b>{esc(manifest_text)}</b></div>
-        <div class=\"quality-item\">Book coverage<b>{esc(coverage_text)} · orderable markets {esc(orderable_count_text)}</b></div>
-        <div class=\"quality-item\">BTC-only<b>{esc(btc_only)} · universe {esc(public_universe)}</b></div>
-        <div class=\"quality-item\">Interval<b>actual {esc(actual_interval_text)}s · configured {esc(configured_interval)}s</b></div>
-        <div class=\"quality-item\">Reasons<b>{esc(reason_text)}</b></div>
-        <div class=\"quality-item\">Tick<b>{esc_public(latest_tick.get('tick_id', 'none') if latest_tick else 'none')}</b></div>
+      <div class=\"{css}\" aria-label=\"数据质量 Data quality\">
+        <div class=\"quality-item\">数据质量 Data quality<b>{esc(decision)} · {esc(warning_text)}</b></div>
+        <div class=\"quality-item\">数据源 Source<b>{esc(public_source)} · fallback ticks last 1h {fallback_ticks_last_hour(ticks, latest_tick)}</b></div>
+        <div class=\"quality-item\">Recorder 新鲜度<b>{esc('n/a' if recorder_age is None else public_text(recorder_age) + 's')} · latest tick age {esc('n/a' if latest_age is None else str(round(latest_age, 1)) + 's')}</b></div>
+        <div class=\"quality-item\">Manifest 校验<b>{esc(manifest_text)}</b></div>
+        <div class=\"quality-item\">盘口覆盖 Book coverage<b>{esc(coverage_text)} · orderable markets {esc(orderable_count_text)}</b></div>
+        <div class=\"quality-item\">BTC-only 范围<b>{esc(btc_only)} · universe {esc(public_universe)}</b></div>
+        <div class=\"quality-item\">循环间隔 Interval<b>actual {esc(actual_interval_text)}s · configured {esc(configured_interval)}s</b></div>
+        <div class=\"quality-item\">原因 Reasons<b>{esc(reason_text)}</b></div>
+        <div class=\"quality-item\">Tick 标识<b>{esc_public(latest_tick.get('tick_id', 'none') if latest_tick else 'none')}</b></div>
       </div>
     """
 
@@ -851,6 +891,50 @@ def risk_ledger_status(data_dir: pathlib.Path) -> Dict[str, Any]:
     return {"ok": True, "status": "present", "rows_sampled": len(rows), "read_scope": "tail"}
 
 
+def baseline_status(data_dir: pathlib.Path) -> Dict[str, Any]:
+    payload = read_json(quant_lanes.baseline_report_path(data_dir), None)
+    if not isinstance(payload, dict):
+        return {"ok": None, "status": "missing", "baseline_names": list(quant_lanes.BASELINE_NAMES)}
+    safe = redact_value(payload)
+    return {
+        "ok": payload.get("ok") is True,
+        "status": "ok" if payload.get("ok") is True else "check",
+        "baseline_names": list(quant_lanes.BASELINE_NAMES),
+        "price_points": payload.get("price_points"),
+        "best_baseline_after_fee_roi": quant_lanes.best_baseline_roi(payload),
+        "public_summary": "baseline comparison available" if payload.get("ok") is True else str(payload.get("reason") or "baseline check"),
+        "redacted": safe,
+    }
+
+
+def public_lane_summary(data_dir: pathlib.Path, scores: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    registry = quant_lanes.load_lane_registry(data_dir)
+    score_rows = coarse_scores(scores or [])
+    scores_by_agent = {row.get("agent_id"): row for row in score_rows if isinstance(row, dict)}
+    lanes: Dict[str, Any] = {}
+    for lane_id, entry in (registry.get("lanes") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        control = quant_lanes.load_lane_control(data_dir, lane_id)
+        score = scores_by_agent.get(lane_id, {})
+        lanes[lane_id] = {
+            "label": entry.get("label"),
+            "model_family": entry.get("model_family"),
+            "status": entry.get("status"),
+            "control_status": control.get("status"),
+            "paper_only": True,
+            "public_scope": "coarse_aggregate_only",
+            "score_band": score.get("score_band", "not_active"),
+            "position_bucket": score.get("position_bucket", "none"),
+        }
+    return {
+        "ok": True,
+        "schema_version": registry.get("schema_version"),
+        "registry_sha256": registry.get("registry_sha256"),
+        "lanes": lanes,
+    }
+
+
 def runtime_is_complete(
     gate: Dict[str, Any],
     recorder: Dict[str, Any],
@@ -893,6 +977,7 @@ def public_runtime_status(data_dir: pathlib.Path, latest_tick: Dict[str, Any]) -
     backup = backup_status(data_dir)
     replay = replay_status(data_dir)
     ledger = risk_ledger_status(data_dir)
+    baselines = baseline_status(data_dir)
     gate = public_gate_summary(latest_tick)
     runtime_complete = runtime_is_complete(gate, recorder, registry, backup, replay, ledger)
     return {
@@ -903,6 +988,7 @@ def public_runtime_status(data_dir: pathlib.Path, latest_tick: Dict[str, Any]) -
         "backup": {k: v for k, v in backup.items() if k != "redacted"},
         "replay": replay,
         "risk_ledger": ledger,
+        "baselines": {k: v for k, v in baselines.items() if k != "redacted"},
     }
 
 
@@ -1059,10 +1145,10 @@ def agent_status_panel(scores: List[Dict[str, Any]], state: Dict[str, Any], env:
           </div>
           <div class="agent-sub">{esc_public(env.get('AURUM_DUEL_MODE', 'review_only'))} · {esc_public(status)} · review {esc_public(review)}</div>
           <div class="agent-stats">
-            <span>score band<b>{esc(row.get('score_band', 'unknown'))}</b></span>
-            <span>position bucket<b>{esc(row.get('position_bucket', 'unknown'))}</b></span>
-            <span>script gate<b>{esc(tradable)}</b></span>
-            <span>paper mode<b>aggregate only</b></span>
+            <span>分数区间 score band<b>{esc(row.get('score_band', 'unknown'))}</b></span>
+            <span>持仓桶 position bucket<b>{esc(row.get('position_bucket', 'unknown'))}</b></span>
+            <span>脚本闸 script gate<b>{esc(tradable)}</b></span>
+            <span>公开模式<b>aggregate only</b></span>
           </div>
         </div>
         """)
@@ -1079,12 +1165,12 @@ def positions_panel(scores: List[Dict[str, Any]]) -> str:
             active_agents += 1
     return f"""
       <div class="position-row">
-        <div class="rank-head"><span>Open exposure</span><span>{esc(bucket_count(total_positions))}</span></div>
-        <div class="tiny">aggregate paper-position bucket only; per-agent positions stay in operator output</div>
+        <div class="rank-head"><span>公开风险敞口 Open exposure</span><span>{esc(bucket_count(total_positions))}</span></div>
+        <div class="tiny">只显示 aggregate paper-position bucket；per-agent positions 留在 operator output</div>
       </div>
       <div class="position-row">
-        <div class="rank-head"><span>Agents with exposure</span><span>{esc(bucket_count(active_agents))}</span></div>
-        <div class="tiny">no raw position keys, share counts, or account-like balances are public</div>
+        <div class="rank-head"><span>有敞口的 lane/agent Agents with exposure</span><span>{esc(bucket_count(active_agents))}</span></div>
+        <div class="tiny">公开页不展示 raw position keys、share counts 或 account-like balances</div>
       </div>
     """
 
@@ -1107,13 +1193,13 @@ def polymarket_rules_panel() -> str:
     other_rate = float(rules["taker_fee_rates"].get("other", 0.0))
     return f"""
       <div class="rule-list">
-        <div class="rule-line"><span>Fill role</span><b>{esc(rules['paper_fill_role']).upper()}</b></div>
-        <div class="rule-line"><span>Fee formula</span><b>shares × rate × p × (1-p)</b></div>
+        <div class="rule-line"><span>成交角色 Fill role</span><b>{esc(rules['paper_fill_role']).upper()}</b></div>
+        <div class="rule-line"><span>费用公式 Fee formula</span><b>shares × rate × p × (1-p)</b></div>
         <div class="rule-line"><span>BTC/Crypto taker rate</span><b>{crypto_rate:.2%}</b></div>
-        <div class="rule-line"><span>Other/general rate</span><b>{other_rate:.2%}</b></div>
+        <div class="rule-line"><span>其他市场费率</span><b>{other_rate:.2%}</b></div>
         <div class="rule-line"><span>Maker fee/rebate</span><b>0 fee · rebate not credited</b></div>
-        <div class="rule-line"><span>Fee precision</span><b>{rules['fee_precision_places']} decimals</b></div>
-        <div class="rule-line"><span>Min paper order</span><b>${fmt_money(rules['min_order_usdc'])}</b></div>
+        <div class="rule-line"><span>费用精度</span><b>{rules['fee_precision_places']} decimals</b></div>
+        <div class="rule-line"><span>最小 paper order</span><b>${fmt_money(rules['min_order_usdc'])}</b></div>
       </div>
       <div class="caption">按 Polymarket fee docs: taker fee 在 match time 计算；当前 paper fill 都按 taker，maker queue/rebate 等 recorder v2 再模拟。</div>
     """
@@ -1141,6 +1227,7 @@ def trade_chart(
     btc: List[Dict[str, Any]],
     roi: Dict[str, List[Dict[str, Any]]],
     events: List[Dict[str, Any]],
+    btc_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
     width, height = 1060, 560
     left, right, top, bottom = 62, 62, 36, 56
@@ -1186,18 +1273,20 @@ def trade_chart(
         color = AGENT_COLORS.get(agent, "#fff")
         shape = "r='5'" if event.get("kind") == "FILL" else "r='3.5'"
         pips.append(f'<circle class="trade-pip" cx="{x:.1f}" cy="{y:.1f}" {shape} fill="{color}" opacity=".95"><title>{esc(agent)} {esc(event.get("kind"))} {fmt_price(price)}</title></circle>')
+    btc_summary = btc_summary or btc_chart_summary(btc)
     if btc_points:
         btc_line = f'<polyline points="{btc_points}" fill="none" stroke="var(--btc)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>'
     else:
-        btc_line = f'<text x="{left + 20}" y="{top + plot_h/2:.1f}" fill="#777" font-size="16">waiting for Bitcoin recorder frames</text>'
+        btc_line = f'<text x="{left + 20}" y="{top + plot_h/2:.1f}" fill="#777" font-size="16">等待 Bitcoin recorder frames</text>'
     return f"""
     <div class="chart-shell">
-      <svg class="chart" viewBox="0 0 {width} {height}" preserveAspectRatio="none" role="img" aria-label="Bitcoin market line, agent ROI lines, and trade points">
+      <svg class="chart" viewBox="0 0 {width} {height}" preserveAspectRatio="none" role="img" aria-label="BTC Yes 概率曲线、agent ROI 线、公共粗粒度状态">
         {''.join(grid)}
         <line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}"/>
         <line class="axis" x1="{width-right}" y1="{top}" x2="{width-right}" y2="{height-bottom}"/>
         <line class="axis" x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}"/>
-        <text class="axis-label" x="{left}" y="22">BTC market price / probability</text>
+        <text class="axis-label" x="{left}" y="22">BTC Yes 概率 / market price</text>
+        <text class="axis-label" x="{left + 210}" y="22">{esc(str(btc_summary.get('status_label', '')))}</text>
         <text class="axis-label" x="{width-right-88}" y="22">agent ROI</text>
         <text class="axis-label" x="{left}" y="{height-20}">{esc(short_time(btc[0].get('ts') if btc else 'start'))}</text>
         <text class="axis-label" x="{width-right-70}" y="{height-20}">{esc(short_time(btc[-1].get('ts') if btc else 'now'))}</text>
@@ -1255,7 +1344,7 @@ def event_log(events: List[Dict[str, Any]]) -> str:
 
 def latest_review_summary(reviews: List[Dict[str, Any]]) -> str:
     if not reviews:
-        return "No 5h pro review yet."
+        return "暂无 30 分钟 slow review 记录。"
     latest = reviews[-1]
     summary = latest.get("summary") or latest.get("public_dashboard_note") or "review recorded"
     review_id = public_text(latest.get("review_id", ""))
@@ -1294,10 +1383,10 @@ def recorder_panel(data_dir: pathlib.Path) -> str:
     market_count = public_count(summary.get("market_count", 0))
     ok_frames = public_count(clob_book.get("ok_frames", 0))
     return f"""
-      <div class=\"rule-line\"><span>Status</span><b><span class=\"pill {pill}\">{esc(status)}</span></b></div>
-      <div class=\"rule-line\"><span>Age</span><b>{esc_public(age)}s</b></div>
-      <div class=\"rule-line\"><span>Markets</span><b>{esc(market_count)}</b></div>
-      <div class=\"rule-line\"><span>Books</span><b>{esc(ok_frames)} · coverage {esc(ok_tokens)}/{esc(requested)}</b></div>
+      <div class=\"rule-line\"><span>状态 Status</span><b><span class=\"pill {pill}\">{esc(status)}</span></b></div>
+      <div class=\"rule-line\"><span>新鲜度 Age</span><b>{esc_public(age)}s</b></div>
+      <div class=\"rule-line\"><span>市场 Markets</span><b>{esc(market_count)}</b></div>
+      <div class=\"rule-line\"><span>盘口 Books</span><b>{esc(ok_frames)} · coverage {esc(ok_tokens)}/{esc(requested)}</b></div>
       <div class=\"caption\">{esc(', '.join(summary.get('errors', [])) or 'Gamma/CLOB/Data API frames captured independently from paper fills.')}</div>
     """
 
@@ -1313,13 +1402,20 @@ def runtime_panel(runtime: Dict[str, Any]) -> str:
     victory: Dict[str, Any] = raw_victory if isinstance(raw_victory, dict) else {}
     victory_label = "valid" if bool(victory.get("valid_victory")) else "not yet"
     ledger_rows = f"tail rows sampled {ledger.get('rows_sampled', 0)}" if ledger.get("read_scope") == "tail" else f"rows {ledger.get('rows', 0)}"
+    baselines_raw = runtime.get("baselines")
+    baselines: Dict[str, Any] = baselines_raw if isinstance(baselines_raw, dict) else {}
+    lanes_raw = runtime.get("lanes")
+    lanes: Dict[str, Any] = lanes_raw if isinstance(lanes_raw, dict) else {}
+    lane_count = len(lanes.get("lanes", {}) if isinstance(lanes.get("lanes"), dict) else {})
     return f"""
-      <div class="rule-line"><span>Completion</span><b>{esc(runtime.get('completion_state', 'code-complete-only'))}</b></div>
+      <div class="rule-line"><span>完成状态 Completion</span><b>{esc(runtime.get('completion_state', 'code-complete-only'))}</b></div>
       <div class="rule-line"><span>Bot registry</span><b>{esc('ok' if registry.get('ok') else 'check')}</b></div>
-      <div class="rule-line"><span>Backup</span><b>{esc(backup.get('status', 'missing'))}</b></div>
-      <div class="rule-line"><span>Replay</span><b>{esc(replay.get('status', 'missing'))}</b></div>
-      <div class="rule-line"><span>Risk ledger</span><b>{esc(ledger.get('status', 'missing'))} · {esc(ledger_rows)}</b></div>
-      <div class="rule-line"><span>Victory gate</span><b>{esc(victory_label)} · ROI &gt; 5%</b></div>
+      <div class="rule-line"><span>备份 Backup</span><b>{esc(backup.get('status', 'missing'))}</b></div>
+      <div class="rule-line"><span>回放 Replay</span><b>{esc(replay.get('status', 'missing'))}</b></div>
+      <div class="rule-line"><span>风险账本 Risk ledger</span><b>{esc(ledger.get('status', 'missing'))} · {esc(ledger_rows)}</b></div>
+      <div class="rule-line"><span>Baseline gate</span><b>{esc(baselines.get('status', 'missing'))} · {esc(public_count(baselines.get('best_baseline_after_fee_roi')))}</b></div>
+      <div class="rule-line"><span>量化 lanes</span><b>{esc(lane_count)} · coarse public only</b></div>
+      <div class="rule-line"><span>胜利闸 Victory gate</span><b>{esc(victory_label)} · ROI &gt; 5%</b></div>
     """
 
 
@@ -1349,6 +1445,7 @@ def write_operator_output(
             "recent_events": events[:80],
             "state": state,
             "reviews": reviews[-5:],
+            "lanes": quant_lanes.lane_operator_rows(data_dir, state, scores, reviews),
             "bot_registry": bot_scripts.verify_bot_registry_manifest(data_dir),
             "market_recorder": market_recorder.recorder_health(
                 recorder_data_root(data_dir),
@@ -1357,6 +1454,7 @@ def write_operator_output(
             "backup": backup_status(data_dir),
             "replay": replay_status(data_dir),
             "risk_ledger": risk_ledger_status(data_dir),
+            "baselines": baseline_status(data_dir),
         }
     )
     (operator_dir / "operator.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1402,11 +1500,13 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     ])
     latest_tick = ticks[-1] if ticks else {}
     btc, latest_btc_market, btc_source = bitcoin_series(data_dir, ticks, state)
+    btc_summary = btc_chart_summary(btc)
     roi = roi_series(ticks, state, scores)
     public_events = public_tick_events(ticks)
     operator_events = extract_trade_events(ticks, decisions)
     runtime = public_runtime_status(data_dir, latest_tick)
     runtime["victory"] = victory
+    runtime["lanes"] = public_lane_summary(data_dir, scores)
     updated_at = utc_now()
     universe = env.get("AURUM_DUEL_UNIVERSE", "bitcoin").lower() or "bitcoin"
     contest_days = env.get("AURUM_FIRST_CONTEST_DAYS", "7")
@@ -1417,6 +1517,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     mode_text = public_text(mode)
     market_question = latest_btc_market.get("question") if latest_btc_market else "Waiting for first Bitcoin snapshot"
     latest_btc_price = btc[-1]["value"] if btc else None
+    cadence_minutes = max(1, int(round(quant_lanes.review_cadence_seconds(env) / 60)))
 
     html_doc = f"""<!doctype html>
 <html lang="zh-CN">
@@ -1424,74 +1525,74 @@ def render(args: argparse.Namespace) -> pathlib.Path:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex,nofollow" />
-  <title>Aurum BTC Paper Duel Terminal</title>
+  <title>Aurum BTC Paper Duel 公共终端</title>
   <style>{CSS}</style>
 </head>
 <body>
   <main class="terminal">
     <aside class="left-rail">
       <section class="rail-section">
-        <div class="rail-title"><span>Contest</span><span class="pill amber">first {esc(contest_days_text)} days</span></div>
+        <div class="rail-title"><span>比赛 Contest</span><span class="pill amber">first {esc(contest_days_text)} days</span></div>
         <div class="big-number">BTC only</div>
         <div class="caption">第一版只交易 Bitcoin 相关 Polymarket 市场。paper engine 消费独立 market_recorder 的同源数据；agent 只比策略，不比谁抓到不同盘口。</div>
       </section>
       <section class="rail-section">
-        <div class="rail-title"><span>Recorder</span><span>market data</span></div>
+        <div class="rail-title"><span>Recorder</span><span>市场数据 market data</span></div>
         {recorder_panel(data_dir)}
       </section>
       <section class="rail-section">
-        <div class="rail-title"><span>Runtime</span><span>proof status</span></div>
+        <div class="rail-title"><span>运行时 Runtime</span><span>证明状态 proof status</span></div>
         {runtime_panel(runtime)}
       </section>
       <section class="rail-section">
-        <div class="rail-title"><span>Agents</span><span>{esc(mode_text)}</span></div>
+        <div class="rail-title"><span>模型 lanes / Agents</span><span>{esc(mode_text)}</span></div>
         {agent_status_panel(scores, state, env, data_dir)}
       </section>
       <section class="rail-section">
-        <div class="rail-title"><span>Positions</span><span>paper</span></div>
+        <div class="rail-title"><span>持仓 Positions</span><span>paper</span></div>
         {positions_panel(scores)}
       </section>
       <section class="rail-section">
-        <div class="rail-title"><span>Polymarket Rules</span><span>fees</span></div>
+        <div class="rail-title"><span>Polymarket 规则</span><span>fees</span></div>
         {polymarket_rules_panel()}
       </section>
       <section class="rail-section">
-        <div class="rail-title"><span>Rules</span><span>visible</span></div>
-        <div class="caption">bot v2 目标：agent 写受限策略规格；固定执行引擎做 5s+ paper 自动交易。</div>
+        <div class="rail-title"><span>策略规则 Rules</span><span>visible</span></div>
+        <div class="caption">bot v2 目标：agent 写受限策略规格；固定执行引擎做 5s+ paper 自动交易；slow review 默认约 {esc(cadence_minutes)} 分钟。</div>
         <pre class="rules">{esc(rule_excerpt(rules))}</pre>
       </section>
     </aside>
 
     <section class="center-stage">
       <div class="topbar">
-        <div class="brand"><h1>Aurum Trading Terminal</h1><span>paper-only · no wallet · no live order</span></div>
-        <div class="meta"><span>generated {esc(updated_at)}</span><span>ticks {len(ticks)}</span><span>btc frames {len(btc)}</span></div>
+        <div class="brand"><h1>Aurum BTC Paper Duel</h1><span>paper-only · no wallet · no live order</span></div>
+        <div class="meta"><span>生成 {esc(updated_at)}</span><span>ticks {len(ticks)}</span><span>btc frames {len(btc)}</span></div>
       </div>
       {data_quality_banner(latest_tick, ticks, env)}
       <div class="chart-wrap">
         <div class="chart-title">
           <div>
-            <h2>Bitcoin recorder line × coarse score bands</h2>
-            <p>{esc_public(market_question)} · latest BTC market price {fmt_price(latest_btc_price)} · source {esc_public(btc_source)}</p>
+            <h2>BTC Yes 概率曲线 × agent ROI</h2>
+            <p>{esc_public(market_question)} · latest BTC market price {fmt_price(latest_btc_price)} · source {esc_public(btc_source)} · chart {esc_public(btc_summary.get('status_label'))}</p>
           </div>
           <div class="legend-line">
-            <span style="color:var(--btc)">● BTC market line</span>
-            <span style="color:var(--superwing)">● SuperWing score band</span>
-            <span style="color:var(--deepseek)">● DeepSeek score band</span>
+            <span style="color:var(--btc)">● BTC Yes 概率</span>
+            <span style="color:var(--superwing)">● SuperWing ROI</span>
+            <span style="color:var(--deepseek)">● DeepSeek ROI</span>
           </div>
         </div>
-        {trade_chart(btc, roi, [])}
+        {trade_chart(btc, roi, [], btc_summary)}
       </div>
       <div class="stage-footer">
-        <div class="footer-cell"><span>Universe</span><b>{esc_public(universe)}</b></div>
-        <div class="footer-cell"><span>Fastest bot interval</span><b>{esc(min_interval_text)}s hard floor</b></div>
+        <div class="footer-cell"><span>交易范围 Universe</span><b>{esc_public(universe)}</b></div>
+        <div class="footer-cell"><span>最快 bot interval</span><b>{esc(min_interval_text)}s hard floor</b></div>
         <div class="footer-cell"><span>Runtime state</span><b>{esc(runtime.get('completion_state'))}</b></div>
-        <div class="footer-cell"><span>Latest 5h review</span><b>{esc(trunc(latest_review_summary(reviews), 72))}</b></div>
+        <div class="footer-cell"><span>Latest slow review</span><b>{esc(trunc(latest_review_summary(reviews), 72))}</b></div>
       </div>
     </section>
 
     <aside class="right-log">
-      <div class="log-head"><h2>Activity Log</h2><span class="pill">coarse tick summary</span></div>
+      <div class="log-head"><h2>活动日志 Activity Log</h2><span class="pill">coarse tick summary 粗粒度 tick</span></div>
       <div class="log-list">{event_log(public_events)}</div>
     </aside>
   </main>
@@ -1502,10 +1603,11 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     (out_dir / "index.html").write_text(html_doc, encoding="utf-8")
     manifest = {
         "ok": True,
-        "view": "public_trade_terminal_v3",
+        "view": "public_trade_terminal_v4_chinese_first",
         "generated_at": updated_at,
         "tick_count": len(ticks),
         "btc_frame_count": len(btc),
+        "btc_chart": btc_summary,
         "latest_tick": redact_string(str(latest_tick.get("tick_id") or "")) or None,
         "latest_review": redact_string(str((reviews[-1] if reviews else {}).get("review_id") or "")) or None,
         "universe": redact_string(universe),

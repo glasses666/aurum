@@ -1,5 +1,5 @@
 [Unit]
-Description=Aurum 5h advanced strategy review and rule prompt update
+Description=Aurum slow strategy review and gated rule prompt update
 Wants=network-online.target
 After=network-online.target
 
@@ -14,6 +14,7 @@ Environment=AURUM_DATA_DIR=/opt/aurum/data/paper_duel
 Environment=AURUM_RUN_DIR=/opt/aurum/run
 Environment=AURUM_LOG_DIR=/opt/aurum/logs
 Environment=AURUM_PUBLIC_DASHBOARD_DIR=/opt/aurum/public/dashboard
+Environment=AURUM_REVIEW_CADENCE_SECONDS=1800
 ExecStart=/opt/aurum/app/scripts/run_strategy_review.sh
 NoNewPrivileges=true
 PrivateTmp=true

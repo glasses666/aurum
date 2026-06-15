@@ -15,6 +15,7 @@ import agent_duel
 import bot_scripts
 import agent_bot_loop
 import market_recorder
+import quant_lanes
 import strategy_rules
 
 
@@ -116,6 +117,25 @@ class MechanicalBotScriptTests(unittest.TestCase):
         self.assertEqual(second_tick["effective_mode"], "hold_only")
         self.assertIn("missing_bot_registry_manifest", second_tick["bot_script_manifest"]["errors"])
         self.assertFalse(manifest_exists_after_ticks)
+
+    def test_bot_loop_marks_unapplied_when_lane_controls_block_all_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            market_recorder.capture_once(root, fetcher=market_recorder_test_fetcher(), now=lambda: "2026-06-14T03:30:00+00:00", max_books=2)
+            data_dir = root / "paper_duel"
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            quant_lanes.set_lane_control(data_dir, "superwing", "frozen", reason="unit")
+            quant_lanes.set_lane_control(data_dir, "deepseek", "hold_only", reason="unit")
+            args = types.SimpleNamespace(data_dir=str(data_dir), env_file="", mode="paper_apply", limit=1, min_volume=0, max_orders=2, mock_markets="", allow_proxy=False, dashboard_dir="")
+            with mock.patch.dict(os.environ, {"AURUM_RECORDER_MAX_STALE_SECONDS": "999999999", "AURUM_DEEPSEEK_ALLOW_PAPER_APPLY": "true", "AURUM_DEEPSEEK_OPERATOR_CONFIRM": "ALLOW_DEEPSEEK_PAPER_APPLY"}, clear=False):
+                tick = agent_bot_loop.run_mechanical_tick(args)
+
+        self.assertFalse(tick["applied"])
+        self.assertEqual(tick["effective_mode"], "hold_only")
+        for agent in agent_duel.AGENTS:
+            self.assertFalse(tick["agents"][agent]["result"]["applied"])
+            self.assertEqual(tick["agents"][agent]["decision"]["orders"], [])
+            self.assertIn("lane_trade_blocked", tick["agents"][agent]["decision"]["notes"])
 
     def test_deepseek_default_bot_script_is_hold_only_until_validated(self):
         with tempfile.TemporaryDirectory() as tmp:

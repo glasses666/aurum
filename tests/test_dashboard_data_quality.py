@@ -14,6 +14,7 @@ import agent_duel
 import aurum_status_report
 import bot_scripts
 import generate_dashboard
+import quant_lanes
 import strategy_rules
 import strategy_review
 
@@ -197,8 +198,10 @@ class DashboardDataQualityTests(unittest.TestCase):
                 seen_contexts[agent] = json.dumps(ctx, ensure_ascii=False, sort_keys=True)
                 if agent == "superwing":
                     return {
+                        "review_outcome": "PROPOSE_UPDATE",
                         "summary": "SuperWing isolated review",
                         "findings": ["superwing-own-ledger-only"],
+                        "proposal_metrics": {"schema_valid": True, "replay_ok": True, "holdout_ok": True},
                         "superwing_rules": strategy_rules.load_superwing_rules(data_dir),
                         "superwing_rationale": "Keep conservative paper-only settings after reviewing own ledger.",
                         "bot_scripts": {"superwing": bot_scripts.load_bot_script(data_dir, "superwing")},
@@ -207,8 +210,10 @@ class DashboardDataQualityTests(unittest.TestCase):
                         "review_model": "mock-superwing",
                     }
                 return {
+                    "review_outcome": "PROPOSE_UPDATE",
                     "summary": "DeepSeek isolated review",
                     "findings": ["deepseek-own-ledger-only"],
+                    "proposal_metrics": {"schema_valid": True, "replay_ok": True, "holdout_ok": True},
                     "deepseek_rules_md": strategy_rules.load_deepseek_rules(data_dir),
                     "deepseek_rationale": "Keep paper-only buy/sell/hold rules after reviewing own ledger.",
                     "bot_scripts": {"deepseek": bot_scripts.load_bot_script(data_dir, "deepseek")},
@@ -254,8 +259,10 @@ class DashboardDataQualityTests(unittest.TestCase):
             def fallback_review(ctx):
                 agent = ctx["target_agent_id"]
                 review = {
+                    "review_outcome": "PROPOSE_UPDATE",
                     "summary": f"Fallback review for {agent}",
                     "findings": ["fallback-model-used"],
+                    "proposal_metrics": {"schema_valid": True, "replay_ok": True, "holdout_ok": True},
                     "bot_scripts": {agent: bot_scripts.load_bot_script(data_dir, agent)},
                     "risk_notes": ["fallback should not promote"],
                     "public_dashboard_note": "Fallback model used; keep current rules.",
@@ -298,6 +305,231 @@ class DashboardDataQualityTests(unittest.TestCase):
                 self.assertEqual(payload["agent_id"], agent)
                 self.assertEqual(payload["learning_scope"], "target_agent_raw_ledger_only")
                 self.assertTrue(payload["model_fallback_used"])
+
+    def test_review_keep_current_strategy_writes_no_strategy_proposals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            strategy_rules.ensure_default_rules(data_dir)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+            original_superwing = strategy_rules.superwing_rules_path(data_dir).read_text(encoding="utf-8")
+            original_deepseek = strategy_rules.deepseek_rules_path(data_dir).read_text(encoding="utf-8")
+
+            def keep_review(ctx):
+                return {
+                    "review_outcome": "KEEP_CURRENT_STRATEGY",
+                    "summary": "Keep current strategy; no executable rewrite.",
+                    "findings": ["current strategy remains within bounds"],
+                    "risk_notes": ["paper-only"],
+                    "public_dashboard_note": "keep current strategy",
+                    "review_model": "mock-keep",
+                }
+
+            with mock.patch.object(strategy_review, "call_review_model", side_effect=keep_review):
+                record = strategy_review.run_review(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        dashboard_dir=str(out_dir),
+                        operator_dashboard_dir="",
+                        limit_ticks=2,
+                        auto_promote=True,
+                        no_promote=False,
+                    )
+                )
+            final_superwing = strategy_rules.superwing_rules_path(data_dir).read_text(encoding="utf-8")
+            final_deepseek = strategy_rules.deepseek_rules_path(data_dir).read_text(encoding="utf-8")
+
+        self.assertEqual(record["review_status"], "model_ok")
+        self.assertEqual(record["review_outcomes"], {"superwing": "KEEP_CURRENT_STRATEGY", "deepseek": "KEEP_CURRENT_STRATEGY"})
+        self.assertFalse(record["auto_promote"])
+        self.assertEqual(record["promoted"], {})
+        self.assertEqual(final_superwing, original_superwing)
+        self.assertEqual(final_deepseek, original_deepseek)
+        self.assertEqual(record["proposed"]["superwing_protocol"], "KEEP_CURRENT_STRATEGY")
+        self.assertEqual(record["proposed"]["deepseek_protocol"], "KEEP_CURRENT_STRATEGY")
+
+    def test_invalid_review_protocol_falls_back_without_promote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+
+            def invalid_review(ctx):
+                return {
+                    "summary": "Missing required outcome",
+                    "findings": [],
+                    "review_model": "mock-invalid",
+                }
+
+            with mock.patch.object(strategy_review, "call_review_model", side_effect=invalid_review):
+                record = strategy_review.run_review(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        dashboard_dir=str(out_dir),
+                        operator_dashboard_dir="",
+                        limit_ticks=2,
+                        auto_promote=True,
+                        no_promote=False,
+                    )
+                )
+            agent_records = {
+                agent: json.loads((data_dir / "strategy_reviews" / "agents" / agent / f"{record['review_id']}.json").read_text(encoding="utf-8"))
+                for agent in agent_duel.AGENTS
+            }
+
+        self.assertEqual(record["review_status"], "fallback_no_promote")
+        self.assertFalse(record["auto_promote"])
+        self.assertEqual(record["promoted"], {})
+        self.assertEqual(record["review_model"], "fallback_no_promote")
+        for agent in agent_duel.AGENTS:
+            self.assertEqual(agent_records[agent]["review_protocol_error"], "missing_review_outcome")
+
+    def test_review_protocol_rejects_legacy_outcome_missing_metrics_and_partial_script(self):
+        self.assertEqual(
+            strategy_review.normalize_review_protocol({"outcome": "KEEP_CURRENT_STRATEGY"}, "superwing")["error"],
+            "unknown_review_field:outcome",
+        )
+        missing_metrics = strategy_review.normalize_review_protocol(
+            {
+                "review_outcome": "PROPOSE_UPDATE",
+                "summary": "proposal without local metric claims",
+                "findings": [],
+                "superwing_rules": strategy_rules.DEFAULT_SUPERWING_RULES,
+            },
+            "superwing",
+        )
+        self.assertEqual(missing_metrics["error"], "propose_update_missing_proposal_metrics")
+        partial_script = strategy_review.normalize_review_protocol(
+            {
+                "review_outcome": "PROPOSE_UPDATE",
+                "summary": "partial script body",
+                "findings": [],
+                "proposal_metrics": {},
+                "bot_scripts": {"superwing": {"buy_when": {"price_min": 0.2}}},
+            },
+            "superwing",
+        )
+        self.assertTrue(partial_script["error"].startswith("propose_update_bot_script_invalid:"))
+
+    def test_request_hold_only_freezes_lane_without_strategy_proposal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+
+            def mixed_review(ctx):
+                agent = ctx["target_agent_id"]
+                if agent == "deepseek":
+                    return {
+                        "review_outcome": "REQUEST_HOLD_ONLY",
+                        "summary": "Freeze new entries after anomalies.",
+                        "findings": ["risk anomaly"],
+                        "risk_notes": ["hold-only"],
+                        "review_model": "mock-hold",
+                    }
+                return {
+                    "review_outcome": "KEEP_CURRENT_STRATEGY",
+                    "summary": "Keep SuperWing.",
+                    "findings": [],
+                    "risk_notes": ["paper-only"],
+                    "review_model": "mock-keep",
+                }
+
+            with mock.patch.object(strategy_review, "call_review_model", side_effect=mixed_review):
+                record = strategy_review.run_review(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        dashboard_dir=str(out_dir),
+                        operator_dashboard_dir="",
+                        limit_ticks=2,
+                        auto_promote=True,
+                        no_promote=False,
+                    )
+                )
+
+            control = quant_lanes.load_lane_control(data_dir, "deepseek")
+
+        self.assertEqual(record["review_status"], "model_ok")
+        self.assertEqual(record["review_outcomes"]["deepseek"], "REQUEST_HOLD_ONLY")
+        self.assertEqual(control["status"], "hold_only")
+        self.assertIn("deepseek", record["lane_controls"])
+        self.assertNotIn("deepseek_bot_script", record["proposed"])
+
+    def test_model_claimed_promotion_metrics_cannot_clear_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+
+            def fake_metrics_review(ctx):
+                agent = ctx["target_agent_id"]
+                current = bot_scripts.load_bot_script(data_dir, agent)
+                promoted = bot_scripts.merge_script_update(current, {})
+                promoted["review"] = {
+                    "status": "promoted",
+                    "reviewed_by": "unit",
+                    "reviewed_at": "2026-06-14T03:30:00+00:00",
+                    "promotion_id": "unit",
+                }
+                if agent == "deepseek":
+                    promoted["hold_only"] = False
+                    promoted["allowed_sides"] = ["buy", "sell"]
+                    promoted["max_orders_per_tick"] = 1
+                    promoted["buy_when"] = {**promoted["buy_when"], "enabled": True, "max_notional": 10.0}
+                    promoted["sell_when"] = {**promoted["sell_when"], "enabled": True}
+                return {
+                    "review_outcome": "PROPOSE_UPDATE",
+                    "summary": "Model claims this should promote.",
+                    "findings": ["model-claimed-metrics"],
+                    "superwing_rules": strategy_rules.load_superwing_rules(data_dir),
+                    "deepseek_rules_md": strategy_rules.load_deepseek_rules(data_dir),
+                    "bot_scripts": {agent: promoted},
+                    "proposal_metrics": {
+                        "schema_valid": True,
+                        "replay_ok": True,
+                        "holdout_ok": True,
+                        "after_fee_roi": 999.0,
+                        "max_drawdown": 0.0,
+                        "trade_count": 100,
+                        "churn": 0.0,
+                        "exposure_concentration": 0.0,
+                    },
+                    "risk_notes": ["paper-only"],
+                    "review_model": "mock-claims",
+                }
+
+            with mock.patch.object(strategy_review, "call_review_model", side_effect=fake_metrics_review):
+                record = strategy_review.run_review(
+                    argparse.Namespace(
+                        data_dir=str(data_dir),
+                        env_file="",
+                        dashboard_dir=str(out_dir),
+                        operator_dashboard_dir="",
+                        limit_ticks=2,
+                        auto_promote=True,
+                        no_promote=False,
+                    )
+                )
+
+        self.assertEqual(record["promoted"], {})
+        self.assertFalse(record["auto_promote"])
+        for agent in agent_duel.AGENTS:
+            gate = record["promotion_gates"][agent]
+            self.assertEqual(gate["status"], "rejected")
+            self.assertTrue(gate["model_claimed_metrics_ignored"])
+            self.assertIn("schema_not_valid", gate["reasons"])
+            self.assertIn("replay_not_ok", gate["reasons"])
 
     def test_call_review_model_records_api_usage_metadata_not_model_claim(self):
         class FakeResponse:
@@ -539,8 +771,79 @@ class DashboardDataQualityTests(unittest.TestCase):
             '"details"',
         ):
             self.assertNotIn(forbidden, public_blob)
-        self.assertEqual(manifest["view"], "public_trade_terminal_v3")
+        self.assertEqual(manifest["view"], "public_trade_terminal_v4_chinese_first")
         self.assertEqual(manifest["scores"][0]["score_band"], "up")
+
+    def test_public_dashboard_is_chinese_first_and_keeps_stable_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            agent_duel.init_state(data_dir, reset=True)
+            bot_scripts.ensure_default_bot_scripts(data_dir)
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = path.read_text(encoding="utf-8")
+
+        for label in ("数据质量", "运行时 Runtime", "模型 lanes", "持仓 Positions", "活动日志 Activity Log", "BTC Yes 概率曲线"):
+            self.assertIn(label, html)
+        for marker in ("code-complete-only", "paper-only", "score band", "coarse tick summary"):
+            self.assertIn(marker, html)
+
+    def test_btc_chart_summary_marks_variable_and_flat_series(self):
+        variable = generate_dashboard.btc_chart_summary(
+            [
+                {"ts": "2026-06-14T03:30:00+00:00", "value": 0.42},
+                {"ts": "2026-06-14T03:31:00+00:00", "value": 0.47},
+            ]
+        )
+        flat = generate_dashboard.btc_chart_summary(
+            [
+                {"ts": "2026-06-14T03:30:00+00:00", "value": 0.42},
+                {"ts": "2026-06-14T03:31:00+00:00", "value": 0.42},
+            ]
+        )
+
+        self.assertFalse(variable["is_flat"])
+        self.assertEqual(variable["status"], "variable")
+        self.assertTrue(flat["is_flat"])
+        self.assertEqual(flat["status"], "flat")
+        self.assertIn("平坦", flat["status_label"])
+
+    def test_public_dashboard_serializes_nonflat_btc_series_as_variable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            data_dir = root / "paper_duel"
+            out_dir = root / "public"
+            snapshot_dir = data_dir / "snapshots"
+            snapshot_dir.mkdir(parents=True)
+            agent_duel.init_state(data_dir, reset=True)
+            for idx, price in enumerate((0.42, 0.46), 1):
+                (snapshot_dir / f"s{idx}.json").write_text(
+                    json.dumps(
+                        {
+                            "snapshot_id": f"s{idx}",
+                            "ts": f"2026-06-14T03:3{idx}:00+00:00",
+                            "markets": [
+                                {
+                                    "market_id": "btc-yes",
+                                    "question": "Will Bitcoin close above 100k?",
+                                    "volume": 1000 + idx,
+                                    "outcomes": [{"name": "Yes", "price": price}, {"name": "No", "price": 1 - price}],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            path = generate_dashboard.render(argparse.Namespace(data_dir=str(data_dir), env_file="", output_dir=str(out_dir)))
+            html = path.read_text(encoding="utf-8")
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(manifest["btc_chart"]["is_flat"])
+        self.assertEqual(manifest["btc_chart"]["status"], "variable")
+        self.assertIn("真实波动 variable", html)
 
     def test_snapshot_records_ignore_tick_paths_outside_snapshot_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1276,6 +1579,89 @@ class DashboardDataQualityTests(unittest.TestCase):
 
         self.assertIn('stroke="#a78bfa"', html)
         self.assertIn('stroke="#22d3ee"', html)
+
+    def test_quant_lane_registry_supports_future_model_lanes_without_raw_peer_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            agent_duel.init_state(data_dir, reset=True)
+            registry = quant_lanes.load_lane_registry(data_dir)
+
+        for lane in ("superwing", "deepseek", "gpt", "claude", "manual"):
+            self.assertIn(lane, registry["lanes"])
+            self.assertFalse(registry["lanes"][lane]["raw_peer_ledger_allowed"])
+            self.assertEqual(registry["lanes"][lane]["public_scope"], "coarse_aggregate_only")
+        self.assertEqual(registry["lanes"]["gpt"]["status"], "dormant")
+        self.assertEqual(quant_lanes.load_lane_control(data_dir, "gpt")["status"], "hold_only")
+
+    def test_promotion_gate_passes_and_fails_against_baselines(self):
+        baselines = quant_lanes.evaluate_baselines([{"value": 0.40}, {"value": 0.44}, {"value": 0.48}])
+        passing = quant_lanes.evaluate_promotion_gate(
+            {
+                "schema_valid": True,
+                "replay_ok": True,
+                "holdout_ok": True,
+                "after_fee_roi": quant_lanes.best_baseline_roi(baselines) + 0.02,
+                "max_drawdown": 0.02,
+                "trade_count": 4,
+                "churn": 0.10,
+                "exposure_concentration": 0.12,
+            },
+            baselines,
+        )
+        failing = quant_lanes.evaluate_promotion_gate(
+            {
+                "schema_valid": True,
+                "replay_ok": True,
+                "holdout_ok": True,
+                "after_fee_roi": -0.01,
+                "max_drawdown": 0.20,
+                "trade_count": 0,
+                "churn": 0.90,
+                "exposure_concentration": 0.60,
+            },
+            baselines,
+        )
+
+        self.assertEqual(passing["status"], "pass")
+        self.assertTrue(passing["executable"])
+        self.assertEqual(failing["status"], "rejected")
+        self.assertFalse(failing["executable"])
+        self.assertIn("does_not_beat_best_baseline_after_fees", failing["reasons"])
+        self.assertIn("drawdown_too_high", failing["reasons"])
+
+    def test_black_swan_flow_protects_before_model_trigger_and_freezes_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            data_dir.mkdir(parents=True)
+            reasons = quant_lanes.detect_extreme_events(
+                market={"price_jump_abs": 0.22, "manifest_ok": False},
+                account={"drawdown": 0.12, "repeated_stop_loss_or_rejects": 3},
+                system={"restart_count": 3, "backup_ok": False},
+            )
+            record = quant_lanes.apply_black_swan_protection(data_dir, "deepseek", reasons, evidence={"remote_error": "redacted upstream"})
+            control = quant_lanes.load_lane_control(data_dir, "deepseek")
+
+        self.assertGreaterEqual(len(reasons), 5)
+        self.assertEqual(record["flow"]["sequence"][0], "deterministic_protective_action")
+        self.assertEqual(record["flow"]["sequence"][-1], "trigger_slow_model_review_for_resume_update_or_retire")
+        self.assertFalse(record["flow"]["model_may_trade_in_hot_path"])
+        self.assertEqual(control["status"], "frozen")
+
+    def test_lane_freeze_blocks_trade_and_resume_requires_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            data_dir.mkdir(parents=True)
+            control = quant_lanes.set_lane_control(data_dir, "superwing", "frozen", reason="unit")
+            allowed, reasons = quant_lanes.lane_trade_allowed(data_dir, "superwing", script_tradable=True, gate_ok=True)
+            blocked_resume, blocked_reasons = quant_lanes.can_resume_lane(control, {"status": "rejected", "executable": False})
+            ok_resume, ok_reasons = quant_lanes.can_resume_lane(control, {"status": "pass", "executable": True})
+
+        self.assertFalse(allowed)
+        self.assertIn("lane_control_frozen", reasons)
+        self.assertFalse(blocked_resume)
+        self.assertIn("resume_gate_not_passed", blocked_reasons)
+        self.assertTrue(ok_resume)
+        self.assertEqual(ok_reasons, [])
 
 
 if __name__ == "__main__":

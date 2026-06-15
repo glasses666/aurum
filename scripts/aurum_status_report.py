@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import agent_duel as duel
 import data_quality_gate
 import generate_dashboard
+import quant_lanes
 
 
 def latest_tick(data_dir: pathlib.Path) -> Dict[str, Any]:
@@ -34,23 +35,7 @@ def gate_status(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_se
 
 
 def public_scoreboard_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    allowed = (
-        "agent_id",
-        "rank",
-        "score",
-        "raw_roi_score",
-        "roi",
-        "drawdown",
-        "open_positions",
-        "trade_count",
-        "order_count",
-        "risk_event_count",
-    )
-    public_rows: List[Dict[str, Any]] = []
-    for row in rows:
-        if isinstance(row, dict):
-            public_rows.append({key: row.get(key) for key in allowed if key in row})
-    return public_rows
+    return generate_dashboard.coarse_scores([row for row in rows if isinstance(row, dict)])
 
 
 def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_seconds: int) -> Dict[str, Any]:
@@ -70,6 +55,8 @@ def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_s
     except Exception:
         scoreboard = {"competition": duel.competition_context(), "scoreboard": [], "victory": duel.victory_status([])}
     runtime_complete = generate_dashboard.runtime_is_complete(gate, recorder, registry, backup, replay, ledger)
+    lanes = generate_dashboard.public_lane_summary(data_dir, scoreboard.get("scoreboard", []))
+    baselines = generate_dashboard.baseline_status(data_dir)
     report = {
         "ok": True,
         "report": "aurum_status_report_v1",
@@ -87,6 +74,9 @@ def build_report(data_dir: pathlib.Path, recorder_dir: pathlib.Path, max_stale_s
         "backup": {k: v for k, v in backup.items() if k != "redacted"},
         "replay": replay,
         "risk_ledger": ledger,
+        "lanes": lanes,
+        "baselines": {k: v for k, v in baselines.items() if k != "redacted"},
+        "review_cadence_seconds": quant_lanes.review_cadence_seconds(),
     }
     return generate_dashboard.redact_value(report)
 

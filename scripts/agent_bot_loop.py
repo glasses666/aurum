@@ -22,6 +22,7 @@ import bot_scripts
 import generate_dashboard
 import data_quality_gate
 import market_recorder
+import quant_lanes
 import recorder_replay
 import strategy_rules
 
@@ -177,8 +178,9 @@ def load_markets_for_tick(data_dir: pathlib.Path, args: argparse.Namespace) -> t
     }
 
 
-def hold_only_decision_for_agent(agent_id: str, script: Dict[str, Any], gate: Dict[str, Any]) -> Dict[str, Any]:
+def hold_only_decision_for_agent(agent_id: str, script: Dict[str, Any], gate: Dict[str, Any], extra_reasons: Optional[List[str]] = None) -> Dict[str, Any]:
     reasons = [str(reason) for reason in (gate.get("reason_codes", []) or [])]
+    reasons.extend(str(reason) for reason in (extra_reasons or []))
     if script.get("risk_reason"):
         reasons.append(str(script.get("risk_reason")))
     return {
@@ -260,20 +262,36 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
     snapshot_file.write_text(json.dumps(snapshot_record, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     agent_records: Dict[str, Any] = {}
+    any_agent_apply = False
     for agent_id in duel.AGENTS:
         state = duel.load_state(data_dir)
         script = bot_scripts.load_bot_script(data_dir, agent_id, write_manifest=False)
+        lane_allowed, lane_reasons = quant_lanes.lane_trade_allowed(
+            data_dir,
+            agent_id,
+            script_tradable=bot_scripts.script_tradable(script),
+            gate_ok=not hold_only,
+        )
         if hold_only:
             decision = hold_only_decision_for_agent(agent_id, script, gate or {})
+        elif not lane_allowed:
+            decision = hold_only_decision_for_agent(
+                agent_id,
+                script,
+                {"reason_codes": lane_reasons},
+                extra_reasons=["lane_trade_blocked"],
+            )
         else:
             decision = bot_scripts.mechanical_decision_for_agent(state["accounts"][agent_id], markets, script)
+        agent_apply = effective_apply and lane_allowed
+        any_agent_apply = any_agent_apply or agent_apply
         result = duel.validate_and_apply(
             data_dir,
             state,
             agent_id,
             decision,
             markets,
-            apply=effective_apply,
+            apply=agent_apply,
             max_orders=int(script.get("max_orders_per_tick", args.max_orders)),
             max_notional_per_order=duel.STARTING_EQUITY * duel.MAX_TRADE_FRACTION,
             execution_context={
@@ -288,7 +306,12 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
                 "bot_script_status": script.get("status"),
             },
         )
-        agent_records[agent_id] = {"script": script, "decision": decision, "result": result}
+        agent_records[agent_id] = {
+            "script": script,
+            "lane_control": quant_lanes.load_lane_control(data_dir, agent_id),
+            "decision": decision,
+            "result": result,
+        }
 
     final_state = duel.load_state(data_dir)
     prices = duel.market_price_map(markets)
@@ -300,8 +323,8 @@ def run_mechanical_tick(args: argparse.Namespace) -> Dict[str, Any]:
         "tick_id": snapshot_id,
         "ts": duel.utc_now(),
         "mode": mode,
-        "effective_mode": "hold_only" if hold_only else mode,
-        "applied": effective_apply,
+        "effective_mode": "hold_only" if (hold_only or (apply_paper and not any_agent_apply)) else mode,
+        "applied": any_agent_apply,
         "runner": "resident_mechanical_bot_loop",
         "loop_interval_sec": loop_interval(data_dir),
         "snapshot_file": str(snapshot_file),

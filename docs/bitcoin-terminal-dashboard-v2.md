@@ -8,7 +8,7 @@ Queen Glasser's corrected target is not a slow hourly LLM suggestion board. Auru
 - Market data is shared: one recorder/universe produces the same Bitcoin slate and frames for every agent.
 - Each agent has its own bot, wallet, rules, event log, and ROI/ranking.
 - The hot path should become a resident bot loop with a hard **5s minimum interval**, not a cron process spawned every 5 seconds.
-- The 5h pro review loop updates strategy rules/prompts only after validation; it cannot expand risk caps, enable live trading, request wallets, or touch keys.
+- The configurable slow review loop (default about 30 minutes) updates strategy rules/prompts only after validation; it cannot expand risk caps, enable live trading, request wallets, or touch keys.
 
 ## Dashboard target
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Five-hour advanced review for the Aurum paper duel.
+"""Configurable slow-review protocol for the Aurum paper duel.
 
-The review model summarizes recent paper decisions, proposes strategy-rule updates,
-validates them against local safety constraints, and optionally promotes them to
-the current paper rules. It never touches live wallets or real orders.
+The review model summarizes recent paper decisions for one isolated lane and
+must choose KEEP_CURRENT_STRATEGY, PROPOSE_UPDATE, or REQUEST_HOLD_ONLY. It never
+touches live wallets or real orders.
 """
 
 from __future__ import annotations
@@ -20,7 +20,28 @@ from typing import Any, Dict, List, Optional
 import agent_duel as duel
 import bot_scripts
 import generate_dashboard
+import quant_lanes
 import strategy_rules
+
+REVIEW_OUTCOMES = set(quant_lanes.REVIEW_OUTCOMES)
+ALLOWED_MODEL_REVIEW_FIELDS = {
+    "review_outcome",
+    "summary",
+    "findings",
+    "proposal_metrics",
+    "superwing_rules",
+    "superwing_rationale",
+    "deepseek_rules_md",
+    "deepseek_rationale",
+    "bot_scripts",
+    "risk_notes",
+    "public_dashboard_note",
+    "review_model",
+    "primary_review_model",
+    "review_model_fallback_used",
+    "review_model_usage",
+    "structured_retry_used",
+}
 
 
 def read_jsonl(path: pathlib.Path, limit: int) -> List[Dict[str, Any]]:
@@ -112,8 +133,10 @@ def _isolated_agent_learning_context(
 
 def _required_output_schema() -> Dict[str, Any]:
     return {
+        "review_outcome": "one of KEEP_CURRENT_STRATEGY, PROPOSE_UPDATE, REQUEST_HOLD_ONLY",
         "summary": "one short paragraph",
         "findings": ["short observation"],
+        "proposal_metrics": "required for PROPOSE_UPDATE auto-promotion gate; schema_valid/replay_ok/holdout_ok/after_fee_roi/max_drawdown/trade_count/churn/exposure_concentration",
         "superwing_rules": {
             "name": "string",
             "selection": "string",
@@ -152,6 +175,8 @@ def review_context(data_dir: pathlib.Path, limit_ticks: int) -> Dict[str, Any]:
         "now": duel.utc_now(),
         "mode": os.environ.get("AURUM_DUEL_MODE", "review_only"),
         "paper_only": True,
+        "review_cadence_seconds": quant_lanes.review_cadence_seconds(),
+        "allowed_review_outcomes": list(quant_lanes.REVIEW_OUTCOMES),
         "self_evolution_contract": "Use own ledger/fills/risk_events/replay outcomes to propose better bounded mechanical rules; strict DSL/review gates decide promotion; keep learning state per-agent isolated.",
         "learning_isolation_contract": "Shared review context is aggregate-only. Raw trades/fills/risk_events are supplied only in the isolated target-agent review context for one agent at a time.",
         "competition": scoreboard["competition"],
@@ -218,7 +243,9 @@ def call_review_model(ctx: Dict[str, Any]) -> Dict[str, Any]:
     system = (
         "You are the advanced strategy-review model for Aurum's PAPER-ONLY Polymarket duel. "
         "Improve transparency and strategy quality, but never propose real wallets, private keys, USDC deposits, logins, geoblock bypass, live trading, or risk-cap changes. "
-        "Return JSON only. The runner will validate and may reject unsafe updates."
+        "Return JSON only with review_outcome exactly one of KEEP_CURRENT_STRATEGY, PROPOSE_UPDATE, REQUEST_HOLD_ONLY. "
+        "KEEP_CURRENT_STRATEGY keeps the executable strategy unchanged. PROPOSE_UPDATE produces schema-validated strategy proposals only, never orders. "
+        "REQUEST_HOLD_ONLY asks the runner to freeze new entries for this lane. The runner will validate and may reject unsafe updates."
     )
     if target_agent:
         system += (
@@ -336,6 +363,123 @@ def merge_model_usage(agent_reviews: Dict[str, Dict[str, Any]]) -> Dict[str, Any
     return {"agents": agents, "aggregate": aggregate}
 
 
+def normalize_review_protocol(review: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
+    unknown = sorted(set(review) - ALLOWED_MODEL_REVIEW_FIELDS)
+    if unknown:
+        return {
+            "ok": False,
+            "agent_id": agent_id,
+            "review_outcome": str(review.get("review_outcome") or ""),
+            "status": "fallback_no_promote",
+            "error": "unknown_review_field:" + unknown[0],
+        }
+    raw_outcome = review.get("review_outcome")
+    if not isinstance(raw_outcome, str):
+        return {
+            "ok": False,
+            "agent_id": agent_id,
+            "review_outcome": "",
+            "status": "fallback_no_promote",
+            "error": "missing_review_outcome",
+        }
+    outcome = raw_outcome.strip().upper()
+    if outcome not in REVIEW_OUTCOMES:
+        return {
+            "ok": False,
+            "agent_id": agent_id,
+            "review_outcome": outcome,
+            "status": "fallback_no_promote",
+            "error": "unsupported_review_outcome",
+        }
+    if outcome == "PROPOSE_UPDATE":
+        if not isinstance(review.get("proposal_metrics"), dict):
+            return {
+                "ok": False,
+                "agent_id": agent_id,
+                "review_outcome": outcome,
+                "status": "fallback_no_promote",
+                "error": "propose_update_missing_proposal_metrics",
+            }
+        raw_scripts = review.get("bot_scripts")
+        has_agent_script = isinstance(raw_scripts, dict) and isinstance(raw_scripts.get(agent_id), dict)
+        if has_agent_script:
+            script_error = bot_scripts.bot_script_schema_error(raw_scripts.get(agent_id), agent_id)
+            if script_error:
+                return {
+                    "ok": False,
+                    "agent_id": agent_id,
+                    "review_outcome": outcome,
+                    "status": "fallback_no_promote",
+                    "error": "propose_update_bot_script_invalid:" + script_error,
+                }
+        has_rules = (agent_id == "superwing" and isinstance(review.get("superwing_rules"), dict)) or (
+            agent_id == "deepseek" and isinstance(review.get("deepseek_rules_md"), str)
+        )
+        if not (has_agent_script or has_rules):
+            return {
+                "ok": False,
+                "agent_id": agent_id,
+                "review_outcome": outcome,
+                "status": "fallback_no_promote",
+                "error": "propose_update_missing_strategy_payload",
+            }
+    return {"ok": True, "agent_id": agent_id, "review_outcome": outcome, "status": "model_ok", "error": ""}
+
+
+LOCAL_PROMOTION_METRIC_SOURCES = {
+    "local_replay_baseline_gate",
+    "recorder_replay",
+    "operator_approved_replay_gate",
+}
+
+
+def model_claimed_promotion_metrics(review: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
+    raw = review.get("proposal_metrics")
+    if isinstance(raw, dict):
+        agent_raw = raw.get(agent_id)
+        if isinstance(agent_raw, dict):
+            return agent_raw
+        return raw
+    return {}
+
+
+def promotion_metrics_path(data_dir: pathlib.Path, agent_id: str) -> pathlib.Path:
+    return data_dir / "strategy_reviews" / "promotion_metrics" / f"{agent_id}.json"
+
+
+def promotion_metrics_for_review(data_dir: pathlib.Path, agent_id: str) -> Dict[str, Any]:
+    payload = generate_dashboard.read_json(promotion_metrics_path(data_dir, agent_id), {})
+    if isinstance(payload, dict):
+        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else payload
+        source = str(payload.get("source") or metrics.get("source") or "").strip()
+        if source in LOCAL_PROMOTION_METRIC_SOURCES:
+            out = dict(metrics)
+            out["metric_source"] = source
+            return out
+    return {
+        "schema_valid": False,
+        "replay_ok": False,
+        "holdout_ok": False,
+        "after_fee_roi": 0.0,
+        "max_drawdown": 1.0,
+        "trade_count": 0,
+        "churn": 1.0,
+        "exposure_concentration": 1.0,
+        "metric_source": "missing",
+        "reason": "missing_independent_replay_holdout_promotion_metrics",
+    }
+
+
+def baseline_results_for_review(data_dir: pathlib.Path) -> Dict[str, Any]:
+    snapshots = generate_dashboard.snapshot_records(data_dir, [], limit=160)
+    result = quant_lanes.evaluate_baselines(snapshots)
+    try:
+        quant_lanes.atomic_write_json(quant_lanes.baseline_report_path(data_dir), result)
+    except Exception:
+        pass
+    return result
+
+
 def agent_review_record_path(data_dir: pathlib.Path, agent_id: str, review_id: str) -> pathlib.Path:
     return data_dir / "strategy_reviews" / "agents" / agent_id / f"{review_id}.json"
 
@@ -347,10 +491,13 @@ def write_agent_review_records(
     model_errors: Dict[str, str],
     review_status: str,
     validation_errors: List[str],
+    review_protocols: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, str]:
     paths: Dict[str, str] = {}
+    review_protocols = review_protocols or {}
     for agent_id in duel.AGENTS:
         review = agent_reviews.get(agent_id, {})
+        protocol = review_protocols.get(agent_id, {})
         payload = {
             "ok": agent_id in agent_reviews and agent_id not in model_errors,
             "review_id": review_id,
@@ -359,6 +506,8 @@ def write_agent_review_records(
             "learning_scope": "target_agent_raw_ledger_only",
             "peer_scope": "aggregate_peer_scoreboard_only",
             "review_status": review_status,
+            "review_outcome": protocol.get("review_outcome") or review.get("review_outcome") or review.get("outcome") or "",
+            "review_protocol_error": protocol.get("error", ""),
             "model_error": model_errors.get(agent_id, "")[:500],
             "review_model": review.get("review_model", "fallback_no_promote" if agent_id in model_errors else "unknown"),
             "primary_review_model": review.get("primary_review_model"),
@@ -394,6 +543,7 @@ def merge_isolated_agent_reviews(agent_reviews: Dict[str, Dict[str, Any]]) -> Di
     summaries = [str(agent_reviews.get(agent_id, {}).get("summary") or "").strip() for agent_id in duel.AGENTS]
     notes = [str(agent_reviews.get(agent_id, {}).get("public_dashboard_note") or "").strip() for agent_id in duel.AGENTS]
     return {
+        "review_outcomes": {agent_id: agent_reviews.get(agent_id, {}).get("review_outcome", agent_reviews.get(agent_id, {}).get("outcome", "")) for agent_id in duel.AGENTS},
         "summary": " | ".join(item for item in summaries if item) or "Per-agent isolated strategy reviews completed.",
         "findings": [item for agent_id in duel.AGENTS for item in _list_field(agent_reviews.get(agent_id, {}), "findings")],
         "superwing_rules": superwing_review.get("superwing_rules"),
@@ -425,18 +575,27 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
             agent_reviews[agent_id] = call_review_model(isolated_ctx)
         except Exception as exc:
             model_errors[agent_id] = str(exc)
+    review_protocols: Dict[str, Dict[str, Any]] = {}
+    for agent_id, review_payload in list(agent_reviews.items()):
+        protocol = normalize_review_protocol(review_payload, agent_id)
+        review_protocols[agent_id] = protocol
+        if not protocol.get("ok"):
+            model_errors[agent_id] = protocol.get("error", "invalid_review_protocol")
+            review_payload["review_model"] = "fallback_no_promote"
+            review_payload["review_outcome"] = protocol.get("review_outcome", "")
     model_failed = bool(model_errors)
     if model_failed:
         model_error = "; ".join(f"{agent}: {error[:500]}" for agent, error in model_errors.items())
         review = {
-            "summary": "Strategy review model output was not parseable; no rule changes promoted in this maintenance cycle.",
+            "summary": "Strategy review model output was invalid; no rule changes promoted in this maintenance cycle.",
             "findings": [f"review_model_error: {model_error[:500]}"],
+            "review_outcomes": {agent_id: review_protocols.get(agent_id, {}).get("review_outcome", "") for agent_id in duel.AGENTS},
             "superwing_rules": strategy_rules.load_superwing_rules(data_dir),
             "superwing_rationale": "Fallback only; keep current SuperWing rules.",
             "deepseek_rules_md": strategy_rules.load_deepseek_rules(data_dir),
             "deepseek_rationale": "Fallback only; keep current DeepSeek rules.",
-            "risk_notes": ["No rule promotion was performed because the review model output failed validation."],
-            "public_dashboard_note": "Strategy review fallback: malformed model output; current rules kept unchanged.",
+            "risk_notes": ["No rule promotion was performed because the review model output failed protocol validation."],
+            "public_dashboard_note": "Strategy review fallback: invalid model output; current rules kept unchanged.",
             "review_model": "fallback_no_promote",
             "structured_retry_used": True,
         }
@@ -447,35 +606,57 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     review_id = duel.utc_now().replace(":", "").replace("+00:00", "Z")
     proposed: Dict[str, Any] = {}
     promoted: Dict[str, Any] = {}
+    lane_controls: Dict[str, Any] = {}
+    promotion_gates: Dict[str, Any] = {}
 
     validation_errors = []
-    sw_candidate = review.get("superwing_rules")
-    sw_raw: Dict[str, Any] = sw_candidate if isinstance(sw_candidate, dict) else {}
-    placeholder_fields = [
-        key
-        for key in ("name", "selection", "notes", "review_rationale")
-        if strategy_rules.contains_placeholder_text(sw_raw.get(key))
-    ]
-    if strategy_rules.contains_placeholder_text(review.get("superwing_rationale")):
-        placeholder_fields.append("superwing_rationale")
-    if placeholder_fields:
-        validation_errors.append("superwing placeholder fields: " + ", ".join(sorted(set(placeholder_fields))))
-    sw_rules = strategy_rules.normalize_superwing_rules(sw_raw)
-    sw_proposal = strategy_rules.write_proposal(data_dir, review_id, "superwing", "_rules.json", json.dumps(sw_rules, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-    proposed["superwing_rules"] = str(sw_proposal)
-
-    ds_rules_text = review.get("deepseek_rules_md") or strategy_rules.load_deepseek_rules(data_dir)
-    try:
-        ds_rules_text = strategy_rules.validate_deepseek_rules(str(ds_rules_text))
-    except ValueError as exc:
-        validation_errors.append("deepseek rules rejected: " + str(exc))
-        ds_rules_text = strategy_rules.load_deepseek_rules(data_dir)
-    ds_proposal = strategy_rules.write_proposal(data_dir, review_id, "deepseek", "_rules.md", ds_rules_text)
-    proposed["deepseek_rules"] = str(ds_proposal)
-
+    baseline_results = baseline_results_for_review(data_dir)
     bot_script_candidates: Dict[str, Dict[str, Any]] = {}
     raw_bot_scripts = review.get("bot_scripts") if isinstance(review.get("bot_scripts"), dict) else {}
+    sw_rules = strategy_rules.load_superwing_rules(data_dir)
+    ds_rules_text = strategy_rules.load_deepseek_rules(data_dir)
     for agent_id in duel.AGENTS:
+        protocol = review_protocols.get(agent_id, {"review_outcome": "fallback_no_promote", "ok": False})
+        outcome = protocol.get("review_outcome")
+        if outcome == "KEEP_CURRENT_STRATEGY":
+            proposed[f"{agent_id}_protocol"] = "KEEP_CURRENT_STRATEGY"
+            continue
+        if outcome == "REQUEST_HOLD_ONLY":
+            lane_controls[agent_id] = quant_lanes.set_lane_control(
+                data_dir,
+                agent_id,
+                "hold_only",
+                reason=str(agent_reviews.get(agent_id, {}).get("summary") or "review_requested_hold_only"),
+                operator=f"strategy_review:{review_id}",
+            )
+            proposed[f"{agent_id}_protocol"] = "REQUEST_HOLD_ONLY"
+            continue
+        if outcome != "PROPOSE_UPDATE":
+            continue
+        if agent_id == "superwing":
+            sw_candidate = review.get("superwing_rules")
+            sw_raw: Dict[str, Any] = sw_candidate if isinstance(sw_candidate, dict) else {}
+            placeholder_fields = [
+                key
+                for key in ("name", "selection", "notes", "review_rationale")
+                if strategy_rules.contains_placeholder_text(sw_raw.get(key))
+            ]
+            if strategy_rules.contains_placeholder_text(review.get("superwing_rationale")):
+                placeholder_fields.append("superwing_rationale")
+            if placeholder_fields:
+                validation_errors.append("superwing placeholder fields: " + ", ".join(sorted(set(placeholder_fields))))
+            sw_rules = strategy_rules.normalize_superwing_rules(sw_raw)
+            sw_proposal = strategy_rules.write_proposal(data_dir, review_id, "superwing", "_rules.json", json.dumps(sw_rules, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            proposed["superwing_rules"] = str(sw_proposal)
+        if agent_id == "deepseek":
+            ds_rules_text = review.get("deepseek_rules_md") or strategy_rules.load_deepseek_rules(data_dir)
+            try:
+                ds_rules_text = strategy_rules.validate_deepseek_rules(str(ds_rules_text))
+            except ValueError as exc:
+                validation_errors.append("deepseek rules rejected: " + str(exc))
+                ds_rules_text = strategy_rules.load_deepseek_rules(data_dir)
+            ds_proposal = strategy_rules.write_proposal(data_dir, review_id, "deepseek", "_rules.md", ds_rules_text)
+            proposed["deepseek_rules"] = str(ds_proposal)
         current_script = bot_scripts.load_bot_script(data_dir, agent_id)
         candidate = raw_bot_scripts.get(agent_id) if isinstance(raw_bot_scripts, dict) else None
         if isinstance(candidate, dict):
@@ -497,10 +678,20 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         )
         proposed[f"{agent_id}_bot_script"] = str(proposal_path)
 
-    promote = (not model_failed) and (not model_fallback_used) and (not validation_errors) and auto_promote_enabled(args)
+        promotion_gates[agent_id] = quant_lanes.evaluate_promotion_gate(
+            promotion_metrics_for_review(data_dir, agent_id),
+            baseline_results,
+        )
+        promotion_gates[agent_id]["model_claimed_metrics_ignored"] = bool(model_claimed_promotion_metrics(agent_reviews.get(agent_id, {}), agent_id))
+
+    proposed_agents = [agent_id for agent_id in duel.AGENTS if f"{agent_id}_bot_script" in proposed]
+    gates_pass = bool(proposed_agents) and all(promotion_gates.get(agent_id, {}).get("status") == "pass" for agent_id in proposed_agents)
+    promote = (not model_failed) and (not model_fallback_used) and (not validation_errors) and gates_pass and auto_promote_enabled(args)
     if promote:
-        promoted["superwing_rules"] = str(strategy_rules.promote_superwing_rules(data_dir, sw_rules, source=f"review:{review_id}", rationale=str(review.get("superwing_rationale", ""))))
-        promoted["deepseek_rules"] = str(strategy_rules.promote_deepseek_rules(data_dir, ds_rules_text, source=f"review:{review_id}", rationale=str(review.get("deepseek_rationale", ""))))
+        if "superwing_rules" in proposed:
+            promoted["superwing_rules"] = str(strategy_rules.promote_superwing_rules(data_dir, sw_rules, source=f"review:{review_id}", rationale=str(review.get("superwing_rationale", ""))))
+        if "deepseek_rules" in proposed:
+            promoted["deepseek_rules"] = str(strategy_rules.promote_deepseek_rules(data_dir, ds_rules_text, source=f"review:{review_id}", rationale=str(review.get("deepseek_rationale", ""))))
         for agent_id, candidate in bot_script_candidates.items():
             promoted[f"{agent_id}_bot_script"] = str(bot_scripts.write_bot_script(data_dir, agent_id, candidate, source=f"review:{review_id}"))
 
@@ -511,13 +702,21 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         review_status = "model_ok"
     usage_summary = merge_model_usage(agent_reviews)
-    agent_review_paths = write_agent_review_records(data_dir, review_id, agent_reviews, model_errors, review_status, validation_errors)
+    agent_review_paths = write_agent_review_records(data_dir, review_id, agent_reviews, model_errors, review_status, validation_errors, review_protocols)
     record = {
         "ok": True,
         "review_id": review_id,
         "ts": duel.utc_now(),
         "review_model": review.get("review_model"),
         "review_status": review_status,
+        "review_cadence_seconds": quant_lanes.review_cadence_seconds(),
+        "review_outcomes": {
+            agent_id: review_protocols.get(agent_id, {}).get("review_outcome")
+            or agent_reviews.get(agent_id, {}).get("review_outcome")
+            or agent_reviews.get(agent_id, {}).get("outcome")
+            or ""
+            for agent_id in duel.AGENTS
+        },
         "model_fallback_used": model_fallback_used,
         "review_model_usage": usage_summary,
         "per_agent_review_paths": agent_review_paths,
@@ -531,6 +730,9 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         "public_dashboard_note": review.get("public_dashboard_note", ""),
         "proposed": proposed,
         "promoted": promoted,
+        "promotion_gates": promotion_gates,
+        "baseline_results": baseline_results,
+        "lane_controls": lane_controls,
         "superwing_rationale": review.get("superwing_rationale", ""),
         "deepseek_rationale": review.get("deepseek_rationale", ""),
     }
@@ -558,13 +760,13 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Run Aurum 5h strategy review and optional rule-prompt promotion")
+    p = argparse.ArgumentParser(description="Run Aurum configurable slow strategy review and optional gated rule-prompt promotion")
     p.add_argument("--data-dir", default="data/paper_duel")
     p.add_argument("--env-file", default=".env")
     p.add_argument("--dashboard-dir", default="")
     p.add_argument("--operator-dashboard-dir", default="")
     p.add_argument("--limit-ticks", type=int, default=24)
-    p.add_argument("--auto-promote", action="store_true", help="promote validated rule updates even without env gate")
+    p.add_argument("--auto-promote", action="store_true", help="promote validated rule updates when replay/baseline gate also passes")
     p.add_argument("--no-promote", action="store_true", help="write proposals only")
     return p
 
