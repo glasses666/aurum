@@ -559,6 +559,108 @@ def merge_isolated_agent_reviews(agent_reviews: Dict[str, Dict[str, Any]]) -> Di
     }
 
 
+def latest_review_record(data_dir: pathlib.Path) -> Dict[str, Any]:
+    root = data_dir / "strategy_reviews"
+    if not root.exists():
+        return {}
+    for path in sorted(root.glob("*.json"), reverse=True):
+        row = generate_dashboard.read_json(path, None)
+        if isinstance(row, dict):
+            return row
+    return {}
+
+
+def _float_env(name: str, default: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _truthy_env(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def review_skip_decision(data_dir: pathlib.Path, base_ctx: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
+    ticks = base_ctx.get("recent_ticks") if isinstance(base_ctx.get("recent_ticks"), list) else []
+    latest_tick = ticks[-1] if ticks else {}
+    latest_tick_id = str(latest_tick.get("tick_id") or latest_tick.get("ts") or "")
+    latest_review = latest_review_record(data_dir)
+    latest_review_tick_id = str(latest_review.get("latest_tick_id") or "")
+    frozen_lanes = []
+    for lane_id in duel.AGENTS:
+        try:
+            control = quant_lanes.load_lane_control(data_dir, lane_id)
+        except Exception:
+            continue
+        if control.get("status") == "frozen":
+            frozen_lanes.append(lane_id)
+    if force:
+        return {"skip": False, "reason": "forced"}
+    if frozen_lanes:
+        return {"skip": False, "reason": "frozen_lane_requires_review", "frozen_lanes": frozen_lanes}
+    quota_used = max(_float_env("AURUM_REVIEW_QUOTA_USED_PCT", -1.0), _float_env("AURUM_OPENAI_5H_USED_PCT", -1.0))
+    quota_threshold = _float_env("AURUM_REVIEW_QUOTA_SKIP_PCT", 85.0)
+    if quota_used >= quota_threshold >= 0.0:
+        return {"skip": True, "reason": "quota_safe_skip", "quota_used_pct": quota_used, "quota_skip_pct": quota_threshold}
+    if _truthy_env("AURUM_REVIEW_SKIP_NO_CHANGE", True) and latest_tick_id and latest_tick_id == latest_review_tick_id:
+        return {"skip": True, "reason": "no_new_tick_since_last_review", "latest_tick_id": latest_tick_id}
+    return {"skip": False, "reason": "changes_available", "latest_tick_id": latest_tick_id}
+
+
+def write_skip_record(args: argparse.Namespace, data_dir: pathlib.Path, env_file: Optional[pathlib.Path], base_ctx: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
+    review_id = duel.utc_now().replace(":", "").replace("+00:00", "Z") + "-skip"
+    ticks = base_ctx.get("recent_ticks") if isinstance(base_ctx.get("recent_ticks"), list) else []
+    latest_tick = ticks[-1] if ticks else {}
+    record = {
+        "ok": True,
+        "review_id": review_id,
+        "ts": duel.utc_now(),
+        "review_model": "skip_no_model_call",
+        "review_status": "skipped",
+        "review_cadence_seconds": quant_lanes.review_cadence_seconds(),
+        "review_outcomes": {agent_id: "KEEP_CURRENT_STRATEGY" for agent_id in duel.AGENTS},
+        "summary": "Slow review skipped by quota/no-change guard; executable strategies left unchanged.",
+        "findings": ["No model call was made."],
+        "risk_notes": [],
+        "public_dashboard_note": "Slow review skipped safely; current strategies kept unchanged.",
+        "proposed": {},
+        "promoted": {},
+        "promotion_gates": {},
+        "baseline_results": baseline_results_for_review(data_dir),
+        "lane_controls": {},
+        "skip_decision": decision,
+        "latest_tick_id": latest_tick.get("tick_id") or latest_tick.get("ts") or "",
+        "latest_tick_count": len(ticks),
+    }
+    out_dir = data_dir / "strategy_reviews"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{review_id}.json"
+    out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    dashboard_dir = args.dashboard_dir or os.environ.get("AURUM_PUBLIC_DASHBOARD_DIR", "/opt/aurum/public/dashboard")
+    operator_dashboard_dir = args.operator_dashboard_dir or os.environ.get("AURUM_OPERATOR_DASHBOARD_DIR", "")
+    try:
+        dash_args = argparse.Namespace(
+            data_dir=str(data_dir),
+            env_file=str(env_file or ""),
+            output_dir=dashboard_dir,
+            operator_output_dir=operator_dashboard_dir,
+        )
+        dashboard_path = generate_dashboard.render(dash_args)
+        record["dashboard_path"] = str(dashboard_path)
+        out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception as exc:
+        record["dashboard_error"] = str(exc)
+        out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return record
+
+
 def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     data_dir = pathlib.Path(args.data_dir)
     env_file = pathlib.Path(args.env_file) if args.env_file else None
@@ -567,6 +669,9 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     strategy_rules.ensure_default_rules(data_dir)
     bot_scripts.ensure_default_bot_scripts(data_dir)
     base_ctx = review_context(data_dir, args.limit_ticks)
+    skip = review_skip_decision(data_dir, base_ctx, force=getattr(args, "force_review", False))
+    if skip.get("skip"):
+        return write_skip_record(args, data_dir, env_file, base_ctx, skip)
     agent_reviews: Dict[str, Dict[str, Any]] = {}
     model_errors: Dict[str, str] = {}
     for agent_id in duel.AGENTS:
@@ -703,6 +808,9 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         review_status = "model_ok"
     usage_summary = merge_model_usage(agent_reviews)
     agent_review_paths = write_agent_review_records(data_dir, review_id, agent_reviews, model_errors, review_status, validation_errors, review_protocols)
+    recent_ticks_raw = base_ctx.get("recent_ticks")
+    recent_ticks_for_meta: List[Dict[str, Any]] = recent_ticks_raw if isinstance(recent_ticks_raw, list) else []
+    latest_tick_for_meta: Dict[str, Any] = recent_ticks_for_meta[-1] if recent_ticks_for_meta else {}
     record = {
         "ok": True,
         "review_id": review_id,
@@ -710,6 +818,8 @@ def run_review(args: argparse.Namespace) -> Dict[str, Any]:
         "review_model": review.get("review_model"),
         "review_status": review_status,
         "review_cadence_seconds": quant_lanes.review_cadence_seconds(),
+        "latest_tick_id": latest_tick_for_meta.get("tick_id") or latest_tick_for_meta.get("ts") or "",
+        "latest_tick_count": len(recent_ticks_for_meta),
         "review_outcomes": {
             agent_id: review_protocols.get(agent_id, {}).get("review_outcome")
             or agent_reviews.get(agent_id, {}).get("review_outcome")
@@ -768,6 +878,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit-ticks", type=int, default=24)
     p.add_argument("--auto-promote", action="store_true", help="promote validated rule updates when replay/baseline gate also passes")
     p.add_argument("--no-promote", action="store_true", help="write proposals only")
+    p.add_argument("--force-review", action="store_true", help="bypass quota/no-change skip guards for an explicit operator run")
     return p
 
 

@@ -14,10 +14,12 @@ import hashlib
 import json
 import math
 import pathlib
+import re
 import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import agent_duel as duel
+import strategy_rules
 
 LANE_SCHEMA_VERSION = 1
 CONTROL_SCHEMA_VERSION = 1
@@ -102,10 +104,84 @@ def baseline_report_path(data_dir: pathlib.Path) -> pathlib.Path:
     return lanes_root(data_dir) / "baseline_report.json"
 
 
+def proposal_decisions_path(data_dir: pathlib.Path) -> pathlib.Path:
+    return lanes_root(data_dir) / "proposal_decisions.jsonl"
+
+
+def proposal_decision_dir(data_dir: pathlib.Path) -> pathlib.Path:
+    return lanes_root(data_dir) / "proposal_decisions"
+
+
 def append_jsonl(path: pathlib.Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(json_safe(record), ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n")
+
+
+def _read_jsonl(path: pathlib.Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+    except Exception:
+        return []
+    return rows
+
+
+SENSITIVE_EVIDENCE_KEY_PARTS = (
+    "api",
+    "authorization",
+    "bearer",
+    "connection",
+    "credential",
+    "env",
+    "file",
+    "host",
+    "hostname",
+    "ip",
+    "key",
+    "password",
+    "path",
+    "private",
+    "remote",
+    "root",
+    "secret",
+    "server",
+    "ssh",
+    "token",
+)
+SENSITIVE_EVIDENCE_PATTERNS = (
+    re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I),
+    re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    re.compile(r"(?:ssh|postgres|mysql|mongodb|redis)://[^\s\"']+", re.I),
+    re.compile(r"(?:^|[\s\"'])/(?:Users|home|root|opt|etc|var)/[^\s\"']+"),
+)
+
+
+def redact_evidence(value: Any, key: Any = "") -> Any:
+    key_text = str(key or "").lower()
+    if any(part in key_text for part in SENSITIVE_EVIDENCE_KEY_PARTS) and isinstance(value, (str, int, float, bool)):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {str(k): redact_evidence(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_evidence(item, key) for item in value]
+    if isinstance(value, str):
+        redacted = value
+        for pattern in SENSITIVE_EVIDENCE_PATTERNS:
+            redacted = pattern.sub("[redacted]", redacted)
+        return redacted
+    return value
 
 
 def review_cadence_seconds(env: Optional[Dict[str, str]] = None) -> int:
@@ -313,6 +389,136 @@ def lane_operator_rows(
     return rows
 
 
+PROPOSAL_SUFFIXES = {
+    "_rules.json": "rules_json",
+    "_rules.md": "rules_markdown",
+    "_bot_script.json": "bot_script_json",
+}
+
+
+def _parse_proposal_artifact(path: pathlib.Path) -> Optional[Dict[str, str]]:
+    name = path.name
+    for agent_id in DEFAULT_LANE_DEFS:
+        for suffix, kind in PROPOSAL_SUFFIXES.items():
+            marker = f"_{agent_id}{suffix}"
+            if name.endswith(marker):
+                review_id = name[: -len(marker)]
+                if review_id:
+                    return {"review_id": review_id, "agent_id": agent_id, "artifact_kind": kind}
+    return None
+
+
+def _proposal_id(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:16]
+
+
+def _proposal_decision_index(data_dir: pathlib.Path) -> Dict[str, Dict[str, Any]]:
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for row in _read_jsonl(proposal_decisions_path(pathlib.Path(data_dir))):
+        proposal_id = str(row.get("proposal_id") or "")
+        if proposal_id:
+            decisions[proposal_id] = row
+    return decisions
+
+
+def _review_gate_for_proposal(data_dir: pathlib.Path, review_id: str, agent_id: str) -> Dict[str, Any]:
+    review = _read_json(pathlib.Path(data_dir) / "strategy_reviews" / f"{review_id}.json", {})
+    if isinstance(review, dict):
+        gates = review.get("promotion_gates") if isinstance(review.get("promotion_gates"), dict) else {}
+        gate = gates.get(agent_id) if isinstance(gates, dict) else None
+        if isinstance(gate, dict):
+            return gate
+    return {"status": "missing", "executable": False, "reasons": ["promotion_gate_missing"]}
+
+
+def list_strategy_proposals(data_dir: pathlib.Path, *, include_decided: bool = True) -> List[Dict[str, Any]]:
+    data_dir = pathlib.Path(data_dir)
+    root = strategy_rules.proposal_dir(data_dir)
+    if not root.exists():
+        return []
+    decisions = _proposal_decision_index(data_dir)
+    proposals: List[Dict[str, Any]] = []
+    for path in sorted(root.glob("*")):
+        if not path.is_file():
+            continue
+        parsed = _parse_proposal_artifact(path)
+        if not parsed:
+            continue
+        proposal_id = _proposal_id(path)
+        decision = decisions.get(proposal_id)
+        if decision and not include_decided:
+            continue
+        gate = _review_gate_for_proposal(data_dir, parsed["review_id"], parsed["agent_id"])
+        can_approve = gate.get("status") == "pass" and gate.get("executable") is True
+        proposals.append(
+            {
+                "proposal_id": proposal_id,
+                "artifact": path.name,
+                "review_id": parsed["review_id"],
+                "agent_id": parsed["agent_id"],
+                "artifact_kind": parsed["artifact_kind"],
+                "status": str((decision or {}).get("status") or "pending"),
+                "gate_status": gate.get("status"),
+                "gate_executable": gate.get("executable") is True,
+                "gate_reasons": gate.get("reasons", []) if isinstance(gate.get("reasons"), list) else [],
+                "can_approve": can_approve,
+                "decision": decision or {},
+            }
+        )
+    return proposals
+
+
+def resolve_strategy_proposal(data_dir: pathlib.Path, proposal: str) -> Dict[str, Any]:
+    wanted = str(proposal or "").strip()
+    if not wanted:
+        raise duel.DuelError("proposal id or artifact is required")
+    for item in list_strategy_proposals(data_dir, include_decided=True):
+        if wanted in {item["proposal_id"], item["artifact"]}:
+            return item
+    raise duel.DuelError(f"unknown strategy proposal: {wanted}")
+
+
+def record_proposal_decision(
+    data_dir: pathlib.Path,
+    proposal: str,
+    action: str,
+    *,
+    operator: str = "local_operator",
+    reason: str = "",
+) -> Dict[str, Any]:
+    action = str(action or "").strip().lower()
+    if action not in {"approve", "reject"}:
+        raise duel.DuelError("proposal action must be approve or reject")
+    item = resolve_strategy_proposal(pathlib.Path(data_dir), proposal)
+    if item.get("status") in {"approved", "rejected"}:
+        raise duel.DuelError(f"proposal already {item.get('status')}: {item.get('proposal_id')}")
+    if action == "approve" and not item.get("can_approve"):
+        raise duel.DuelError(
+            "proposal cannot be approved before schema/replay/holdout/baseline gate passes: "
+            + ",".join(str(reason) for reason in item.get("gate_reasons", []))
+        )
+    record = {
+        "ts": utc_now(),
+        "event": "strategy_proposal_decision",
+        "proposal_id": item["proposal_id"],
+        "artifact": item["artifact"],
+        "review_id": item["review_id"],
+        "agent_id": item["agent_id"],
+        "artifact_kind": item["artifact_kind"],
+        "status": "approved" if action == "approve" else "rejected",
+        "operator": str(operator or "local_operator")[:120],
+        "reason": str(reason or "")[:500],
+        "gate_status": item.get("gate_status"),
+        "gate_executable": item.get("gate_executable") is True,
+        "gate_reasons": item.get("gate_reasons", []),
+        "paper_only": True,
+        "promotion_is_separate_step": True,
+    }
+    atomic_write_json(proposal_decision_dir(pathlib.Path(data_dir)) / f"{item['proposal_id']}.json", record)
+    append_jsonl(proposal_decisions_path(pathlib.Path(data_dir)), record)
+    return record
+
+
 def _extract_price_series(frames: Iterable[Dict[str, Any]]) -> List[float]:
     values: List[float] = []
     for frame in frames:
@@ -499,7 +705,13 @@ def detect_extreme_events(
     return reasons
 
 
-def protective_flow(lane_id: str, reasons: List[str], *, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def protective_flow(
+    lane_id: str,
+    reasons: List[str],
+    *,
+    evidence: Optional[Dict[str, Any]] = None,
+    protective_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     return {
         "version": BLACK_SWAN_FLOW_VERSION,
         "lane_id": lane_id,
@@ -516,8 +728,124 @@ def protective_flow(lane_id: str, reasons: List[str], *, evidence: Optional[Dict
             "set_hold_only",
         ],
         "model_may_trade_in_hot_path": False,
-        "evidence": json_safe(evidence or {}),
+        "evidence": redact_evidence(evidence or {}),
+        "protective_result": json_safe(protective_result or {}),
     }
+
+
+def _outcome_price(market: Dict[str, Any], outcome_name: str) -> Optional[float]:
+    for outcome in market.get("outcomes", []) or []:
+        if not isinstance(outcome, dict):
+            continue
+        if str(outcome.get("name", "")).lower() != str(outcome_name or "").lower():
+            continue
+        try:
+            parsed = float(outcome.get("price"))
+        except Exception:
+            return None
+        return parsed if math.isfinite(parsed) and 0.0 < parsed < 1.0 else None
+    return None
+
+
+def protective_close_orders(state: Dict[str, Any], lane_id: str, reasons: List[str], *, close_fraction: float = 1.0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    accounts = state.get("accounts") if isinstance(state.get("accounts"), dict) else {}
+    account = accounts.get(lane_id) if isinstance(accounts, dict) else {}
+    positions = account.get("positions") if isinstance(account, dict) and isinstance(account.get("positions"), dict) else {}
+    markets = state.get("last_markets") if isinstance(state.get("last_markets"), list) else []
+    market_by_id = {str(market.get("market_id")): market for market in markets if isinstance(market, dict)}
+    orders: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    fraction = max(0.0, min(1.0, float(close_fraction or 1.0)))
+    reason_text = ",".join(reasons) or "black_swan_protection"
+    for pos_key, position in positions.items():
+        if not isinstance(position, dict):
+            continue
+        market_id = str(position.get("market_id") or "")
+        outcome_name = str(position.get("outcome") or "")
+        market = market_by_id.get(market_id)
+        if not market:
+            skipped.append({"position": str(pos_key), "market_id": market_id, "reason": "latest_market_missing"})
+            continue
+        price = _outcome_price(market, outcome_name)
+        if price is None:
+            skipped.append({"position": str(pos_key), "market_id": market_id, "outcome": outcome_name, "reason": "latest_outcome_price_missing"})
+            continue
+        try:
+            shares = float(position.get("shares") or 0.0) * fraction
+        except Exception:
+            shares = 0.0
+        if not math.isfinite(shares) or shares <= 0:
+            skipped.append({"position": str(pos_key), "market_id": market_id, "outcome": outcome_name, "reason": "no_positive_shares"})
+            continue
+        orders.append(
+            {
+                "market_id": market_id,
+                "outcome": outcome_name,
+                "side": "sell",
+                "shares": round(shares, 6),
+                "limit_price": round(max(0.01, price - duel.SLIPPAGE_BPS / 10000.0), 4),
+                "rationale": "deterministic black-swan protective close before model review: " + reason_text[:320],
+            }
+        )
+    return orders, skipped
+
+
+def execute_deterministic_protection(data_dir: pathlib.Path, lane_id: str, reasons: List[str]) -> Dict[str, Any]:
+    data_dir = pathlib.Path(data_dir)
+    try:
+        state = duel.init_state(data_dir, reset=False)
+    except Exception:
+        state = duel.init_state(data_dir, reset=False)
+    account_before = duel.account_digest(state.get("accounts", {}).get(lane_id, {})) if lane_id in state.get("accounts", {}) else {}
+    orders, skipped = protective_close_orders(state, lane_id, reasons)
+    markets = state.get("last_markets") if isinstance(state.get("last_markets"), list) else []
+    decision = {
+        "agent_id": lane_id,
+        "source": "deterministic_black_swan_protection",
+        "orders": orders,
+        "notes": "cancel simulated orders; close/reduce paper exposure if latest market prices are available; freeze lane before model review",
+    }
+    if orders:
+        result = duel.validate_and_apply(
+            data_dir,
+            state,
+            lane_id,
+            decision,
+            markets,
+            apply=True,
+            max_orders=max(1, len(orders)),
+            max_notional_per_order=duel.STARTING_EQUITY,
+            execution_context={"source": "black_swan_protection", "black_swan_reasons": reasons},
+        )
+        state_after = duel.load_state(data_dir)
+    else:
+        result = {"fills": [], "rejections": [], "applied": True, "reason": "no_closeable_open_positions"}
+        state_after = state
+    account_after = duel.account_digest(state_after.get("accounts", {}).get(lane_id, {})) if lane_id in state_after.get("accounts", {}) else {}
+    status = "closed_or_reduced" if result.get("fills") else "attempted_no_fills" if orders else "nothing_to_close"
+    record = {
+        "status": status,
+        "protective_action_order": 1,
+        "orders_attempted": len(orders),
+        "fills": len(result.get("fills", []) or []),
+        "rejections": len(result.get("rejections", []) or []),
+        "skipped_positions": skipped,
+        "decision": decision,
+        "result": result,
+        "account_delta": {"before": account_before, "after": account_after},
+    }
+    duel.append_risk_ledger(
+        data_dir,
+        {
+            "ts": utc_now(),
+            "event": "black_swan_deterministic_protection",
+            "agent_id": lane_id,
+            "reasons": reasons,
+            "protective_result": record,
+            "account_delta": record["account_delta"],
+        },
+    )
+    return record
 
 
 def apply_black_swan_protection(
@@ -528,17 +856,19 @@ def apply_black_swan_protection(
     evidence: Optional[Dict[str, Any]] = None,
     cooldown_until: str = "",
 ) -> Dict[str, Any]:
-    flow = protective_flow(lane_id, reasons, evidence=evidence)
+    data_dir = pathlib.Path(data_dir)
+    protective_result = execute_deterministic_protection(data_dir, lane_id, reasons)
     control = set_lane_control(
-        pathlib.Path(data_dir),
+        data_dir,
         lane_id,
         "frozen",
         reason=",".join(reasons) or "black_swan_protection",
         operator="deterministic_protective_flow",
         cooldown_until=cooldown_until,
     )
+    flow = protective_flow(lane_id, reasons, evidence=evidence, protective_result=protective_result)
     record = {"ts": utc_now(), "event": "black_swan_protection", "flow": flow, "control": control}
-    append_jsonl(lane_events_path(pathlib.Path(data_dir)), record)
+    append_jsonl(lane_events_path(data_dir), record)
     return record
 
 
@@ -577,7 +907,24 @@ def command_gate(args: argparse.Namespace) -> None:
 
 
 def command_protect(args: argparse.Namespace) -> None:
-    payload = apply_black_swan_protection(pathlib.Path(args.data_dir), args.lane, args.reason, cooldown_until=args.cooldown_until)
+    evidence = _read_json(pathlib.Path(args.evidence), {}) if args.evidence else {}
+    payload = apply_black_swan_protection(pathlib.Path(args.data_dir), args.lane, args.reason, evidence=evidence if isinstance(evidence, dict) else {}, cooldown_until=args.cooldown_until)
+    print(json.dumps(json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
+
+
+def command_proposals(args: argparse.Namespace) -> None:
+    payload = {"ok": True, "proposals": list_strategy_proposals(pathlib.Path(args.data_dir), include_decided=args.include_decided)}
+    print(json.dumps(json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
+
+
+def command_proposal_decision(args: argparse.Namespace) -> None:
+    payload = record_proposal_decision(
+        pathlib.Path(args.data_dir),
+        args.proposal,
+        args.action,
+        operator=args.operator,
+        reason=args.reason,
+    )
     print(json.dumps(json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
 
 
@@ -603,11 +950,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--metrics", default="")
     p_gate.add_argument("--baselines", default="")
     p_gate.set_defaults(func=command_gate)
-    p_protect = sub.add_parser("protect", help="freeze a lane after deterministic black-swan protection")
+    p_protect = sub.add_parser("protect", help="execute deterministic black-swan protection, then freeze a lane")
     p_protect.add_argument("--lane", choices=tuple(DEFAULT_LANE_DEFS), required=True)
     p_protect.add_argument("--reason", action="append", default=[])
     p_protect.add_argument("--cooldown-until", default="")
+    p_protect.add_argument("--evidence", default="")
     p_protect.set_defaults(func=command_protect)
+    p_proposals = sub.add_parser("proposals", help="list pending/reviewed strategy proposal artifacts and gate status")
+    p_proposals.add_argument("--include-decided", action="store_true")
+    p_proposals.set_defaults(func=command_proposals)
+    p_proposal_decision = sub.add_parser("proposal-decision", help="approve or reject a proposal after gate validation")
+    p_proposal_decision.add_argument("action", choices=("approve", "reject"))
+    p_proposal_decision.add_argument("--proposal", required=True)
+    p_proposal_decision.add_argument("--operator", default="local_operator")
+    p_proposal_decision.add_argument("--reason", default="")
+    p_proposal_decision.set_defaults(func=command_proposal_decision)
     return parser
 
 

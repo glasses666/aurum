@@ -11,6 +11,7 @@ before calling the VPS deployment runtime-complete.
   probability, separate from agent ROI.
 - Dashboard manifest now records BTC chart flat/variable status so a genuinely
   flat source series is not confused with a rendering bug.
+- BTC chart selector root cause fixed: the old public chart selected the highest-volume BTC-tagged market, which on the live dashboard was the long-horizon low-probability `Will bitcoin hit $1m before GTA VI?` market. That market can be legitimately near-flat even while BTC is moving. The selector now scores persistent BTC candidates by non-extreme latest Yes price, observed variation, sample count, then liquidity/volume, and records the selector diagnostic in the safe public manifest.
 - Quant-lane governance scaffold covers SuperWing, DeepSeek, GPT, Claude, and
   manual lanes with paper-only public/private separation.
 - Slow review protocol now requires `KEEP_CURRENT_STRATEGY`,
@@ -19,10 +20,11 @@ before calling the VPS deployment runtime-complete.
   replay/holdout/baseline gate pass.
 - Baselines cover no-trade, buy-and-hold, simple momentum, simple
   mean-reversion, and random-safe using the paper fee model.
-- Black-swan flow freezes lanes only after deterministic protective action and
-  redacted evidence capture.
+- Black-swan flow executes deterministic paper protective close/reduce orders first, records redacted evidence/account delta, then freezes the lane for model resume/update/retire review.
 - Private operator output remains separate from public dashboard output and can
   be controlled with `scripts/quant_lanes.py`.
+- Operator proposal workflow lists proposal artifacts and requires a passed schema/replay/holdout/baseline promotion gate before `proposal-decision approve`; rejected/ungated proposals stay non-executable.
+- Slow review cadence is quota-safe: no-change cycles and high quota usage can skip model calls while preserving `KEEP_CURRENT_STRATEGY` semantics and generating a skip record/dashboard refresh.
 
 ## Rollback Boundaries
 

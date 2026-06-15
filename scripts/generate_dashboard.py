@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import html
 import json
 import math
@@ -494,7 +495,16 @@ def choose_bitcoin_market(markets: Iterable[Dict[str, Any]]) -> Optional[Dict[st
     candidates = [m for m in markets if isinstance(m, dict) and market_is_bitcoin(m)]
     if not candidates:
         return None
-    candidates.sort(key=lambda m: (float(m.get("volume", 0.0) or 0.0), float(m.get("liquidity", 0.0) or 0.0)), reverse=True)
+    def score(market: Dict[str, Any]) -> Tuple[int, float, float, float]:
+        price = yes_price(market)
+        non_extreme = 1 if price is not None and 0.03 <= price <= 0.97 else 0
+        return (
+            non_extreme,
+            float(market.get("volume", 0.0) or 0.0),
+            float(market.get("liquidity", 0.0) or 0.0),
+            0.0 if price is None else 1.0 - abs(float(price) - 0.5),
+        )
+    candidates.sort(key=score, reverse=True)
     return candidates[0]
 
 
@@ -552,25 +562,72 @@ def snapshot_records(data_dir: pathlib.Path, ticks: List[Dict[str, Any]], limit:
     return rows[-limit:]
 
 
+def market_identity(market: Dict[str, Any]) -> str:
+    for key in ("market_id", "condition_id", "id", "slug", "question"):
+        value = str(market.get(key) or "").strip()
+        if value:
+            return value
+    return hashlib.sha256(json.dumps(market, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def bitcoin_series_from_snapshots(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], str, Dict[str, Any]]:
+    by_market: Dict[str, List[Dict[str, Any]]] = {}
+    latest_by_market: Dict[str, Dict[str, Any]] = {}
+    for snap in records:
+        markets = snap.get("markets", []) if isinstance(snap.get("markets"), list) else []
+        for market in markets:
+            if not isinstance(market, dict) or not market_is_bitcoin(market):
+                continue
+            price = yes_price(market)
+            if price is None or not math.isfinite(float(price)):
+                continue
+            key = market_identity(market)
+            latest_by_market[key] = market
+            by_market.setdefault(key, []).append({"ts": snap.get("ts") or snap.get("snapshot_id"), "value": float(price), "market": market})
+    if not by_market:
+        return [], None, "btc_market_yes_price", {"root_cause": "no_bitcoin_snapshot_series_available"}
+    def score(item: Tuple[str, List[Dict[str, Any]]]) -> Tuple[int, float, int, float, float]:
+        key, series = item
+        values = [float(point.get("value", 0.0)) for point in series]
+        delta = max(values) - min(values) if values else 0.0
+        latest_market = latest_by_market.get(key, {})
+        latest_price = values[-1] if values else 0.0
+        non_extreme = 1 if 0.03 <= latest_price <= 0.97 else 0
+        return (
+            non_extreme,
+            delta,
+            len(series),
+            float(latest_market.get("volume", 0.0) or 0.0),
+            float(latest_market.get("liquidity", 0.0) or 0.0),
+        )
+    chosen_key, chosen_points = max(by_market.items(), key=score)
+    latest_market = latest_by_market.get(chosen_key)
+    values = [float(point.get("value", 0.0)) for point in chosen_points]
+    root_cause = (
+        "previous_selector_preferred_highest_volume_long_horizon_btc_market; selecting persistent BTC market by non-extreme latest price, observed variation, sample count, then liquidity/volume"
+    )
+    diagnostic = {
+        "root_cause": root_cause,
+        "candidate_market_count": len(by_market),
+        "selected_market_id": chosen_key,
+        "selected_question": str((latest_market or {}).get("question") or ""),
+        "selected_point_count": len(chosen_points),
+        "selected_delta": round((max(values) - min(values)) if values else 0.0, 8),
+    }
+    return chosen_points[-120:], latest_market, "btc_market_yes_price_variable_selector", diagnostic
+
+
 def bitcoin_series(data_dir: pathlib.Path, ticks: List[Dict[str, Any]], state: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], str]:
-    points: List[Dict[str, Any]] = []
-    latest_market: Optional[Dict[str, Any]] = None
-    for snap in snapshot_records(data_dir, ticks):
-        market = choose_bitcoin_market(snap.get("markets", []) or [])
-        if not market:
-            continue
-        price = yes_price(market)
-        if price is None:
-            continue
-        latest_market = market
-        points.append({"ts": snap.get("ts") or snap.get("snapshot_id"), "value": price, "market": market})
+    records = snapshot_records(data_dir, ticks)
+    points, latest_market, source, _diagnostic = bitcoin_series_from_snapshots(records)
     if not latest_market:
         latest_market = choose_bitcoin_market(state.get("last_markets", []) if isinstance(state, dict) else [])
         if latest_market:
             price = yes_price(latest_market)
             if price is not None:
                 points.append({"ts": state.get("updated_at") or utc_now(), "value": price, "market": latest_market})
-    return points[-120:], latest_market, "btc_market_yes_price"
+                source = "btc_market_yes_price_state_fallback"
+    return points[-120:], latest_market, source
 
 
 def btc_chart_summary(points: List[Dict[str, Any]], *, epsilon: float = 1e-6) -> Dict[str, Any]:
@@ -1446,6 +1503,13 @@ def write_operator_output(
             "state": state,
             "reviews": reviews[-5:],
             "lanes": quant_lanes.lane_operator_rows(data_dir, state, scores, reviews),
+            "strategy_proposals": quant_lanes.list_strategy_proposals(data_dir, include_decided=True),
+            "proposal_controls": {
+                "list": "python3 scripts/quant_lanes.py --data-dir <data_dir> proposals",
+                "approve": "python3 scripts/quant_lanes.py --data-dir <data_dir> proposal-decision approve --proposal <proposal_id>",
+                "reject": "python3 scripts/quant_lanes.py --data-dir <data_dir> proposal-decision reject --proposal <proposal_id>",
+                "approval_requires": "schema/replay/holdout/baseline promotion gate pass",
+            },
             "bot_registry": bot_scripts.verify_bot_registry_manifest(data_dir),
             "market_recorder": market_recorder.recorder_health(
                 recorder_data_root(data_dir),
@@ -1499,8 +1563,15 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         if isinstance(row, dict)
     ])
     latest_tick = ticks[-1] if ticks else {}
-    btc, latest_btc_market, btc_source = bitcoin_series(data_dir, ticks, state)
+    btc_records = snapshot_records(data_dir, ticks)
+    btc, latest_btc_market, btc_source, btc_diagnostic = bitcoin_series_from_snapshots(btc_records)
+    if not latest_btc_market:
+        btc, latest_btc_market, btc_source = bitcoin_series(data_dir, ticks, state)
+        btc_diagnostic = {"root_cause": "snapshot_series_missing; used state fallback"}
     btc_summary = btc_chart_summary(btc)
+    btc_summary["selector_source"] = btc_source
+    btc_summary["root_cause"] = btc_diagnostic.get("root_cause", "")
+    btc_summary["selector_diagnostic"] = redact_value(btc_diagnostic)
     roi = roi_series(ticks, state, scores)
     public_events = public_tick_events(ticks)
     operator_events = extract_trade_events(ticks, decisions)

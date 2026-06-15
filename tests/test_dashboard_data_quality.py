@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -1662,6 +1663,141 @@ class DashboardDataQualityTests(unittest.TestCase):
         self.assertIn("resume_gate_not_passed", blocked_reasons)
         self.assertTrue(ok_resume)
         self.assertEqual(ok_reasons, [])
+    def test_btc_selector_prefers_variable_non_extreme_series_over_high_volume_flat_tail_market(self):
+        records = []
+        for idx, variable_price in enumerate([0.42, 0.47, 0.52], 1):
+            records.append(
+                {
+                    "ts": f"2026-06-14T00:0{idx}:00+00:00",
+                    "markets": [
+                        {
+                            "market_id": "btc-gta-million",
+                            "question": "Will bitcoin hit $1m before GTA VI?",
+                            "volume": 999999,
+                            "liquidity": 999999,
+                            "outcomes": [{"name": "Yes", "price": 0.01}, {"name": "No", "price": 0.99}],
+                        },
+                        {
+                            "market_id": "btc-weekly-range",
+                            "question": "Will Bitcoin close above this week's range?",
+                            "volume": 1000,
+                            "liquidity": 1000,
+                            "outcomes": [{"name": "Yes", "price": variable_price}, {"name": "No", "price": 1 - variable_price}],
+                        },
+                    ],
+                }
+            )
+
+        points, latest, source, diagnostic = generate_dashboard.bitcoin_series_from_snapshots(records)
+        summary = generate_dashboard.btc_chart_summary(points)
+
+        self.assertEqual(latest["market_id"], "btc-weekly-range")
+        self.assertEqual(source, "btc_market_yes_price_variable_selector")
+        self.assertEqual(summary["status"], "variable")
+        self.assertIn("highest_volume_long_horizon", diagnostic["root_cause"])
+
+    def test_operator_proposal_decision_requires_passed_gate_before_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            data_dir.mkdir(parents=True)
+            review_id = "review001"
+            proposal_path = strategy_rules.proposal_dir(data_dir) / f"{review_id}_superwing_bot_script.json"
+            proposal_path.parent.mkdir(parents=True)
+            proposal_path.write_text(json.dumps({"agent_id": "superwing"}), encoding="utf-8")
+            review_path = data_dir / "strategy_reviews" / f"{review_id}.json"
+            review_path.parent.mkdir(parents=True)
+            review_path.write_text(
+                json.dumps(
+                    {
+                        "promotion_gates": {
+                            "superwing": {"status": "rejected", "executable": False, "reasons": ["does_not_beat_best_baseline_after_fees"]}
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            proposals = quant_lanes.list_strategy_proposals(data_dir)
+            self.assertEqual(len(proposals), 1)
+            self.assertFalse(proposals[0]["can_approve"])
+            with self.assertRaises(agent_duel.DuelError):
+                quant_lanes.record_proposal_decision(data_dir, proposals[0]["proposal_id"], "approve")
+            rejected = quant_lanes.record_proposal_decision(data_dir, proposals[0]["proposal_id"], "reject", reason="gate failed")
+
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(rejected["gate_status"], "rejected")
+
+    def test_operator_proposal_decision_can_approve_after_gate_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            data_dir.mkdir(parents=True)
+            review_id = "review002"
+            proposal_path = strategy_rules.proposal_dir(data_dir) / f"{review_id}_deepseek_bot_script.json"
+            proposal_path.parent.mkdir(parents=True)
+            proposal_path.write_text(json.dumps({"agent_id": "deepseek"}), encoding="utf-8")
+            review_path = data_dir / "strategy_reviews" / f"{review_id}.json"
+            review_path.parent.mkdir(parents=True)
+            review_path.write_text(
+                json.dumps({"promotion_gates": {"deepseek": {"status": "pass", "executable": True, "reasons": []}}}),
+                encoding="utf-8",
+            )
+
+            proposal = quant_lanes.list_strategy_proposals(data_dir)[0]
+            approved = quant_lanes.record_proposal_decision(data_dir, proposal["proposal_id"], "approve", reason="gate passed")
+
+        self.assertEqual(approved["status"], "approved")
+        self.assertTrue(approved["gate_executable"])
+
+    def test_review_skip_guard_skips_no_change_and_high_quota_without_frozen_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            data_dir.mkdir(parents=True)
+            (data_dir / "strategy_reviews").mkdir(parents=True)
+            (data_dir / "strategy_reviews" / "last.json").write_text(json.dumps({"latest_tick_id": "tick-1"}), encoding="utf-8")
+            base_ctx = {"recent_ticks": [{"tick_id": "tick-1"}]}
+            no_change = strategy_review.review_skip_decision(data_dir, base_ctx)
+            with mock.patch.dict(os.environ, {"AURUM_REVIEW_QUOTA_USED_PCT": "90", "AURUM_REVIEW_QUOTA_SKIP_PCT": "85"}, clear=False):
+                quota_skip = strategy_review.review_skip_decision(data_dir, {"recent_ticks": [{"tick_id": "tick-2"}]})
+
+        self.assertTrue(no_change["skip"])
+        self.assertEqual(no_change["reason"], "no_new_tick_since_last_review")
+        self.assertTrue(quota_skip["skip"])
+        self.assertEqual(quota_skip["reason"], "quota_safe_skip")
+
+    def test_black_swan_protection_closes_paper_position_before_freezing_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp) / "paper_duel"
+            state = agent_duel.init_state(data_dir, reset=True)
+            market = {
+                "market_id": "btc-1",
+                "question": "Will Bitcoin close above range?",
+                "outcomes": [{"name": "Yes", "price": 0.52}, {"name": "No", "price": 0.48}],
+                "volume": 1000,
+                "liquidity": 1000,
+            }
+            state["last_markets"] = [market]
+            account = state["accounts"]["superwing"]
+            account["cash"] = agent_duel.STARTING_EQUITY - 10.0
+            account["positions"]["btc-1::Yes"] = {
+                "market_id": "btc-1",
+                "question": market["question"],
+                "outcome": "Yes",
+                "shares": 10.0,
+                "cost_basis": 10.0,
+                "avg_price": 1.0,
+                "last_price": 0.52,
+                "fees_paid": 0.0,
+            }
+            agent_duel.save_state(data_dir, state)
+
+            record = quant_lanes.apply_black_swan_protection(data_dir, "superwing", ["market_price_jump"])
+            final_state = agent_duel.load_state(data_dir)
+            control = quant_lanes.load_lane_control(data_dir, "superwing")
+
+        self.assertEqual(record["flow"]["sequence"][0], "deterministic_protective_action")
+        self.assertGreaterEqual(record["flow"]["protective_result"]["fills"], 1)
+        self.assertEqual(final_state["accounts"]["superwing"]["positions"], {})
+        self.assertEqual(control["status"], "frozen")
 
 
 if __name__ == "__main__":
